@@ -11,6 +11,17 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::message::{ContentBlock, Message, ToolCall};
 
+/// A delta reported while a completion streams in.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A run of assistant text, in the order the model produced it.
+    Text(String),
+    /// The model finished naming one tool. The call is complete, so a caller
+    /// need not wait for the response as a whole to finish arriving before
+    /// acting on it.
+    ToolCall(ToolCall),
+}
+
 /// A tool advertised to the model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolDefinition {
@@ -118,9 +129,33 @@ impl StopReason {
 /// The seam between the agent loop and any model provider.
 ///
 /// Implement this to plug in another vendor, a local model, or a mock in
-/// tests. The loop only ever needs `complete`.
+/// tests. The loop drives every call through `stream`, whose default falls
+/// back to `complete`.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Run one model completion.
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse>;
+
+    /// Stream one completion, reporting text and finished tool calls as they
+    /// arrive, and return the assembled response.
+    ///
+    /// The loop always goes through this method, so a client that can only do
+    /// whole responses is fine: the default replays `complete` as one event per
+    /// block. Implement it to make the first token visible before the response
+    /// ends.
+    async fn stream(
+        &self,
+        request: CompletionRequest<'_>,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<CompletionResponse> {
+        let response = self.complete(request).await?;
+        for block in &response.content {
+            if let Some(text) = block.as_text() {
+                on_event(StreamEvent::Text(text.to_string()));
+            } else if let Some(call) = block.as_tool_call() {
+                on_event(StreamEvent::ToolCall(call));
+            }
+        }
+        Ok(response)
+    }
 }

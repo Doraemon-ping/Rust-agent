@@ -30,10 +30,17 @@ User prompt --UserPromptSubmit--> LLM
 ```rust
 for step in 0..max_steps {
     history = compact(history);            // s08: prepare() before every call
-    let response = client.complete(CompletionRequest { messages: history, tools, .. }).await?;
+    let mut calls = Vec::new();
+    // Text reaches the observer the moment it arrives, and a tool call is
+    // collected as soon as its block closes -- the response assembles under it.
+    let response = client
+        .stream(CompletionRequest { messages: history, tools, .. }, &mut |event| match event {
+            StreamEvent::Text(text) => observer.on_event(AgentEvent::AssistantText(&text)),
+            StreamEvent::ToolCall(call) => calls.push(call),
+        })
+        .await?;
     history.push(Message::assistant(response.content));
 
-    let calls = response.tool_calls();
     if calls.is_empty() {
         // s17: /goal re-enters the loop until its condition is met
         if let GoalDecision::Block { reason } = goal.evaluate_after_turn(&history, running).await {
@@ -50,13 +57,29 @@ for step in 0..max_steps {
 
 That is the whole agent. Everything else is a seam you can replace.
 
+### Model calls stream
+
+The loop never calls `complete` directly. It calls `LlmClient::stream`, which
+reports text and finished tool calls as they arrive and returns the assembled
+response; the trait's default implementation calls `complete` and replays the
+finished blocks, so a provider (or mock) that cannot stream still works
+unchanged. The Anthropic client implements it for real: `stream: true`, the SSE
+body parsed line by line, each `text_delta` forwarded the moment it lands -- so
+the first token is visible before the response ends -- and each `tool_use`
+block collected as soon as its block closes. A stream failure that lands after
+part of the response was already shown is reported instead of retried:
+replaying it would duplicate text the user has already seen. (A response cut
+off by `max_tokens` is still retried with a bigger budget, exactly as before,
+so its partial text may briefly show twice before the fuller answer replaces
+it.)
+
 ## Layout
 
 | File | Responsibility |
 | --- | --- |
 | `src/agent.rs` | The loop, the `Agent` runtime, the builder, `AgentEvent` |
-| `src/llm/mod.rs` | `LlmClient` trait and the wire types |
-| `src/llm/anthropic.rs` | Anthropic Messages API client |
+| `src/llm/mod.rs` | `LlmClient` trait (`complete` / streaming `stream`) and the wire types |
+| `src/llm/anthropic.rs` | Anthropic Messages API client, streaming over SSE |
 | `src/tools/mod.rs` | `Tool` trait, `ToolRegistry`, workspace-safe `ToolContext` |
 | `src/tools/bash.rs` | `bash` tool (platform shell, timeout, output cap) |
 | `src/tools/fs.rs` | `read_file`, `write_file`, `edit_file`, `glob` |
@@ -321,7 +344,7 @@ they coordinate through file mailboxes instead.
   Lead ──spawn_teammate──> TeammateRuntime (thread)
     ^                          │  work / idle scan
     │  .mailboxes/lead.jsonl    │  claims ready tasks, completes them
-    └── result / idle / plan / shutdown ──┘
+    └── report / idle / plan / shutdown ──┘
 ```
 
 | Tool | Effect |
@@ -361,6 +384,23 @@ Lead on its own. Teammates are threads with their own tokio runtime; a
 teammate's working directory is fixed when it is spawned (its task's worktree,
 or the repository), so idle auto-claiming only takes tasks that resolve to that
 same directory. Removing a worktree stays with the host, as in the reference.
+
+A teammate keeps the Lead's context small, and the Lead's wakeups rare:
+
+- **One report per turn.** The `complete_task` tool records what it closed
+  instead of messaging the Lead itself; at the end of the turn the runtime
+  sends a single structured `task_completed` message per turn -- the task ids
+  plus the model's closing prose -- so a finished task never also arrives as a
+  separate `result` line. A turn that closes two tasks still sends one report.
+- **No idle spin.** A teammate spawned without a task parks on its mailbox
+  instead of spending a model turn announcing that it is ready; it calls the
+  model only once it has a claimed task or a message. Give a teammate its
+  instruction as a task (or a message) rather than in the spawn prompt alone.
+- **Quiet while it works.** The idle announcement is only sent when the
+  teammate is actually going to wait. If a successor task is already ready it
+  claims it and keeps going, so a chain does not wake the Lead between steps.
+- **No todo reminder.** Teammates run with `todo_reminder_after(0)`: their plan
+  is the shared task board, and the reminder would only add unused context.
 
 ## MCP tools
 
@@ -610,9 +650,10 @@ A `ratatui` front-end over the *same* agent the CLI builds: skills, compaction,
 memory, subagent, task graph, background commands, cron, teams, MCP, recovery,
 workflows, and the `/goal` loop. The agent runs on its own thread with a
 current-thread Tokio runtime, so the blocking approval prompt never freezes the
-screen; every `AgentEvent` streams into a scrolling transcript. The visuals live
-in `src/ui.rs` as pure functions over plain data, so `src/bin/tui.rs` is just an
-event/input shell and the rendering is unit-tested without a terminal.
+screen; every `AgentEvent` streams into a scrolling transcript, and because the
+loop forwards text a delta at a time, prose appears as the model writes it. The
+visuals live in `src/ui.rs` as pure functions over plain data, so `src/bin/tui.rs`
+is just an event/input shell and the rendering is unit-tested without a terminal.
 
 Type a task and press Enter, use `/goal <condition>` (or `/goal` for status and
 `/goal clear`) to drive the goal loop, and answer permission prompts with `y`
@@ -644,9 +685,10 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 
 - **A new tool**: implement `Tool` and register it with
   `Agent::builder().tools(registry)`. The loop never changes.
-- **A new provider**: implement `LlmClient` (one method) and pass it to
-  `builder().client(..)`. Local models, OpenAI-compatible gateways, and mocks
-  all fit the same seam.
+- **A new provider**: implement `LlmClient` and pass it to `builder().client(..)`.
+  `complete` is the only required method; implement `stream` as well to send
+  text deltas and finished tool calls as they arrive. Local models,
+  OpenAI-compatible gateways, and mocks that do neither still fit the seam.
 - **Hooks / telemetry**: implement `AgentObserver`; every event has a no-op
   default.
 - **Loop callbacks**: implement `Hook` and register it with

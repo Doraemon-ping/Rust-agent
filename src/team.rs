@@ -1212,6 +1212,19 @@ impl Team {
             .unwrap_or(false)
     }
 
+    /// Whether a ready task is waiting for this teammate, without claiming it.
+    ///
+    /// An idle announcement is only worth a Lead wakeup when the teammate is
+    /// about to *wait*; if it is going to claim the next ready task, that claim
+    /// is its next report and the idle line is noise.
+    pub fn has_ready_task(&self, name: &str, cwd: &Path) -> bool {
+        let _board = self.lock_board();
+        if self.lock_state().assignments.contains_key(name) {
+            return false;
+        }
+        !self.ready_tasks(cwd).is_empty()
+    }
+
     /// Give a stopping teammate's task back to the board.
     fn release_teammate_assignment(&self, name: &str) {
         if let Some(task_id) = self.assignment(name) {
@@ -1289,6 +1302,33 @@ struct TeammateRuntime {
     history: Vec<Message>,
     /// The assignment already nudged about, so the reminder fires once.
     reminded: Option<String>,
+    /// Tasks the `complete_task` tool closed this turn, shared with the tool.
+    completions: Arc<CompletionLog>,
+}
+
+/// Completions a teammate closed during one turn.
+///
+/// The `complete_task` tool records them here instead of messaging the Lead
+/// itself, so the runtime can send a single structured report per turn rather
+/// than one message per tool call plus the model's closing prose.
+#[derive(Default)]
+struct CompletionLog {
+    reports: Mutex<Vec<String>>,
+}
+
+impl CompletionLog {
+    /// Record the structured line for one completed task.
+    fn record(&self, report: String) {
+        self.reports
+            .lock()
+            .expect("completion log poisoned")
+            .push(report);
+    }
+
+    /// Take everything recorded so far, leaving the log empty.
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.reports.lock().expect("completion log poisoned"))
+    }
 }
 
 impl TeammateRuntime {
@@ -1304,10 +1344,10 @@ impl TeammateRuntime {
         let mut tools = ToolRegistry::base();
         tools.register(ListTasksTool);
         tools.register(ClaimTaskTool::owned_by(&name));
-        tools.register(NotifyingCompleteTask::new(
+        let completions = Arc::new(CompletionLog::default());
+        tools.register(RecordingCompleteTask::new(
             CompleteTaskTool::owned_by(&name),
-            team.clone(),
-            name.clone(),
+            Arc::clone(&completions),
         ));
         register_teammate_tools(&mut tools, team.clone(), name.clone());
 
@@ -1326,6 +1366,9 @@ impl TeammateRuntime {
             .max_tokens(team.max_tokens())
             .max_steps(team.max_steps())
             .system_prompt(teammate_system_prompt(&name, &role))
+            // A teammate's plan is the shared task board, not a todo list; the
+            // reminder would only add context it never uses.
+            .todo_reminder_after(0)
             .build();
 
         let mut opening = prompt;
@@ -1354,6 +1397,7 @@ impl TeammateRuntime {
             agent,
             history: vec![Message::user_text(opening)],
             reminded: None,
+            completions,
         }
     }
 
@@ -1387,17 +1431,25 @@ impl TeammateRuntime {
 
         self.team.set_status(&self.name, TeammateStatus::Working);
         if let Err(error) = self.agent.run_turn(&mut self.history).await {
+            // A task may already be closed; never let that report vanish with
+            // the turn.
+            self.report_completions();
             self.report_error(&error.to_string());
             return WorkOutcome::Stop;
         }
 
-        let summary = last_assistant_text(&self.history);
         let gate = self.team.gate(&self.name);
-        if gate != PlanGate::Pending && !summary.is_empty() {
-            let _ = self
-                .team
-                .bus()
-                .send(&TeamMessage::new(&self.name, LEAD, summary, MSG_RESULT));
+        // One structured completion report per turn. The model's closing prose
+        // is folded into it, so a closed task never also arrives as a separate
+        // `result` message.
+        if !self.report_completions() && gate != PlanGate::Pending {
+            let summary = last_assistant_text(&self.history);
+            if !summary.is_empty() {
+                let _ = self
+                    .team
+                    .bus()
+                    .send(&TeamMessage::new(&self.name, LEAD, summary, MSG_RESULT));
+            }
         }
         if gate == PlanGate::Pending {
             self.team
@@ -1424,18 +1476,46 @@ impl TeammateRuntime {
 
         self.team.release_completed_assignment(&self.name);
         self.team.set_status(&self.name, TeammateStatus::Idle);
-        let waiting = match self.team.assignment(&self.name) {
-            Some(task_id) => format!(
-                "Waiting for more work. Still holds {task_id} (in_progress): complete it, or \
-                 tell me what is blocking."
-            ),
-            None => "Waiting for more work.".to_string(),
-        };
-        let _ = self
-            .team
-            .bus()
-            .send(&TeamMessage::new(&self.name, LEAD, waiting, MSG_IDLE));
+        // Only announce idleness when the teammate is actually going to wait.
+        // If a successor task is ready it will claim it and keep working, so
+        // the announcement would be a second Lead wakeup carrying no news.
+        if !self.team.has_ready_task(&self.name, &self.cwd) {
+            let waiting = match self.team.assignment(&self.name) {
+                Some(task_id) => format!(
+                    "Waiting for more work. Still holds {task_id} (in_progress): complete it, or \
+                     tell me what is blocking."
+                ),
+                None => "Waiting for more work.".to_string(),
+            };
+            let _ = self
+                .team
+                .bus()
+                .send(&TeamMessage::new(&self.name, LEAD, waiting, MSG_IDLE));
+        }
         WorkOutcome::Idle
+    }
+
+    /// Send one structured `task_completed` report covering every task closed
+    /// this turn, with the model's closing prose folded in. `true` when it was
+    /// sent, so the caller can skip the now-redundant `result` message.
+    fn report_completions(&self) -> bool {
+        let reports = self.completions.take();
+        if reports.is_empty() {
+            return false;
+        }
+        let summary = last_assistant_text(&self.history);
+        let mut report = reports.join("\n");
+        if !summary.is_empty() && !report.contains(summary.as_str()) {
+            report.push_str("\n\n");
+            report.push_str(&summary);
+        }
+        let _ = self.team.bus().send(&TeamMessage::new(
+            &self.name,
+            LEAD,
+            report,
+            MSG_TASK_COMPLETED,
+        ));
+        true
     }
 
     /// Claim the next ready task, or wait for a message that gives more work.
@@ -1500,7 +1580,16 @@ impl TeammateRuntime {
     }
 
     async fn run(&mut self) {
+        // A teammate spawned without a task must not burn a model turn just to
+        // say it is ready: look for work or a message first, and call the model
+        // only once there is something to act on.
         let mut outcome = WorkOutcome::Continue;
+        if self.team.assignment(&self.name).is_none() {
+            self.team.set_status(&self.name, TeammateStatus::Idle);
+            if !self.wait_for_work() {
+                outcome = WorkOutcome::Stop;
+            }
+        }
         while outcome != WorkOutcome::Stop {
             if outcome == WorkOutcome::Idle && !self.wait_for_work() {
                 break;
@@ -1688,7 +1777,9 @@ impl Tool for SpawnTeammateTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a persistent teammate that works the shared task board until shut down."
+        "Spawn a persistent teammate that works the shared task board until shut down. \
+         With no task_id it parks on its mailbox and calls the model only once it has \
+         a claimed task or a message, so give it one or send one."
     }
 
     fn input_schema(&self) -> Value {
@@ -1933,23 +2024,22 @@ pub fn register_team_tools(registry: &mut ToolRegistry, team: Team) {
     registry.register(SendMessageTool::new(team, LEAD));
 }
 
-/// A teammate's `complete_task` that also tells the Lead the moment a task
-/// closes. The inner tool reports "cannot complete" as a normal `Ok`, so the
-/// board is checked before notifying.
-struct NotifyingCompleteTask {
+/// A teammate's `complete_task` that records every task it really closes, so the
+/// runtime can report them to the Lead in one message per turn. The inner tool
+/// reports "cannot complete" as a normal `Ok`, so the board is checked first.
+struct RecordingCompleteTask {
     inner: CompleteTaskTool,
-    team: Team,
-    name: String,
+    completions: Arc<CompletionLog>,
 }
 
-impl NotifyingCompleteTask {
-    fn new(inner: CompleteTaskTool, team: Team, name: String) -> Self {
-        NotifyingCompleteTask { inner, team, name }
+impl RecordingCompleteTask {
+    fn new(inner: CompleteTaskTool, completions: Arc<CompletionLog>) -> Self {
+        RecordingCompleteTask { inner, completions }
     }
 }
 
 #[async_trait]
-impl Tool for NotifyingCompleteTask {
+impl Tool for RecordingCompleteTask {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -1969,19 +2059,12 @@ impl Tool for NotifyingCompleteTask {
             .unwrap_or_default()
             .to_string();
         let output = self.inner.call(ctx, input).await?;
-        let completed = self
-            .team
-            .tasks()
+        let completed = TaskStore::new(ctx.workspace())
             .load(&task_id)
             .map(|task| task.status == TaskStatus::Completed)
             .unwrap_or(false);
         if completed {
-            let _ = self.team.bus().send(&TeamMessage::new(
-                &self.name,
-                LEAD,
-                &output,
-                MSG_TASK_COMPLETED,
-            ));
+            self.completions.record(output.clone());
         }
         Ok(output)
     }
@@ -2320,12 +2403,21 @@ mod tests {
             wait_for_lead(&team, MSG_IDLE, &mut messages),
             "{messages:?}"
         );
+        // The task id and the closing prose arrive in one structured report,
+        // never as a separate `result` message.
+        let reports: Vec<&TeamMessage> = messages
+            .iter()
+            .filter(|message| message.kind == MSG_TASK_COMPLETED)
+            .collect();
+        assert_eq!(reports.len(), 1, "{messages:?}");
+        assert!(reports[0].content.contains(&task.id), "{messages:?}");
         assert!(
-            messages
-                .iter()
-                .any(|message| message.kind == MSG_RESULT
-                    && message.content.contains("auth refactored")),
+            reports[0].content.contains("auth refactored"),
             "{messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| message.kind == MSG_RESULT),
+            "the closing prose should not also arrive as a result: {messages:?}"
         );
 
         let stored = TaskStore::new(dir.path()).load(&task.id).unwrap();
@@ -2495,7 +2587,6 @@ mod tests {
             .create("add tests", "cover the middleware")
             .unwrap();
         let client = ScriptedClient::scripted(vec![
-            text("ready for work"),
             response(
                 vec![tool_use(
                     "call_1",
@@ -2522,6 +2613,98 @@ mod tests {
     }
 
     #[test]
+    fn a_teammate_with_no_work_never_spends_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // The script is empty on purpose: any model call would fail and be
+        // reported, so a quiet mailbox proves no turn was spent.
+        let team = Team::new(dir.path(), ScriptedClient::scripted(vec![]));
+        team.spawn_teammate("carol", "engineer", "Wait for work.", None, false)
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while team.status("carol") != Some(TeammateStatus::Idle)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(team.status("carol"), Some(TeammateStatus::Idle));
+        let messages = team.bus().read_inbox(LEAD).unwrap();
+        assert!(
+            messages.is_empty(),
+            "the opening turn was not skipped: {messages:?}"
+        );
+        assert_eq!(team.assignment("carol"), None);
+        team.request_shutdown("carol").unwrap();
+    }
+
+    #[test]
+    fn a_chain_reports_each_completion_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let write = store.create("write", "produce the file").unwrap();
+        let verify = store.create("verify", "check the file").unwrap();
+        store
+            .update_dependencies(&verify.id, std::slice::from_ref(&write.id))
+            .unwrap();
+
+        let client = ScriptedClient::scripted(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "complete_task",
+                    json!({ "task_id": write.id }),
+                )],
+                "tool_use",
+            ),
+            text("wrote it"),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "complete_task",
+                    json!({ "task_id": verify.id }),
+                )],
+                "tool_use",
+            ),
+            text("verified it"),
+        ]);
+        let team = Team::new(dir.path(), client);
+        team.spawn_teammate("writer", "engineer", "Wait for work.", None, false)
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while store.load(&verify.id).unwrap().status != TaskStatus::Completed
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the final idle announcement land.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let messages = team.bus().read_inbox(LEAD).unwrap();
+        let completed = messages
+            .iter()
+            .filter(|message| message.kind == MSG_TASK_COMPLETED)
+            .count();
+        let idle = messages
+            .iter()
+            .filter(|message| message.kind == MSG_IDLE)
+            .count();
+        assert_eq!(completed, 2, "one report per task: {messages:?}");
+        assert_eq!(
+            idle, 1,
+            "no idle spam while a successor is ready: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| message.kind == MSG_RESULT),
+            "the prose rode along in the reports: {messages:?}"
+        );
+        for message in messages.iter().filter(|m| m.kind == MSG_TASK_COMPLETED) {
+            assert!(message.content.contains("Completed "), "{messages:?}");
+        }
+        team.request_shutdown("writer").unwrap();
+    }
+
+    #[test]
     fn a_finished_task_hands_the_next_ready_one_to_the_same_teammate() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path());
@@ -2532,7 +2715,6 @@ mod tests {
             .unwrap();
 
         let client = ScriptedClient::scripted(vec![
-            text("ready for work"),
             response(
                 vec![tool_use(
                     "call_1",
@@ -2585,7 +2767,7 @@ mod tests {
             .update_dependencies(&report.id, std::slice::from_ref(&check.id))
             .unwrap();
 
-        let mut script = vec![text("ready for work")];
+        let mut script = Vec::new();
         for task in [&write, &check, &report] {
             script.push(response(
                 vec![tool_use(

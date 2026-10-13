@@ -233,7 +233,12 @@ struct PrintingObserver;
 impl AgentObserver for PrintingObserver {
     fn on_event(&self, event: AgentEvent<'_>) {
         match event {
-            AgentEvent::AssistantText(text) => print!("{text}"),
+            AgentEvent::AssistantText(text) => {
+                // Flush per delta: without it the answer appears only once the
+                // buffer fills, which defeats streaming.
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
             AgentEvent::ToolCall { name, input } => {
                 println!("\n\x1b[36m> {name}\x1b[0m {}", compact(input));
             }

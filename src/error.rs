@@ -16,6 +16,10 @@ pub enum Error {
     #[error("failed to parse model response: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The provider reported an error part-way through a response stream.
+    #[error("model stream error: {0}")]
+    Stream(String),
+
     /// Local filesystem failure inside a tool.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

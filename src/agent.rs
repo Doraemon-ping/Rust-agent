@@ -27,7 +27,9 @@ use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
 use crate::goal::{goal_continuation, GoalController, GoalDecision, GoalEvent};
 use crate::hooks::{Hook, Hooks};
-use crate::llm::{CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition};
+use crate::llm::{
+    CompletionRequest, CompletionResponse, LlmClient, StopReason, StreamEvent, ToolDefinition,
+};
 use crate::mcp::{register_mcp_tools, McpPermissionHook, McpRegistry, MCP_TOOL_PREFIX};
 use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
@@ -356,8 +358,8 @@ impl Agent {
                 tools.extend(mcp.tool_definitions());
             }
 
-            let response = match self
-                .complete_with_recovery(
+            let (response, calls) = match self
+                .stream_with_recovery(
                     None,
                     &system_prompt,
                     history,
@@ -367,7 +369,7 @@ impl Agent {
                 )
                 .await
             {
-                Ok(response) => {
+                Ok((response, calls)) => {
                     // s17: the goal's token baseline is the session total.
                     if let Some(goal) = &self.goal {
                         if let Some(usage) = &response.usage {
@@ -381,7 +383,7 @@ impl Agent {
                         cron_unacked.clear();
                     }
                     reactive_retries = 0;
-                    response
+                    (response, calls)
                 }
                 Err(error) => match &self.compactor {
                     Some(compactor)
@@ -423,11 +425,6 @@ impl Agent {
                         self.observer.on_event(AgentEvent::ContinuationRequested {
                             count: recovery.continuation_count,
                         });
-                        for block in &response.content {
-                            if let Some(text) = block.as_text() {
-                                self.observer.on_event(AgentEvent::AssistantText(text));
-                            }
-                        }
                         history.push(Message::assistant(response.content));
                         history.push(Message::user_text(CONTINUATION_PROMPT));
                         continue;
@@ -438,13 +435,14 @@ impl Agent {
             max_tokens = self.max_tokens;
             recovery.has_escalated = false;
 
-            for block in &response.content {
-                if let Some(text) = block.as_text() {
-                    self.observer.on_event(AgentEvent::AssistantText(text));
-                }
-            }
-
-            let calls = response.tool_calls();
+            // The stream already handed every text run to the observer. Prefer
+            // the calls it collected, but fall back to the assembled response so
+            // a client that streams text but not tool calls still works.
+            let calls = if calls.is_empty() {
+                response.tool_calls()
+            } else {
+                calls
+            };
             history.push(Message::assistant(response.content));
 
             if calls.is_empty() {
@@ -581,14 +579,18 @@ impl Agent {
         (ContentBlock::tool_result(call.id, output, is_error), true)
     }
 
-    /// s15: ask the model, backing off over transient provider failures.
+    /// s15: ask the model, streaming text and finished tool calls out as they
+    /// arrive, and backing off over transient provider failures.
     ///
     /// `429` and `529` are retried with exponential backoff (and jitter) up to
     /// the configured budget; repeated overloads switch the turn to the
     /// fallback model. Every other failure is returned untouched, so the
     /// caller can decide whether to compact and retry or roll the turn back.
+    ///
+    /// A failure that arrives after part of the response was already shown is
+    /// *not* retried: replaying it would duplicate text the user has seen.
     #[allow(clippy::too_many_arguments)]
-    async fn complete_with_recovery(
+    async fn stream_with_recovery(
         &self,
         model: Option<&str>,
         system: &str,
@@ -596,42 +598,38 @@ impl Agent {
         tools: &[ToolDefinition],
         max_tokens: u32,
         recovery: &mut RecoveryState,
-    ) -> Result<CompletionResponse> {
+    ) -> Result<(CompletionResponse, Vec<ToolCall>)> {
+        let mut calls: Vec<ToolCall> = Vec::new();
         let Some(config) = &self.recovery else {
-            return self
-                .client
-                .complete(CompletionRequest {
-                    model,
-                    system,
-                    messages: history,
-                    tools,
-                    max_tokens,
-                })
+            let (response, _) = self
+                .stream_once(model, system, history, tools, max_tokens, &mut calls)
                 .await;
+            return Ok((response?, calls));
         };
 
         let mut attempt = 0usize;
         loop {
-            let result = self
-                .client
-                .complete(CompletionRequest {
-                    model: recovery.current_model.as_deref().or(model),
+            calls.clear();
+            let (response, emitted) = self
+                .stream_once(
+                    recovery.current_model.as_deref().or(model),
                     system,
-                    messages: history,
+                    history,
                     tools,
                     max_tokens,
-                })
+                    &mut calls,
+                )
                 .await;
-            let error = match result {
+            let error = match response {
                 Ok(response) => {
                     recovery.consecutive_overloaded = 0;
-                    return Ok(response);
+                    return Ok((response, calls));
                 }
                 Err(error) => error,
             };
 
             let class = classify(&error);
-            if !is_retryable(class) || attempt + 1 >= config.max_retries {
+            if emitted || !is_retryable(class) || attempt + 1 >= config.max_retries {
                 return Err(error);
             }
             if class == ErrorClass::Overloaded {
@@ -653,6 +651,46 @@ impl Agent {
             tokio::time::sleep(delay).await;
             attempt += 1;
         }
+    }
+
+    /// One streaming attempt: text goes straight to the observer and finished
+    /// tool calls land in `calls`, in the order the model named them. The bool
+    /// is whether anything was already shown.
+    async fn stream_once(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolDefinition],
+        max_tokens: u32,
+        calls: &mut Vec<ToolCall>,
+    ) -> (Result<CompletionResponse>, bool) {
+        let observer = Arc::clone(&self.observer);
+        let mut emitted = false;
+        let result = {
+            let mut on_event = |event: StreamEvent| {
+                emitted = true;
+                match event {
+                    StreamEvent::Text(text) => {
+                        observer.on_event(AgentEvent::AssistantText(&text));
+                    }
+                    StreamEvent::ToolCall(call) => calls.push(call),
+                }
+            };
+            self.client
+                .stream(
+                    CompletionRequest {
+                        model,
+                        system,
+                        messages: history,
+                        tools,
+                        max_tokens,
+                    },
+                    &mut on_event,
+                )
+                .await
+        };
+        (result, emitted)
     }
 
     async fn dispatch(&self, call: &ToolCall) -> (String, bool) {
@@ -2172,5 +2210,53 @@ mod tests {
         assert!(seen.contains(&"async_launched".to_string()), "{seen:?}");
         assert!(seen.contains(&"task_notification".to_string()), "{seen:?}");
         assert!(seen.contains(&"workflow_phase".to_string()), "{seen:?}");
+    }
+
+    /// Streams its answer in pieces, to prove the loop forwards deltas.
+    struct StreamingClient;
+
+    #[async_trait]
+    impl LlmClient for StreamingClient {
+        async fn complete(&self, _request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+            unreachable!("the loop must call `stream`")
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest<'_>,
+            on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<CompletionResponse> {
+            on_event(StreamEvent::Text("Hel".to_string()));
+            on_event(StreamEvent::Text("lo".to_string()));
+            Ok(response(vec![ContentBlock::text("Hello")], "end_turn"))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loop_reports_text_a_delta_at_a_time() {
+        struct TextObserver(Arc<Mutex<Vec<String>>>);
+        impl AgentObserver for TextObserver {
+            fn on_event(&self, event: AgentEvent<'_>) {
+                if let AgentEvent::AssistantText(text) = event {
+                    self.0.lock().unwrap().push(text.to_string());
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let deltas = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .client(StreamingClient)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .observer(TextObserver(Arc::clone(&deltas)))
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        // Two deltas, not one finished block, and the joined text is history.
+        assert_eq!(deltas.lock().unwrap().clone(), vec!["Hel", "lo"]);
+        assert_eq!(history.last().unwrap().text(), "Hello");
     }
 }
