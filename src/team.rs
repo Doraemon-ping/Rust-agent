@@ -1182,6 +1182,14 @@ impl Team {
         completed
     }
 
+    /// Whether `task_id` is still claimed and in progress.
+    pub fn task_in_progress(&self, task_id: &str) -> bool {
+        self.tasks()
+            .load(task_id)
+            .map(|task| task.status == TaskStatus::InProgress)
+            .unwrap_or(false)
+    }
+
     /// Give a stopping teammate's task back to the board.
     fn release_teammate_assignment(&self, name: &str) {
         if let Some(task_id) = self.assignment(name) {
@@ -1257,6 +1265,8 @@ struct TeammateRuntime {
     cwd: PathBuf,
     agent: Agent,
     history: Vec<Message>,
+    /// The assignment already nudged about, so the reminder fires once.
+    reminded: Option<String>,
 }
 
 impl TeammateRuntime {
@@ -1317,6 +1327,7 @@ impl TeammateRuntime {
             cwd,
             agent,
             history: vec![Message::user_text(opening)],
+            reminded: None,
         }
     }
 
@@ -1368,14 +1379,36 @@ impl TeammateRuntime {
             return WorkOutcome::Idle;
         }
 
+        // The turn ended. A task left in progress blocks every task that
+        // depends on it (and stops this teammate claiming anything else), so
+        // ask once whether it is finished or genuinely stuck before idling.
+        if let Some(task_id) = self.team.assignment(&self.name) {
+            if self.reminded.as_deref() != Some(task_id.as_str())
+                && self.team.task_in_progress(&task_id)
+            {
+                self.reminded = Some(task_id.clone());
+                self.push_user_lines(vec![format!(
+                    "[reminder] Task {task_id} is still in_progress and everything that \
+                     depends on it is waiting on you. Call complete_task now if the work is \
+                     done; otherwise reply with exactly what is blocking you."
+                )]);
+                return WorkOutcome::Continue;
+            }
+        }
+
         self.team.release_completed_assignment(&self.name);
         self.team.set_status(&self.name, TeammateStatus::Idle);
-        let _ = self.team.bus().send(&TeamMessage::new(
-            &self.name,
-            LEAD,
-            "Waiting for more work.",
-            MSG_IDLE,
-        ));
+        let waiting = match self.team.assignment(&self.name) {
+            Some(task_id) => format!(
+                "Waiting for more work. Still holds {task_id} (in_progress): complete it, or \
+                 tell me what is blocking."
+            ),
+            None => "Waiting for more work.".to_string(),
+        };
+        let _ = self
+            .team
+            .bus()
+            .send(&TeamMessage::new(&self.name, LEAD, waiting, MSG_IDLE));
         WorkOutcome::Idle
     }
 
@@ -1406,6 +1439,7 @@ impl TeammateRuntime {
                 task.description,
                 self.cwd.display()
             )]);
+            self.reminded = None;
             return true;
         }
     }
@@ -1418,8 +1452,19 @@ impl TeammateRuntime {
             }
             outcome = self.work().await;
         }
+        // A claimed task must never be abandoned silently: hand it back to the
+        // board and say so, or the chain waiting on it stalls for good.
+        let abandoned = self.team.assignment(&self.name);
         self.team.release_teammate_assignment(&self.name);
         self.team.forget(&self.name);
+        if let Some(task_id) = abandoned {
+            let _ = self.team.bus().send(&TeamMessage::new(
+                &self.name,
+                LEAD,
+                format!("Stopped; {task_id} is back on the board (pending)."),
+                MSG_IDLE,
+            ));
+        }
     }
 }
 
@@ -2193,6 +2238,103 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(team.status("bob").is_none(), "teammate did not stop");
+    }
+
+    #[test]
+    fn a_forgotten_complete_task_is_reminded_and_the_chain_unblocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let first = store.create("write the doc", "create the file").unwrap();
+        let second = store.create("verify the doc", "read it back").unwrap();
+        store
+            .update_dependencies(&second.id, std::slice::from_ref(&first.id))
+            .unwrap();
+
+        // Turn 1 does the work but forgets complete_task; the runtime's
+        // reminder brings turn 2, and the task it unblocks is picked up next.
+        let client = ScriptedClient::scripted(vec![
+            text("wrote the doc"),
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "complete_task",
+                    json!({ "task_id": first.id }),
+                )],
+                "tool_use",
+            ),
+            text("done"),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "complete_task",
+                    json!({ "task_id": second.id }),
+                )],
+                "tool_use",
+            ),
+            text("verified"),
+        ]);
+        let team = Team::new(dir.path(), client);
+        team.spawn_teammate(
+            "writer",
+            "technical writer",
+            "Write the doc.",
+            Some(&first.id),
+            false,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.load(&first.id).unwrap().status != TaskStatus::Completed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task the model finished was never closed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while store.load(&second.id).unwrap().status != TaskStatus::Completed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task blocked on it never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_teammate_that_stays_blocked_says_so_instead_of_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskStore::new(dir.path())
+            .create("write the doc", "create the file")
+            .unwrap();
+        // Prose and no complete_task, twice: the reminder fires once and the
+        // teammate then reports the task it is still holding.
+        let client = ScriptedClient::scripted(vec![
+            text("drafting the doc"),
+            text("blocked: which path should I write to?"),
+        ]);
+        let team = Team::new(dir.path(), client);
+        team.spawn_teammate(
+            "writer",
+            "technical writer",
+            "Write the doc.",
+            Some(&task.id),
+            false,
+        )
+        .unwrap();
+
+        let mut messages = Vec::new();
+        assert!(
+            wait_for_lead_text(&team, "Still holds", &mut messages),
+            "the lead was never told the task is still open: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains(&task.id)),
+            "{messages:?}"
+        );
+        assert_eq!(team.status("writer"), Some(TeammateStatus::Idle));
+        assert_eq!(team.assignment("writer").as_deref(), Some(task.id.as_str()));
     }
 
     #[test]
