@@ -578,7 +578,8 @@ reach the observer as `AgentEvent::GoalReported`.
 
 ```sh
 cp .env.example .env      # then fill in ANTHROPIC_API_KEY and MODEL_ID
-cargo run
+cargo run                 # the TUI (default-run on this branch)
+cargo run --bin rust-agent   # the line-oriented REPL
 ```
 
 Environment variables:
@@ -598,11 +599,11 @@ In the REPL: type a task, `/goal <condition>` to keep working until it is met,
 ## TUI (experimental)
 
 ```sh
-cargo run --bin tui
+cargo run                 # this branch's default binary is the TUI
 # no key handy? run the scripted demo model:
-cargo run --bin tui -- --demo
+cargo run -- --demo
 # or render one frame to text (add --ansi for color):
-cargo run --bin tui -- --snapshot
+cargo run -- --snapshot
 ```
 
 A `ratatui` front-end over the *same* agent the CLI builds: skills, compaction,

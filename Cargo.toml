@@ -6,7 +6,7 @@ rust-version = "1.75"
 description = "A minimal, extensible coding-agent runtime in Rust: the agent loop, tool dispatch, and permissions."
 license = "MIT"
 publish = false
-default-run = "rust-agent"
+default-run = "tui"
 
 [lib]
 name = "rust_agent"
