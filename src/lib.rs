@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod permission;
+pub mod recovery;
 pub mod skills;
 pub mod subagent;
 pub mod team;
@@ -69,6 +70,9 @@ pub use memory::{
 pub use message::{ContentBlock, Message, Role, ToolCall};
 pub use permission::{
     Approver, AutoApprover, Decision, DenyApprover, PermissionHook, PermissionPolicy,
+};
+pub use recovery::{
+    classify, is_retryable, ErrorClass, RecoveryConfig, RecoveryState, CONTINUATION_PROMPT,
 };
 pub use skills::{parse_frontmatter, Skill, SkillLoader, SKILL_MANIFEST};
 pub use subagent::{subagent_system_prompt, TaskTool, TASK_TOOL_NAME};

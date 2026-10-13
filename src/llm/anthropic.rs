@@ -55,7 +55,7 @@ fn slice_is_empty<T>(slice: &[T]) -> bool {
 impl LlmClient for AnthropicClient {
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
         let body = MessagesBody {
-            model: &self.model,
+            model: request.model.unwrap_or(&self.model),
             max_tokens: request.max_tokens,
             system: request.system,
             messages: request.messages,

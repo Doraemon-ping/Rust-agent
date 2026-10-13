@@ -26,11 +26,14 @@ use crate::compact::{
 use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
 use crate::hooks::{Hook, Hooks};
-use crate::llm::{CompletionRequest, LlmClient};
+use crate::llm::{CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition};
 use crate::mcp::{register_mcp_tools, McpPermissionHook, McpRegistry, MCP_TOOL_PREFIX};
 use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
 use crate::permission::{Approver, AutoApprover, PermissionHook, PermissionPolicy};
+use crate::recovery::{
+    classify, is_retryable, ErrorClass, RecoveryConfig, RecoveryState, CONTINUATION_PROMPT,
+};
 use crate::skills::SkillLoader;
 use crate::team::{register_team_tools, Team};
 use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
@@ -76,6 +79,18 @@ pub enum AgentEvent<'a> {
     TeamEventDelivered { count: usize },
     /// An MCP server was connected and its tools discovered (s14).
     McpConnected { server: &'a str, tools: usize },
+    /// A transient model failure is being retried (s15).
+    ModelRecovered {
+        kind: &'a str,
+        attempt: usize,
+        delay_ms: u64,
+    },
+    /// Repeated overloads switched the turn to the fallback model (s15).
+    ModelFellBack { model: &'a str },
+    /// A truncated response is retried with a bigger token budget (s15).
+    MaxTokensEscalated { max_tokens: u32 },
+    /// A truncated, tool-less response asked the model to continue (s15).
+    ContinuationRequested { count: usize },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -104,6 +119,8 @@ pub struct Agent {
     cron: Option<CronScheduler>,
     team: Option<Team>,
     mcp: Option<McpRegistry>,
+    recovery: Option<RecoveryConfig>,
+    interactive: bool,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -154,6 +171,16 @@ impl Agent {
     /// The MCP registry, when external tools are enabled (s14).
     pub fn mcp(&self) -> Option<&McpRegistry> {
         self.mcp.as_ref()
+    }
+
+    /// The model-call recovery policy, when it is enabled (s15).
+    pub fn recovery(&self) -> Option<&RecoveryConfig> {
+        self.recovery.as_ref()
+    }
+
+    /// Whether this agent may pause and ask the user for approval (s15).
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
     }
 
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
@@ -221,6 +248,11 @@ impl Agent {
             }
             None => self.system_prompt.clone(),
         };
+        // s15: per-turn recovery bookkeeping (one escalation, bounded
+        // continuations) and the token budget this turn is currently using.
+        let mut recovery = RecoveryState::new();
+        let mut max_tokens = self.max_tokens;
+
         for step in 0..self.max_steps {
             self.observer.on_event(AgentEvent::Step(step));
 
@@ -262,13 +294,14 @@ impl Agent {
             }
 
             let response = match self
-                .client
-                .complete(CompletionRequest {
-                    system: &system_prompt,
-                    messages: history,
-                    tools: &tools,
-                    max_tokens: self.max_tokens,
-                })
+                .complete_with_recovery(
+                    None,
+                    &system_prompt,
+                    history,
+                    &tools,
+                    max_tokens,
+                    &mut recovery,
+                )
                 .await
             {
                 Ok(response) => {
@@ -301,6 +334,40 @@ impl Agent {
                     }
                 },
             };
+
+            // s15: a response cut off by the token budget is retried once with
+            // a bigger budget; if it is still truncated and there is nothing to
+            // run, keep what we have and ask the model to continue.
+            if response.stop_reason() == StopReason::MaxTokens {
+                if let Some(config) = &self.recovery {
+                    if !recovery.has_escalated && config.escalated_max_tokens > max_tokens {
+                        recovery.has_escalated = true;
+                        max_tokens = config.escalated_max_tokens;
+                        self.observer
+                            .on_event(AgentEvent::MaxTokensEscalated { max_tokens });
+                        continue;
+                    }
+                    if response.tool_calls().is_empty()
+                        && recovery.continuation_count < config.max_continuation_retries
+                    {
+                        recovery.continuation_count += 1;
+                        self.observer.on_event(AgentEvent::ContinuationRequested {
+                            count: recovery.continuation_count,
+                        });
+                        for block in &response.content {
+                            if let Some(text) = block.as_text() {
+                                self.observer.on_event(AgentEvent::AssistantText(text));
+                            }
+                        }
+                        history.push(Message::assistant(response.content));
+                        history.push(Message::user_text(CONTINUATION_PROMPT));
+                        continue;
+                    }
+                }
+            }
+            // A complete response resets the per-turn recovery budget.
+            max_tokens = self.max_tokens;
+            recovery.has_escalated = false;
 
             for block in &response.content {
                 if let Some(text) = block.as_text() {
@@ -431,6 +498,80 @@ impl Agent {
         (ContentBlock::tool_result(call.id, output, is_error), true)
     }
 
+    /// s15: ask the model, backing off over transient provider failures.
+    ///
+    /// `429` and `529` are retried with exponential backoff (and jitter) up to
+    /// the configured budget; repeated overloads switch the turn to the
+    /// fallback model. Every other failure is returned untouched, so the
+    /// caller can decide whether to compact and retry or roll the turn back.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_with_recovery(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolDefinition],
+        max_tokens: u32,
+        recovery: &mut RecoveryState,
+    ) -> Result<CompletionResponse> {
+        let Some(config) = &self.recovery else {
+            return self
+                .client
+                .complete(CompletionRequest {
+                    model,
+                    system,
+                    messages: history,
+                    tools,
+                    max_tokens,
+                })
+                .await;
+        };
+
+        let mut attempt = 0usize;
+        loop {
+            let result = self
+                .client
+                .complete(CompletionRequest {
+                    model: recovery.current_model.as_deref().or(model),
+                    system,
+                    messages: history,
+                    tools,
+                    max_tokens,
+                })
+                .await;
+            let error = match result {
+                Ok(response) => {
+                    recovery.consecutive_overloaded = 0;
+                    return Ok(response);
+                }
+                Err(error) => error,
+            };
+
+            let class = classify(&error);
+            if !is_retryable(class) || attempt + 1 >= config.max_retries {
+                return Err(error);
+            }
+            if class == ErrorClass::Overloaded {
+                if let Some(fallback) = config.note_overloaded(recovery) {
+                    self.observer
+                        .on_event(AgentEvent::ModelFellBack { model: &fallback });
+                }
+            }
+            let delay = config.delay(attempt);
+            self.observer.on_event(AgentEvent::ModelRecovered {
+                kind: if class == ErrorClass::RateLimited {
+                    "429"
+                } else {
+                    "529"
+                },
+                attempt: attempt + 1,
+                delay_ms: delay.as_millis() as u64,
+            });
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
     async fn dispatch(&self, call: &ToolCall) -> (String, bool) {
         // s14: a discovered tool is not in the registry; it lives in the MCP
         // registry until the turn ends, so dispatch resolves it by prefix.
@@ -467,6 +608,8 @@ pub struct AgentBuilder {
     cron: Option<CronScheduler>,
     team: Option<Team>,
     mcp: Option<McpRegistry>,
+    recovery: Option<RecoveryConfig>,
+    interactive: Option<bool>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -562,6 +705,27 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable model-call recovery (s15).
+    ///
+    /// Retries `429`/`529` with exponential backoff, switches to the fallback
+    /// model after repeated overloads, escalates the token budget once when a
+    /// response is truncated, and asks the model to continue when a truncated
+    /// turn has nothing left to run.
+    pub fn recovery(mut self, config: RecoveryConfig) -> Self {
+        self.recovery = Some(config);
+        self
+    }
+
+    /// Whether this agent may pause and ask the user for approval (s15).
+    ///
+    /// Defaults to `true`. An asynchronous turn is built with `false`, so
+    /// anything the policy would have asked about is denied instead of
+    /// blocking on an unreachable prompt.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = Some(interactive);
+        self
+    }
+
     /// Override the recall strategy (defaults to [`CatalogRecall`]).
     pub fn memory_recall(mut self, recall: impl MemoryRecall + 'static) -> Self {
         self.memory_recall = Some(Arc::new(recall));
@@ -642,19 +806,24 @@ impl AgentBuilder {
 
         // The permission pipeline is just the first hook, exactly as in s04.
         let mut hooks = Hooks::new();
+        // s15: a turn with no terminal to prompt on denies instead of asking.
+        let interactive = self.interactive.unwrap_or(true);
         let approver: Arc<dyn Approver> = self.approver.unwrap_or_else(|| Arc::new(AutoApprover));
-        hooks.register(PermissionHook::new(
-            self.policy
-                .unwrap_or_else(|| PermissionPolicy::new(workspace.clone())),
-            Arc::clone(&approver),
-        ));
+        hooks.register(
+            PermissionHook::new(
+                self.policy
+                    .unwrap_or_else(|| PermissionPolicy::new(workspace.clone())),
+                Arc::clone(&approver),
+            )
+            .interactive(interactive),
+        );
         // s14: discovered `mcp__*` tools answer to the host policy, not to the
         // server's own annotations.
         if let Some(registry) = &self.mcp {
-            hooks.register(McpPermissionHook::new(
-                registry.clone(),
-                Arc::clone(&approver),
-            ));
+            hooks.register(
+                McpPermissionHook::new(registry.clone(), Arc::clone(&approver))
+                    .interactive(interactive),
+            );
         }
         for hook in self.hooks {
             hooks.register_arc(hook);
@@ -735,6 +904,8 @@ impl AgentBuilder {
             cron: self.cron,
             team: self.team,
             mcp: self.mcp,
+            recovery: self.recovery,
+            interactive,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -1527,5 +1698,253 @@ mod tests {
             })
             .expect("the unapproved MCP tool should have been blocked");
         assert!(blocked.contains("mcp__deploy__trigger"), "{blocked}");
+    }
+
+    /// Replays a script of successes *and* failures, recording the model asked for.
+    struct FlakyClient {
+        script: Mutex<VecDeque<Result<CompletionResponse>>>,
+        models: Mutex<Vec<Option<String>>>,
+    }
+
+    impl FlakyClient {
+        fn new(script: Vec<Result<CompletionResponse>>) -> Self {
+            FlakyClient {
+                script: Mutex::new(script.into()),
+                models: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn models(&self) -> Vec<Option<String>> {
+            self.models.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for FlakyClient {
+        async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+            self.models
+                .lock()
+                .unwrap()
+                .push(request.model.map(str::to_string));
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(Error::Config("no scripted response left".into())))
+        }
+    }
+
+    /// Records only the s15 recovery events.
+    struct RecoveryObserver {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentObserver for RecoveryObserver {
+        fn on_event(&self, event: AgentEvent<'_>) {
+            let label = match event {
+                AgentEvent::ModelRecovered { kind, attempt, .. } => {
+                    format!("recovered {kind} #{attempt}")
+                }
+                AgentEvent::ModelFellBack { model } => format!("fellback {model}"),
+                AgentEvent::MaxTokensEscalated { max_tokens } => format!("escalated {max_tokens}"),
+                AgentEvent::ContinuationRequested { count } => format!("continuation #{count}"),
+                _ => return,
+            };
+            self.events.lock().unwrap().push(label);
+        }
+    }
+
+    fn fast_recovery() -> RecoveryConfig {
+        RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            ..RecoveryConfig::default()
+        }
+    }
+
+    fn recovery_observer() -> (RecoveryObserver, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            RecoveryObserver {
+                events: Arc::clone(&events),
+            },
+            events,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_call_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = FlakyClient::new(vec![
+            Err(Error::Api {
+                status: 429,
+                message: "slow down".into(),
+            }),
+            Ok(response(vec![ContentBlock::text("recovered")], "end_turn")),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(fast_recovery())
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.last().unwrap().text(), "recovered");
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "recovered 429 #1"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_overloads_switch_to_the_fallback_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let overload = || Error::Api {
+            status: 529,
+            message: "overloaded".into(),
+        };
+        let client = Arc::new(FlakyClient::new(vec![
+            Err(overload()),
+            Err(overload()),
+            Ok(response(
+                vec![ContentBlock::text("from backup")],
+                "end_turn",
+            )),
+        ]));
+        let config = RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            fallback_model: Some("backup-model".to_string()),
+            ..RecoveryConfig::default()
+        };
+        let agent = Agent::builder()
+            .shared_client(client.clone())
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(config)
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.last().unwrap().text(), "from backup");
+        let models = client.models();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0], None);
+        assert_eq!(models[2].as_deref(), Some("backup-model"));
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "fellback backup-model"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_is_retried_with_a_bigger_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = ScriptedClient::new(vec![
+            response(vec![ContentBlock::text("half")], "max_tokens"),
+            response(vec![ContentBlock::text("whole answer")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(fast_recovery())
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        // The truncated text is discarded, not appended.
+        assert_eq!(history.last().unwrap().text(), "whole answer");
+        assert!(!history.iter().any(|message| message.text() == "half"));
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "escalated 16000"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_turn_with_nothing_to_run_is_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = ScriptedClient::new(vec![
+            response(vec![ContentBlock::text("half")], "max_tokens"),
+            response(vec![ContentBlock::text("rest")], "end_turn"),
+        ]);
+        let config = RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            escalated_max_tokens: 8192, // no headroom: escalation is skipped
+            ..RecoveryConfig::default()
+        };
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(config)
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let texts: Vec<String> = history.iter().map(Message::text).collect();
+        assert!(texts.iter().any(|text| text == "half"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text == CONTINUATION_PROMPT),
+            "{texts:?}"
+        );
+        assert_eq!(history.last().unwrap().text(), "rest");
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "continuation #1"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_interactive_turn_denies_instead_of_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use("c1", "bash", json!({ "command": "rm -rf build" }))],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("understood")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .interactive(false)
+            .build();
+
+        let mut history = vec![Message::user_text("clean up")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let blocked = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if *is_error && content.contains("asynchronous turn") => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a destructive command should be denied without a prompt");
+        assert!(blocked.contains("Permission denied"), "{blocked}");
     }
 }

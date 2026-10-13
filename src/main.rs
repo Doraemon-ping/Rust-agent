@@ -13,8 +13,9 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
-    ContentBlock, CronScheduler, LlmClient, McpRegistry, MemoryConfig, Message, SkillLoader, Team,
-    ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, MCP_PROMPT, TASKS_PROMPT, TEAM_PROMPT,
+    ContentBlock, CronScheduler, LlmClient, McpRegistry, MemoryConfig, Message, RecoveryConfig,
+    SkillLoader, Team, ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, MCP_PROMPT,
+    TASKS_PROMPT, TEAM_PROMPT,
 };
 
 #[tokio::main]
@@ -60,6 +61,13 @@ async fn main() -> Result<()> {
     // s14: external tools arrive through MCP servers, gated by host policy.
     let mcp = McpRegistry::new();
 
+    // s15: retry transient model failures, fall back, and escalate truncation.
+    let mut recovery = RecoveryConfig::default();
+    if let Some(model) = &config.fallback_model {
+        println!("recovery: fallback model {model}");
+        recovery = recovery.with_fallback_model(model.clone());
+    }
+
     let agent = Agent::builder()
         .shared_client(client)
         .tools(tools)
@@ -71,6 +79,7 @@ async fn main() -> Result<()> {
         .cron(cron.clone())
         .team(team.clone())
         .mcp(mcp.clone())
+        .recovery(recovery)
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
             "{} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
@@ -99,6 +108,7 @@ async fn main() -> Result<()> {
     println!("cron: .scheduled_tasks.json (schedule_cron, list_crons, cancel_cron) (s12)");
     println!("team: .mailboxes/ (spawn_teammate, send_message, review_plan) (s13)");
     println!("mcp: connect_mcp -> mcp__<server>__<tool> (docs, deploy) (s14)");
+    println!("recovery: 429/529 backoff, fallback model, max_tokens escalation (s15)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
@@ -218,6 +228,22 @@ impl AgentObserver for PrintingObserver {
             AgentEvent::McpConnected { server, tools } => {
                 println!("\x1b[35m[mcp] connected {server}: {tools} tool(s)\x1b[0m");
             }
+            AgentEvent::ModelRecovered {
+                kind,
+                attempt,
+                delay_ms,
+            } => {
+                println!("\x1b[33m[{kind}] retry {attempt} after {delay_ms}ms\x1b[0m");
+            }
+            AgentEvent::ModelFellBack { model } => {
+                println!("\x1b[31m[529] switching to {model}\x1b[0m");
+            }
+            AgentEvent::MaxTokensEscalated { max_tokens } => {
+                println!("\x1b[33m[max_tokens] retry with {max_tokens}\x1b[0m");
+            }
+            AgentEvent::ContinuationRequested { count } => {
+                println!("\x1b[33m[continuation {count}] asking the model to continue\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -286,6 +312,10 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::CronDelivered { .. }
             | AgentEvent::TeamEventDelivered { .. }
             | AgentEvent::McpConnected { .. }
+            | AgentEvent::ModelRecovered { .. }
+            | AgentEvent::ModelFellBack { .. }
+            | AgentEvent::MaxTokensEscalated { .. }
+            | AgentEvent::ContinuationRequested { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

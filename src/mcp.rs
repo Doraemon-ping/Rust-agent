@@ -556,12 +556,26 @@ pub fn register_mcp_tools(registry: &mut ToolRegistry, mcp: McpRegistry) {
 pub struct McpPermissionHook {
     registry: McpRegistry,
     approver: Arc<dyn Approver>,
+    interactive: bool,
 }
 
 impl McpPermissionHook {
     /// Wrap a registry and the approver used to answer a `confirm` policy.
     pub fn new(registry: McpRegistry, approver: Arc<dyn Approver>) -> Self {
-        McpPermissionHook { registry, approver }
+        McpPermissionHook {
+            registry,
+            approver,
+            interactive: true,
+        }
+    }
+
+    /// Whether this turn may pause and ask the user (s15).
+    ///
+    /// A `confirm` tool in an asynchronous turn is denied rather than queued
+    /// behind a prompt that will never be answered.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
     }
 }
 
@@ -572,6 +586,11 @@ impl Hook for McpPermissionHook {
         }
         match self.registry.policy_for(&call.name) {
             McpPolicy::Allow => None,
+            McpPolicy::Confirm if !self.interactive => Some(format!(
+                "Permission denied: external tool {} requires confirmation \
+                 (interactive approval is unavailable during an asynchronous turn)",
+                call.name
+            )),
             McpPolicy::Confirm => {
                 let reason = format!("external tool {} requires confirmation", call.name);
                 if self.approver.approve(call, &reason) {

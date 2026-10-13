@@ -25,6 +25,11 @@ pub struct ToolDefinition {
 /// cloning it on every iteration.
 #[derive(Debug, Clone)]
 pub struct CompletionRequest<'a> {
+    /// Override the client's configured model for this call.
+    ///
+    /// The recovery layer uses it to fall back to a second model; `None` means
+    /// "whatever the client was configured with".
+    pub model: Option<&'a str>,
     pub system: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a [ToolDefinition],

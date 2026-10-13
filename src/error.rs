@@ -60,6 +60,10 @@ pub enum Error {
     #[error("mcp error: {0}")]
     Mcp(String),
 
+    /// A retryable model call gave up after the recovery budget ran out (s15).
+    #[error("recovery error: {0}")]
+    Recovery(String),
+
     /// The loop hit its safety bound without the model stopping.
     #[error("agent exceeded the maximum number of iterations ({0})")]
     MaxIterations(usize),

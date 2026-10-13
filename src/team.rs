@@ -1284,6 +1284,9 @@ impl TeammateRuntime {
                 name: name.clone(),
             })
             .shared_observer(observer)
+            // s15: a teammate runs on its own thread, so there is no terminal
+            // to prompt on -- anything needing approval is denied, not queued.
+            .interactive(false)
             .max_tokens(team.max_tokens())
             .max_steps(team.max_steps())
             .system_prompt(teammate_system_prompt(&name, &role))

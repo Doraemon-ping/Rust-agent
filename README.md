@@ -4,7 +4,7 @@ A minimal, extensible coding-agent runtime in Rust.
 
 Rust owns the *harness*: the loop, tool dispatch, and the permission gates.
 The model owns the *agency*. This crate is modelled on the `agent-loop`
-lessons in `learn-claude-code` (s01-s14), re-implemented idiomatically with
+lessons in `learn-claude-code` (s01-s15), re-implemented idiomatically with
 `tokio` + `reqwest` + `serde`.
 
 ## The loop
@@ -65,6 +65,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/cron.rs` | Cron scheduler (s12): 5-field expressions, durable jobs, `[Scheduled]` delivery |
 | `src/team.rs` | Agent teams (s13): mailboxes, teammate runtimes, plan gates, worktrees |
 | `src/mcp.rs` | MCP tools (s14): connect servers, namespace discovered tools, host policy |
+| `src/recovery.rs` | Model-call recovery (s15): classify 429/529, backoff, fallback model, escalation |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -90,6 +91,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s12 | A prompt starts at a scheduled local time | `CronScheduler` + `schedule_cron` / `list_crons` / `cancel_cron` |
 | s13 | Lead delegates to persistent teammates | `Team` + `MessageBus` + `spawn_teammate` and the protocol tools |
 | s14 | Connect a server, discover and call its tools | `McpRegistry` + `McpServer` + `connect_mcp` + `mcp__{server}__{tool}` |
+| s15 | Many mechanisms, one loop; recover from provider failures | the whole `Agent` + `RecoveryConfig` + `Agent::builder().interactive(..)` |
 
 ## Skills
 
@@ -395,6 +397,46 @@ collision is rejected at connect time, so the per-turn pool never half-fails.
 The shipped `docs` and `deploy` servers are in-process mocks; a real transport
 is just an `McpServer` implementation handed to `McpRegistry::register_server`.
 
+## Recovery and asynchronous turns
+
+Everything above hangs off one loop, which is the s15 point: the mechanisms are
+seams, not separate programs. Two seams exist purely to keep that loop alive.
+
+`recovery(..)` wraps the model call. Transient failures are retried before they
+reach the caller:
+
+```text
+  429 rate limited   -> exponential backoff + jitter, retry (up to max_retries)
+  529 overloaded     -> exponential backoff, and after N in a row switch model
+  max_tokens         -> escalate the budget once, then ask the model to continue
+  prompt too long    -> reactive compact, then retry (s08)
+  anything else      -> surfaced to the caller untouched
+```
+
+Backoff doubles from `base_delay_ms`, caps at `max_delay_ms`, and adds up to 25%
+jitter so clients do not retry in lockstep. A truncated response is retried once
+with `escalated_max_tokens`; if it is still truncated and has nothing to run, the
+partial answer is kept and `CONTINUATION_PROMPT` asks for the rest (bounded by
+`max_continuation_retries`). The fallback model needs a per-request override, so
+`CompletionRequest::model` carries it.
+
+The second seam is approval. A turn that runs on its own thread -- a teammate --
+has no terminal to prompt on, so it is built with `interactive(false)`. Anything
+the policy would have *asked* about is denied instead, with a reason the model
+can read, rather than blocking on input nobody can answer:
+
+```rust
+let agent = Agent::builder()
+    .client(client)
+    .recovery(RecoveryConfig::default().with_fallback_model("claude-haiku-4-5"))
+    .interactive(false)          // deny instead of asking
+    .build();
+```
+
+`recovery(..)` emits `AgentEvent::ModelRecovered`, `ModelFellBack`,
+`MaxTokensEscalated`, and `ContinuationRequested`; `Config::fallback_model`
+comes from `FALLBACK_MODEL_ID`.
+
 ## Getting started
 
 ```sh
@@ -409,6 +451,7 @@ Environment variables:
 | `ANTHROPIC_BASE_URL` | Messages API base URL | `https://api.anthropic.com` |
 | `ANTHROPIC_API_KEY` | API key (falls back to `ANTHROPIC_AUTH_TOKEN`) | required |
 | `MODEL_ID` | Model id (falls back to `ANTHROPIC_MODEL`) | required |
+| `FALLBACK_MODEL_ID` | Model used after repeated `529`s (s15) | none |
 | `MAX_TOKENS` | Response budget per call | `8192` |
 
 In the REPL: type a task, `/reset` to clear history, `q` to quit.
@@ -465,10 +508,16 @@ let answer = agent.ask("summarise src/lib.rs").await?;
   `connect_mcp` and the `mcp__*` host policy. Implement `McpServer` over any
   transport and hand it to `McpRegistry::register_server`; the pool, the
   permission hook, and the loop are unchanged.
+- **Provider resilience**: `builder().recovery(RecoveryConfig::default())`
+  retries `429`/`529`, switches models, and escalates truncation. Every knob is
+  a field on `RecoveryConfig`; leave it off and the loop calls the provider
+  exactly once per round.
+- **Asynchronous approval**: `builder().interactive(false)` turns "ask the user"
+  into "deny, with a reason" -- for turns with no terminal to prompt on.
 
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery
 cargo clippy --all-targets
 ```
