@@ -79,6 +79,8 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/message.rs` | Conversation model (`Message`, `ContentBlock`, `ToolCall`) |
 | `src/config.rs` | Environment configuration |
 | `src/main.rs` | Interactive REPL |
+| `src/bin/tui.rs` | Experimental `ratatui` TUI front-end over the same agent |
+| `src/ui.rs` | Pure render helpers for the TUI (`Entry`, `Theme`, layout, wrapping) |
 
 ## Mapping to `learn-claude-code`
 
@@ -576,7 +578,8 @@ reach the observer as `AgentEvent::GoalReported`.
 
 ```sh
 cp .env.example .env      # then fill in ANTHROPIC_API_KEY and MODEL_ID
-cargo run
+cargo run                 # the TUI (default-run on this branch)
+cargo run --bin rust-agent   # the line-oriented REPL
 ```
 
 Environment variables:
@@ -592,6 +595,34 @@ Environment variables:
 
 In the REPL: type a task, `/goal <condition>` to keep working until it is met,
 `/reset` to clear history, `q` to quit.
+
+## TUI (experimental)
+
+```sh
+cargo run                 # this branch's default binary is the TUI
+# no key handy? run the scripted demo model:
+cargo run -- --demo
+# or render one frame to text (add --ansi for color):
+cargo run -- --snapshot
+```
+
+A `ratatui` front-end over the *same* agent the CLI builds: skills, compaction,
+memory, subagent, task graph, background commands, cron, teams, MCP, recovery,
+workflows, and the `/goal` loop. The agent runs on its own thread with a
+current-thread Tokio runtime, so the blocking approval prompt never freezes the
+screen; every `AgentEvent` streams into a scrolling transcript. The visuals live
+in `src/ui.rs` as pure functions over plain data, so `src/bin/tui.rs` is just an
+event/input shell and the rendering is unit-tested without a terminal.
+
+Type a task and press Enter, use `/goal <condition>` (or `/goal` for status and
+`/goal clear`) to drive the goal loop, and answer permission prompts with `y`
+(once), `a` (always, for the session) or `n`. `Shift+Enter` inserts a newline,
+`?` or `/help` shows the key map, and `Esc` quits. While the UI is idle the
+agent thread keeps polling, so a due cron job, an incoming teammate message, or
+a finished background command starts its own turn -- which is how a deferred
+goal is judged as soon as its evidence arrives. `--demo` swaps in a scripted mock
+model (it answers the goal evaluator too), so the UI, the permission gate, and
+the goal loop can all be exercised without an API key.
 
 ## Embedding
 
