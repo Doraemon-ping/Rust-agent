@@ -1121,9 +1121,14 @@ impl Team {
             let state = self.lock_state();
             state.assignments.contains_key(name)
         };
-        if busy || self.owns_in_progress(name) {
+        if busy {
             return None;
         }
+        // With no assignment the teammate cannot be mid-task, so a task it
+        // still owns as in_progress is a leftover from an earlier assignment
+        // (or a dead thread). Leaving it claimed blocks the teammate from ever
+        // claiming again *and* blocks everything that depends on it.
+        let _ = self.release_own_orphans_locked(name);
         for task in self.ready_tasks(cwd) {
             if self
                 .tasks()
@@ -1141,6 +1146,31 @@ impl Team {
         None
     }
 
+    /// Hand back every task `name` still owns as in_progress. They are
+    /// leftovers nobody can finish, so they go back to `pending` and become
+    /// claimable again (by this teammate or any other).
+    pub fn reap_own_orphans(&self, name: &str) -> Vec<String> {
+        let _board = self.lock_board();
+        self.release_own_orphans_locked(name)
+    }
+
+    /// The body of [`Team::reap_own_orphans`]; the caller holds the board lock.
+    fn release_own_orphans_locked(&self, name: &str) -> Vec<String> {
+        let mut released = Vec::new();
+        let Ok(tasks) = self.tasks().list() else {
+            return released;
+        };
+        for task in tasks {
+            if task.status == TaskStatus::InProgress
+                && task.owner.as_deref() == Some(name)
+                && self.tasks().release(&task.id).is_ok()
+            {
+                released.push(task.id);
+            }
+        }
+        released
+    }
+
     /// Ready tasks (pending, unowned, unblocked) whose cwd matches.
     fn ready_tasks(&self, cwd: &Path) -> Vec<Task> {
         let store = self.tasks();
@@ -1156,18 +1186,6 @@ impl Team {
                     && store.can_start(&task.id).unwrap_or(false)
             })
             .collect()
-    }
-
-    /// Whether `name` already owns a task in progress.
-    fn owns_in_progress(&self, name: &str) -> bool {
-        self.tasks()
-            .list()
-            .map(|tasks| {
-                tasks.into_iter().any(|task| {
-                    task.owner.as_deref() == Some(name) && task.status == TaskStatus::InProgress
-                })
-            })
-            .unwrap_or(false)
     }
 
     /// Clear the assignment once its task is completed.
@@ -1435,6 +1453,24 @@ impl TeammateRuntime {
                 }
                 self.push_user_lines(notices);
                 return true;
+            }
+
+            // Tasks this teammate still shows as owning while it holds no
+            // assignment are leftovers: nobody is working on them and they
+            // block the whole chain behind them. Put them back on the board
+            // and tell the Lead, so the stall is visible instead of silent.
+            for task_id in self.team.reap_own_orphans(&self.name) {
+                let notice = format!(
+                    "{task_id} is back on the board (pending): I held it as in_progress but \
+                     had no active assignment for it."
+                );
+                let _ = self.team.bus().send(&TeamMessage::new(
+                    &self.name,
+                    LEAD,
+                    notice.clone(),
+                    MSG_IDLE,
+                ));
+                self.push_user_lines(vec![format!("[Board] {notice}")]);
             }
 
             let Some(task) = self.team.claim_next_task(&self.name, &self.cwd) else {
@@ -2475,6 +2511,56 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_task_hands_the_next_ready_one_to_the_same_teammate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let write = store.create("write", "produce the file").unwrap();
+        let verify = store.create("verify", "check the file").unwrap();
+        store
+            .update_dependencies(&verify.id, std::slice::from_ref(&write.id))
+            .unwrap();
+
+        let client = ScriptedClient::scripted(vec![
+            text("ready for work"),
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "complete_task",
+                    json!({ "task_id": write.id }),
+                )],
+                "tool_use",
+            ),
+            text("wrote it"),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "complete_task",
+                    json!({ "task_id": verify.id }),
+                )],
+                "tool_use",
+            ),
+            text("verified it"),
+        ]);
+        let team = Team::new(dir.path(), client);
+        team.spawn_teammate("writer", "engineer", "Wait for work.", None, false)
+            .unwrap();
+
+        // Completing the first task unblocks the second; the teammate picks it
+        // up on its own instead of waiting for the Lead to hand it over.
+        let mut messages = Vec::new();
+        assert!(
+            wait_for_lead_text(&team, "verified it", &mut messages),
+            "{messages:?}"
+        );
+        assert_eq!(store.load(&write.id).unwrap().status, TaskStatus::Completed);
+        assert_eq!(
+            store.load(&verify.id).unwrap().status,
+            TaskStatus::Completed
+        );
+        team.request_shutdown("writer").unwrap();
+    }
+
+    #[test]
     fn spawning_rejects_bad_names_and_unclaimable_tasks() {
         let dir = tempfile::tempdir().unwrap();
         let task = TaskStore::new(dir.path()).create("t", "").unwrap();
@@ -2578,6 +2664,59 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[test]
+    fn a_free_teammate_with_a_stale_claim_still_gets_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Team::new(dir.path(), ScriptedClient::scripted(vec![]));
+        let store = TaskStore::new(dir.path());
+        // A task claimed but never finished, from an assignment this teammate
+        // no longer holds. It used to block every later claim forever.
+        let stale = store
+            .create("write", "left over from an earlier run")
+            .unwrap();
+        store.claim(&stale.id, "writer").unwrap();
+        assert!(!team.lock_state().assignments.contains_key("writer"));
+
+        let claimed = team
+            .claim_next_task("writer", dir.path())
+            .expect("a free teammate with a stale claim still gets work");
+
+        assert_eq!(claimed.id, stale.id);
+        assert_eq!(
+            store.load(&stale.id).unwrap().status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(
+            team.assignment("writer").as_deref(),
+            Some(stale.id.as_str())
+        );
+        // Once it holds real work again, it stops claiming.
+        assert!(team.claim_next_task("writer", dir.path()).is_none());
+    }
+
+    #[test]
+    fn reaping_returns_only_the_stale_teammates_own_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Team::new(dir.path(), ScriptedClient::scripted(vec![]));
+        let store = TaskStore::new(dir.path());
+        let stale = store.create("old", "abandoned by writer").unwrap();
+        store.claim(&stale.id, "writer").unwrap();
+        // The Lead's own claim is not a teammate's orphan and must survive.
+        let lead = store
+            .create("lead work", "claimed by the coordinator")
+            .unwrap();
+        store.claim(&lead.id, "agent").unwrap();
+
+        assert_eq!(team.reap_own_orphans("writer"), vec![stale.id.clone()]);
+
+        let stale = store.load(&stale.id).unwrap();
+        assert_eq!(stale.status, TaskStatus::Pending);
+        assert!(stale.owner.is_none());
+        assert_eq!(store.load(&lead.id).unwrap().status, TaskStatus::InProgress);
+        // Reaping is idempotent: nothing left to hand back.
+        assert!(team.reap_own_orphans("writer").is_empty());
     }
 
     #[test]
