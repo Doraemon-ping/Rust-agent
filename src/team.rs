@@ -1438,9 +1438,16 @@ impl TeammateRuntime {
         WorkOutcome::Idle
     }
 
-    /// Wait for a message or atomically claim the next ready task.
+    /// Claim the next ready task, or wait for a message that gives more work.
     fn wait_for_work(&mut self) -> bool {
         loop {
+            // Look at the board *before* sleeping. Finishing a task is what
+            // makes its successor ready, and a mailbox timeout does not wake
+            // for board changes, so waiting first would add a scan interval to
+            // every hop of a chain.
+            if self.claim_ready_task() {
+                return true;
+            }
             let inbox = self
                 .team
                 .bus()
@@ -1454,38 +1461,42 @@ impl TeammateRuntime {
                 self.push_user_lines(notices);
                 return true;
             }
-
-            // Tasks this teammate still shows as owning while it holds no
-            // assignment are leftovers: nobody is working on them and they
-            // block the whole chain behind them. Put them back on the board
-            // and tell the Lead, so the stall is visible instead of silent.
-            for task_id in self.team.reap_own_orphans(&self.name) {
-                let notice = format!(
-                    "{task_id} is back on the board (pending): I held it as in_progress but \
-                     had no active assignment for it."
-                );
-                let _ = self.team.bus().send(&TeamMessage::new(
-                    &self.name,
-                    LEAD,
-                    notice.clone(),
-                    MSG_IDLE,
-                ));
-                self.push_user_lines(vec![format!("[Board] {notice}")]);
-            }
-
-            let Some(task) = self.team.claim_next_task(&self.name, &self.cwd) else {
-                continue;
-            };
-            self.push_user_lines(vec![format!(
-                "[Auto-claimed task {}] {}\n{}\nWork directory: {}",
-                task.id,
-                task.subject,
-                task.description,
-                self.cwd.display()
-            )]);
-            self.reminded = None;
-            return true;
         }
+    }
+
+    /// Reap leftovers this teammate cannot still be working on, then take the
+    /// next ready task. `true` once it holds work.
+    fn claim_ready_task(&mut self) -> bool {
+        // Tasks this teammate still shows as owning while it holds no
+        // assignment are leftovers: nobody is working on them and they block
+        // the whole chain behind them. Put them back on the board and tell the
+        // Lead, so the stall is visible instead of silent.
+        for task_id in self.team.reap_own_orphans(&self.name) {
+            let notice = format!(
+                "{task_id} is back on the board (pending): I held it as in_progress but \
+                 had no active assignment for it."
+            );
+            let _ = self.team.bus().send(&TeamMessage::new(
+                &self.name,
+                LEAD,
+                notice.clone(),
+                MSG_IDLE,
+            ));
+            self.push_user_lines(vec![format!("[Board] {notice}")]);
+        }
+
+        let Some(task) = self.team.claim_next_task(&self.name, &self.cwd) else {
+            return false;
+        };
+        self.push_user_lines(vec![format!(
+            "[Auto-claimed task {}] {}\n{}\nWork directory: {}",
+            task.id,
+            task.subject,
+            task.description,
+            self.cwd.display()
+        )]);
+        self.reminded = None;
+        true
     }
 
     async fn run(&mut self) {
@@ -2556,6 +2567,58 @@ mod tests {
         assert_eq!(
             store.load(&verify.id).unwrap().status,
             TaskStatus::Completed
+        );
+        team.request_shutdown("writer").unwrap();
+    }
+
+    #[test]
+    fn a_chain_never_waits_a_scan_interval_between_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let write = store.create("write", "produce the file").unwrap();
+        let check = store.create("check", "verify the file").unwrap();
+        let report = store.create("report", "summarise").unwrap();
+        store
+            .update_dependencies(&check.id, std::slice::from_ref(&write.id))
+            .unwrap();
+        store
+            .update_dependencies(&report.id, std::slice::from_ref(&check.id))
+            .unwrap();
+
+        let mut script = vec![text("ready for work")];
+        for task in [&write, &check, &report] {
+            script.push(response(
+                vec![tool_use(
+                    "call_1",
+                    "complete_task",
+                    json!({ "task_id": task.id }),
+                )],
+                "tool_use",
+            ));
+            script.push(text("done"));
+        }
+        let team = Team::new(dir.path(), ScriptedClient::scripted(script));
+        let started = std::time::Instant::now();
+        team.spawn_teammate("writer", "engineer", "Wait for work.", None, false)
+            .unwrap();
+
+        // Completing a step is what makes the next one ready, so the teammate
+        // must look at the board before it sleeps on its mailbox: waiting a
+        // full scan interval per hop is what made a three step chain crawl.
+        let deadline = started + Duration::from_secs(30);
+        while store.load(&report.id).unwrap().status != TaskStatus::Completed
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(
+            store.load(&report.id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert!(
+            elapsed < IDLE_SCAN_INTERVAL,
+            "three steps took {elapsed:?}; the successor is being waited on"
         );
         team.request_shutdown("writer").unwrap();
     }
