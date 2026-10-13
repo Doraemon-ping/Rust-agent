@@ -10,3 +10,6 @@
 
 # task graph (s10)
 /.tasks
+
+# cron scheduler (s12)
+/.scheduled_tasks.json

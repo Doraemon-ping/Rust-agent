@@ -13,8 +13,8 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
-    ContentBlock, LlmClient, MemoryConfig, Message, SkillLoader, ToolCall, ToolRegistry,
-    BACKGROUND_PROMPT, TASKS_PROMPT,
+    ContentBlock, CronScheduler, LlmClient, MemoryConfig, Message, SkillLoader, ToolCall,
+    ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, TASKS_PROMPT,
 };
 
 #[tokio::main]
@@ -45,6 +45,15 @@ async fn main() -> Result<()> {
     let skills = SkillLoader::new(workspace.join("skills"));
     let skill_count = skills.len();
 
+    // s12: scheduled prompts, restored from `.scheduled_tasks.json`.
+    let cron = CronScheduler::new(workspace.clone());
+    match cron.load() {
+        Ok(0) => {}
+        Ok(count) => println!("cron: restored {count} durable job(s)"),
+        Err(error) => eprintln!("cron: could not load jobs: {error}"),
+    }
+    cron.start_ticker();
+
     let agent = Agent::builder()
         .shared_client(client)
         .tools(tools)
@@ -53,12 +62,14 @@ async fn main() -> Result<()> {
         .compaction(CompactConfig::default())
         .memory(MemoryConfig::default())
         .background(BackgroundManager::new())
+        .cron(cron.clone())
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
             TASKS_PROMPT,
-            BACKGROUND_PROMPT
+            BACKGROUND_PROMPT,
+            CRON_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -75,12 +86,23 @@ async fn main() -> Result<()> {
     println!("memory: .memory/ (recall + extract + consolidate)");
     println!("tasks: .tasks/ (create, update, claim, complete)");
     println!("background: bash run_in_background -> <task_notification> (s11)");
+    println!("cron: .scheduled_tasks.json (schedule_cron, list_crons, cancel_cron) (s12)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
     let mut history: Vec<Message> = Vec::new();
 
     loop {
+        // A job that came due while we were idle starts its own turn before
+        // the next prompt: the loop polls the scheduler as it begins.
+        if cron.has_due() {
+            println!("\x1b[35m[cron] a scheduled job is due\x1b[0m");
+            if let Err(error) = agent.run_turn(&mut history).await {
+                eprintln!("\x1b[31merror: {error}\x1b[0m");
+            }
+            println!();
+        }
+
         let line = match editor.readline("rust-agent >> ") {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -166,6 +188,9 @@ impl AgentObserver for PrintingObserver {
             AgentEvent::BackgroundCollected { count } => {
                 println!("\x1b[35m[background] collected {count} result(s)\x1b[0m");
             }
+            AgentEvent::CronDelivered { count } => {
+                println!("\x1b[35m[cron] delivered {count} job(s)\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -205,6 +230,7 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::MemoryRecalled { .. }
             | AgentEvent::BackgroundStarted { .. }
             | AgentEvent::BackgroundCollected { .. }
+            | AgentEvent::CronDelivered { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

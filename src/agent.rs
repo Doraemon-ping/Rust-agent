@@ -23,6 +23,7 @@ use crate::background::{placeholder, should_run_background, BackgroundManager};
 use crate::compact::{
     is_context_overflow, CompactConfig, CompactTool, Compactor, COMPACT_TOOL_NAME,
 };
+use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
 use crate::hooks::{Hook, Hooks};
 use crate::llm::{CompletionRequest, LlmClient};
@@ -67,6 +68,8 @@ pub enum AgentEvent<'a> {
     BackgroundStarted { task_id: &'a str },
     /// Completed background results were injected into this turn (s11).
     BackgroundCollected { count: usize },
+    /// Due cron jobs were delivered as `[Scheduled]` user messages (s12).
+    CronDelivered { count: usize },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -92,6 +95,7 @@ pub struct Agent {
     hooks: Hooks,
     observer: Arc<dyn AgentObserver>,
     background: Option<BackgroundManager>,
+    cron: Option<CronScheduler>,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -129,6 +133,11 @@ impl Agent {
         self.background.as_ref()
     }
 
+    /// The cron scheduler, when scheduled prompts are enabled (s12).
+    pub fn cron(&self) -> Option<&CronScheduler> {
+        self.cron.as_ref()
+    }
+
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
     /// with any hook-provided context.
     pub fn prepare_prompt(&self, prompt: &str) -> String {
@@ -147,6 +156,26 @@ impl Agent {
         let mut rounds_since_todo = 0usize;
         let active_request = active_request(history);
         let mut reactive_retries = 0usize;
+
+        // s12: a matched cron job becomes a `[Scheduled]` user message for this
+        // turn. It is acknowledged only once the model has accepted it, and put
+        // back (with the message removed) if the call fails.
+        let rollback_to = history.len();
+        let mut cron_unacked: Vec<CronJob> = Vec::new();
+        if let Some(cron) = &self.cron {
+            cron.poll(CronScheduler::now())?;
+            let due = cron.take_due();
+            if !due.is_empty() {
+                self.observer
+                    .on_event(AgentEvent::CronDelivered { count: due.len() });
+                let blocks: Vec<ContentBlock> = due
+                    .iter()
+                    .map(|job| ContentBlock::text(format!("[Scheduled] {}", job.prompt)))
+                    .collect();
+                history.push(Message::user_blocks(blocks));
+                cron_unacked = due;
+            }
+        }
 
         // s09: recall relevant records once per turn; the system prompt is
         // fixed for the whole turn.
@@ -194,6 +223,12 @@ impl Agent {
                 .await
             {
                 Ok(response) => {
+                    if !cron_unacked.is_empty() {
+                        if let Some(cron) = &self.cron {
+                            cron.acknowledge(&cron_unacked)?;
+                        }
+                        cron_unacked.clear();
+                    }
                     reactive_retries = 0;
                     response
                 }
@@ -206,7 +241,15 @@ impl Agent {
                         reactive_retries += 1;
                         continue;
                     }
-                    _ => return Err(error),
+                    _ => {
+                        if !cron_unacked.is_empty() {
+                            if let Some(cron) = &self.cron {
+                                cron.restore(&cron_unacked);
+                            }
+                            history.truncate(rollback_to);
+                        }
+                        return Err(error);
+                    }
                 },
             };
 
@@ -362,6 +405,7 @@ pub struct AgentBuilder {
     hooks: Vec<Arc<dyn Hook>>,
     observer: Option<Arc<dyn AgentObserver>>,
     background: Option<BackgroundManager>,
+    cron: Option<CronScheduler>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -424,6 +468,16 @@ impl AgentBuilder {
     /// turn, so the loop never blocks on a slow command.
     pub fn background(mut self, manager: BackgroundManager) -> Self {
         self.background = Some(manager);
+        self
+    }
+
+    /// Enable scheduled prompts (s12).
+    ///
+    /// Registers `schedule_cron`, `list_crons`, and `cancel_cron`, polls the
+    /// scheduler at the start of every turn, and delivers due jobs as
+    /// `[Scheduled] <prompt>` user messages.
+    pub fn cron(mut self, scheduler: CronScheduler) -> Self {
+        self.cron = Some(scheduler);
         self
     }
 
@@ -515,6 +569,10 @@ impl AgentBuilder {
         if self.background.is_some() {
             tools.register(BashTool::default().advertising_background());
         }
+        // s12: the cron tools share the scheduler's job table.
+        if let Some(scheduler) = &self.cron {
+            register_cron_tools(&mut tools, scheduler.clone());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -564,6 +622,7 @@ impl AgentBuilder {
             hooks,
             observer,
             background: self.background,
+            cron: self.cron,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -1142,5 +1201,89 @@ mod tests {
             "{injected}"
         );
         assert!(injected.contains("later-visible"), "{injected}");
+    }
+
+    #[tokio::test]
+    async fn a_due_cron_job_becomes_a_scheduled_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        let job = cron
+            .schedule("* * * * *", "run tests", true, false)
+            .unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+        assert!(cron.has_due());
+
+        let client = ScriptedClient::new(vec![response(
+            vec![ContentBlock::text("on it")],
+            "end_turn",
+        )]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = Vec::new();
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0].text().contains("[Scheduled] run tests"),
+            "{}",
+            history[0].text()
+        );
+        // Acknowledged: the recurring job stays and waits for the next match.
+        assert!(!cron.has_due());
+        assert_eq!(cron.jobs().len(), 1);
+        assert_eq!(cron.jobs()[0].id, job.id);
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_cron_job_is_removed_once_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        cron.schedule("* * * * *", "once only", false, false)
+            .unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+
+        let client =
+            ScriptedClient::new(vec![response(vec![ContentBlock::text("ok")], "end_turn")]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = Vec::new();
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert!(cron.jobs().is_empty());
+        assert!(!cron.has_due());
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_rolls_back_the_scheduled_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        cron.schedule("* * * * *", "retry me", true, false).unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+
+        let client = ScriptedClient::new(vec![]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("keep me")];
+        let error = agent.run_turn(&mut history).await.unwrap_err();
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text(), "keep me");
+        // The job is queued again for the next turn.
+        assert!(cron.has_due());
     }
 }

@@ -22,6 +22,7 @@ pub mod agent;
 pub mod background;
 pub mod compact;
 pub mod config;
+pub mod cron;
 pub mod error;
 pub mod hooks;
 pub mod llm;
@@ -43,6 +44,11 @@ pub use compact::{
     COMPACT_TOOL_NAME,
 };
 pub use config::Config;
+pub use cron::{
+    cron_matches, is_valid_cron_id, register_cron_tools, validate_cron, CancelCronTool, CronJob,
+    CronScheduler, ListCronsTool, ScheduleCronTool, CANCEL_CRON_TOOL_NAME, CRON_PROMPT,
+    LIST_CRONS_TOOL_NAME, SCHEDULED_TASKS_FILE, SCHEDULE_CRON_TOOL_NAME,
+};
 pub use error::{Error, Result};
 pub use hooks::{Hook, Hooks};
 pub use llm::{

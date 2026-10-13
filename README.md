@@ -62,6 +62,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/compact.rs` | Four-step context compaction and the `compact` tool (s08) |
 | `src/memory.rs` | Durable memory (s09): file-backed store, recall, extract, consolidate |
 | `src/background.rs` | Background Bash tasks (s11): worker threads + `<task_notification>` injection |
+| `src/cron.rs` | Cron scheduler (s12): 5-field expressions, durable jobs, `[Scheduled]` delivery |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -84,6 +85,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s09 | Durable memory: recall, extract, consolidate | `MemoryManager` + `MemoryStore` + `CatalogRecall` |
 | s10 | Persistent task graph with `blockedBy` + `owner` | `TaskStore` + the six task tools |
 | s11 | Slow Bash commands leave the loop | `BackgroundManager` + `run_in_background` + `<task_notification>` |
+| s12 | A prompt starts at a scheduled local time | `CronScheduler` + `schedule_cron` / `list_crons` / `cancel_cron` |
 
 ## Skills
 
@@ -249,6 +251,48 @@ The parameter is explicit: the harness never guesses from keywords such as
 and `AgentEvent::BackgroundCollected`; tune the per-command limits with
 `BackgroundManager::with_timeout(..)` / `with_max_output(..)`.
 
+## Scheduled prompts
+
+The scheduler (s12) answers "run the tests every weekday at 09:00" without the
+user having to ask again. A job pairs a 5-field cron expression with a prompt;
+when the expression matches the local clock the prompt is queued, and the loop
+delivers it as a `[Scheduled] <prompt>` user message on its next turn.
+
+```text
+  .scheduled_tasks.json        poll(now)          take_due()
+  cron:   0 9 * * 1-5  ---->   due?    ---->  [Scheduled] run tests
+  prompt: run tests                                  |
+                                          acknowledge / restore
+```
+
+Expressions are the usual five fields -- `minute hour day month weekday` --
+with `*`, `*/N`, `N`, `N-M`, and comma-separated lists; `validate_cron`
+rejects a bad expression before anything is stored, and day-of-month and
+day-of-week combine with cron's OR rule.
+
+| Tool | Effect |
+| --- | --- |
+| `schedule_cron` | Register a job; returns its `cron_xxxxxxxx` id |
+| `list_crons` | One line per job: expression, frequency, storage |
+| `cancel_cron` | Remove a job by id |
+
+```rust
+let agent = Agent::builder()
+    .client(client)
+    .cron(CronScheduler::new(workspace))   // registers the three tools
+    .system_prompt(format!("{} {}", default_system_prompt(), CRON_PROMPT))
+    .build();
+```
+
+Delivery is at-least-once. A job is acknowledged only after the model has
+accepted the prompt, so a failed call removes the `[Scheduled]` message again
+and puts the job back in the queue. `durable` jobs are written to
+`.scheduled_tasks.json` (temp file + rename) and restored by
+`CronScheduler::load`; `recurring=false` removes a job once delivered.
+`start_ticker()` polls once a second on a background thread so a job fires
+while the agent sits idle -- delivery still happens at the next turn
+boundary. `cron(..)` emits `AgentEvent::CronDelivered`.
+
 ## Getting started
 
 ```sh
@@ -315,6 +359,6 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron
 cargo clippy --all-targets
 ```
