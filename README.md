@@ -79,6 +79,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/message.rs` | Conversation model (`Message`, `ContentBlock`, `ToolCall`) |
 | `src/config.rs` | Environment configuration |
 | `src/main.rs` | Interactive REPL |
+| `src/bin/tui.rs` | Experimental `ratatui` TUI front-end over the same agent |
 
 ## Mapping to `learn-claude-code`
 
@@ -592,6 +593,31 @@ Environment variables:
 
 In the REPL: type a task, `/goal <condition>` to keep working until it is met,
 `/reset` to clear history, `q` to quit.
+
+## TUI (experimental)
+
+```sh
+cargo run --bin tui
+# no key handy? run the scripted demo model:
+cargo run --bin tui -- --demo
+# or render one frame to text (add --ansi for color):
+cargo run --bin tui -- --snapshot
+```
+
+A `ratatui` front-end over the *same* agent the CLI builds: skills, compaction,
+memory, subagent, task graph, background commands, cron, teams, MCP, recovery,
+workflows, and the `/goal` loop. The agent runs on its own thread with a
+current-thread Tokio runtime, so the blocking approval prompt never freezes the
+screen; every `AgentEvent` streams into a scrolling transcript.
+
+Type a task and press Enter, use `/goal <condition>` (or `/goal` for status and
+`/goal clear`) to drive the goal loop, answer permission prompts with `y`/`n`,
+and `Esc` to quit. While the UI is idle the agent thread keeps polling, so a due
+cron job, an incoming teammate message, or a finished background command starts
+its own turn -- which is how a deferred goal is judged as soon as its evidence
+arrives. `--demo` swaps in a scripted mock model (it answers the goal evaluator
+too), so the UI, the permission gate, and the goal loop can all be exercised
+without an API key.
 
 ## Embedding
 
