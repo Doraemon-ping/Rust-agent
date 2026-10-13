@@ -4,7 +4,7 @@ A minimal, extensible coding-agent runtime in Rust.
 
 Rust owns the *harness*: the loop, tool dispatch, and the permission gates.
 The model owns the *agency*. This crate is modelled on the `agent-loop`
-lessons in `learn-claude-code` (s01-s11), re-implemented idiomatically with
+lessons in `learn-claude-code` (s01-s14), re-implemented idiomatically with
 `tokio` + `reqwest` + `serde`.
 
 ## The loop
@@ -64,6 +64,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/background.rs` | Background Bash tasks (s11): worker threads + `<task_notification>` injection |
 | `src/cron.rs` | Cron scheduler (s12): 5-field expressions, durable jobs, `[Scheduled]` delivery |
 | `src/team.rs` | Agent teams (s13): mailboxes, teammate runtimes, plan gates, worktrees |
+| `src/mcp.rs` | MCP tools (s14): connect servers, namespace discovered tools, host policy |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -88,6 +89,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s11 | Slow Bash commands leave the loop | `BackgroundManager` + `run_in_background` + `<task_notification>` |
 | s12 | A prompt starts at a scheduled local time | `CronScheduler` + `schedule_cron` / `list_crons` / `cancel_cron` |
 | s13 | Lead delegates to persistent teammates | `Team` + `MessageBus` + `spawn_teammate` and the protocol tools |
+| s14 | Connect a server, discover and call its tools | `McpRegistry` + `McpServer` + `connect_mcp` + `mcp__{server}__{tool}` |
 
 ## Skills
 
@@ -347,6 +349,52 @@ teammate's working directory is fixed when it is spawned (its task's worktree,
 or the repository), so idle auto-claiming only takes tasks that resolve to that
 same directory. Removing a worktree stays with the host, as in the reference.
 
+## MCP tools
+
+The base tools are compiled in; external services are not. An MCP *server*
+advertises a `tools/list` catalogue and a `tools/call` entry point, and the
+harness decides what to do with it (s14). The model starts with the built-in
+tools plus `connect_mcp`; connecting a server adds its tools to the pool for
+the *next* model call.
+
+```text
+  connect_mcp(name="docs")
+        |  tools/list
+        v
+  mcp__docs__search, mcp__docs__get_version   <- namespaced, in the pool
+        |  tools/call
+        v
+  handler -> tool_result -> LLM
+```
+
+Tools are namespaced `mcp__{server}__{tool}`, with both halves normalized to
+the model's tool-name alphabet, so `docs.one/get.version` and
+`docs_one/get_version` cannot silently map to the same name. The host policy
+table decides authorization -- a `readOnlyHint` in a server's description is a
+hint, never a permission:
+
+| Server / tool | Policy |
+| --- | --- |
+| `docs/search`, `docs/get_version`, `deploy/status` | `allow` |
+| `deploy/trigger` | `confirm` |
+| anything else | `confirm` |
+
+```rust
+let agent = Agent::builder()
+    .client(client)
+    .mcp(McpRegistry::new())               // registers connect_mcp
+    .system_prompt(format!("{} {}", default_system_prompt(), MCP_PROMPT))
+    .build();
+```
+
+`mcp(..)` registers `connect_mcp`, gates discovered tools behind
+`McpPermissionHook` (a `confirm` tool pauses at the same `Approver` as a
+destructive command), lists connected servers in the system prompt, and emits
+`AgentEvent::McpConnected { server, tools }`. A malformed catalogue or a name
+collision is rejected at connect time, so the per-turn pool never half-fails.
+The shipped `docs` and `deploy` servers are in-process mocks; a real transport
+is just an `McpServer` implementation handed to `McpRegistry::register_server`.
+
 ## Getting started
 
 ```sh
@@ -413,10 +461,14 @@ let answer = agent.ask("summarise src/lib.rs").await?;
   tools and folds teammate events into the turn. `MessageBus` and the gate
   protocols are separate seams, so a different transport or approval scheme
   does not touch the loop.
+- **External tools**: `builder().mcp(McpRegistry::new())` registers
+  `connect_mcp` and the `mcp__*` host policy. Implement `McpServer` over any
+  transport and hand it to `McpRegistry::register_server`; the pool, the
+  permission hook, and the loop are unchanged.
 
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp
 cargo clippy --all-targets
 ```

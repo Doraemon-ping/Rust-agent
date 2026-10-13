@@ -26,6 +26,7 @@ pub mod cron;
 pub mod error;
 pub mod hooks;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod permission;
@@ -55,6 +56,11 @@ pub use hooks::{Hook, Hooks};
 pub use llm::{
     AnthropicClient, CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition,
     Usage,
+};
+pub use mcp::{
+    available_servers, host_policy, normalize_mcp_name, prefixed_tool_name, register_mcp_tools,
+    ConnectMcpTool, McpPermissionHook, McpPolicy, McpRegistry, McpServer, McpTool,
+    CONNECT_MCP_TOOL_NAME, MCP_PROMPT, MCP_TOOL_PREFIX,
 };
 pub use memory::{
     build_system, memory_slug, should_store_memory, validate_memory_record, CatalogRecall, Memory,

@@ -56,6 +56,10 @@ pub enum Error {
     #[error("team error: {0}")]
     Team(String),
 
+    /// The MCP layer rejected a server or a discovered tool (s14).
+    #[error("mcp error: {0}")]
+    Mcp(String),
+
     /// The loop hit its safety bound without the model stopping.
     #[error("agent exceeded the maximum number of iterations ({0})")]
     MaxIterations(usize),

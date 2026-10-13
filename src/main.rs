@@ -13,8 +13,8 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
-    ContentBlock, CronScheduler, LlmClient, MemoryConfig, Message, SkillLoader, Team, ToolCall,
-    ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, TASKS_PROMPT, TEAM_PROMPT,
+    ContentBlock, CronScheduler, LlmClient, McpRegistry, MemoryConfig, Message, SkillLoader, Team,
+    ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, MCP_PROMPT, TASKS_PROMPT, TEAM_PROMPT,
 };
 
 #[tokio::main]
@@ -57,6 +57,9 @@ async fn main() -> Result<()> {
     // s13: one Lead plus persistent teammates over file mailboxes.
     let team = Team::new(workspace.clone(), client.clone()).with_observer(TeammateObserver);
 
+    // s14: external tools arrive through MCP servers, gated by host policy.
+    let mcp = McpRegistry::new();
+
     let agent = Agent::builder()
         .shared_client(client)
         .tools(tools)
@@ -67,14 +70,16 @@ async fn main() -> Result<()> {
         .background(BackgroundManager::new())
         .cron(cron.clone())
         .team(team.clone())
+        .mcp(mcp.clone())
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
             TASKS_PROMPT,
             BACKGROUND_PROMPT,
             CRON_PROMPT,
-            TEAM_PROMPT
+            TEAM_PROMPT,
+            MCP_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -93,6 +98,7 @@ async fn main() -> Result<()> {
     println!("background: bash run_in_background -> <task_notification> (s11)");
     println!("cron: .scheduled_tasks.json (schedule_cron, list_crons, cancel_cron) (s12)");
     println!("team: .mailboxes/ (spawn_teammate, send_message, review_plan) (s13)");
+    println!("mcp: connect_mcp -> mcp__<server>__<tool> (docs, deploy) (s14)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
@@ -209,6 +215,9 @@ impl AgentObserver for PrintingObserver {
             AgentEvent::TeamEventDelivered { count } => {
                 println!("\x1b[35m[team] {count} event(s) from teammates\x1b[0m");
             }
+            AgentEvent::McpConnected { server, tools } => {
+                println!("\x1b[35m[mcp] connected {server}: {tools} tool(s)\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -276,6 +285,7 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::BackgroundCollected { .. }
             | AgentEvent::CronDelivered { .. }
             | AgentEvent::TeamEventDelivered { .. }
+            | AgentEvent::McpConnected { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

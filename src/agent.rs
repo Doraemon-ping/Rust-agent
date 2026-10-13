@@ -27,6 +27,7 @@ use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
 use crate::hooks::{Hook, Hooks};
 use crate::llm::{CompletionRequest, LlmClient};
+use crate::mcp::{register_mcp_tools, McpPermissionHook, McpRegistry, MCP_TOOL_PREFIX};
 use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
 use crate::permission::{Approver, AutoApprover, PermissionHook, PermissionPolicy};
@@ -73,6 +74,8 @@ pub enum AgentEvent<'a> {
     CronDelivered { count: usize },
     /// Teammate events were folded into this turn (s13).
     TeamEventDelivered { count: usize },
+    /// An MCP server was connected and its tools discovered (s14).
+    McpConnected { server: &'a str, tools: usize },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -100,6 +103,7 @@ pub struct Agent {
     background: Option<BackgroundManager>,
     cron: Option<CronScheduler>,
     team: Option<Team>,
+    mcp: Option<McpRegistry>,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -147,6 +151,11 @@ impl Agent {
         self.team.as_ref()
     }
 
+    /// The MCP registry, when external tools are enabled (s14).
+    pub fn mcp(&self) -> Option<&McpRegistry> {
+        self.mcp.as_ref()
+    }
+
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
     /// with any hook-provided context.
     pub fn prepare_prompt(&self, prompt: &str) -> String {
@@ -161,7 +170,6 @@ impl Agent {
     /// `history` is the live conversation. The loop appends to it, so callers
     /// keep multi-turn context across `run_turn` calls.
     pub async fn run_turn(&self, history: &mut Vec<Message>) -> Result<()> {
-        let tools = self.tools.definitions();
         let mut rounds_since_todo = 0usize;
         let active_request = active_request(history);
         let mut reactive_retries = 0usize;
@@ -213,7 +221,6 @@ impl Agent {
             }
             None => self.system_prompt.clone(),
         };
-
         for step in 0..self.max_steps {
             self.observer.on_event(AgentEvent::Step(step));
 
@@ -232,6 +239,26 @@ impl Agent {
 
             if let Some(compactor) = &self.compactor {
                 compactor.prepare(history, &active_request).await?;
+            }
+
+            // s14: reassemble the tool pool every round, so a server connected
+            // on the previous round is visible to the model on this one.
+            let mut tools = self.tools.definitions();
+            // ...and announce the connected servers alongside it, so the model
+            // does not have to guess which `mcp__*` tools exist.
+            let system_prompt = match &self.mcp {
+                Some(mcp) => {
+                    let section = mcp.prompt_section();
+                    if section.is_empty() {
+                        system_prompt.clone()
+                    } else {
+                        format!("{system_prompt}{section}")
+                    }
+                }
+                None => system_prompt.clone(),
+            };
+            if let Some(mcp) = &self.mcp {
+                tools.extend(mcp.tool_definitions());
             }
 
             let response = match self
@@ -405,6 +432,16 @@ impl Agent {
     }
 
     async fn dispatch(&self, call: &ToolCall) -> (String, bool) {
+        // s14: a discovered tool is not in the registry; it lives in the MCP
+        // registry until the turn ends, so dispatch resolves it by prefix.
+        if call.name.starts_with(MCP_TOOL_PREFIX) {
+            if let Some(mcp) = &self.mcp {
+                return match mcp.call_tool(&call.name, &call.input) {
+                    Ok(output) => (output, false),
+                    Err(error) => (format!("Error: {error}"), true),
+                };
+            }
+        }
         match self.tools.execute(&self.ctx, call).await {
             Ok(output) => (output, false),
             Err(error) => (format!("Error: {error}"), true),
@@ -429,6 +466,7 @@ pub struct AgentBuilder {
     background: Option<BackgroundManager>,
     cron: Option<CronScheduler>,
     team: Option<Team>,
+    mcp: Option<McpRegistry>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -514,6 +552,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable MCP external tools (s14).
+    ///
+    /// Registers `connect_mcp` and gates the discovered `mcp__*` tools behind
+    /// the host policy. Connected servers' tools join the model's tool pool on
+    /// the next round, and their names are listed in the system prompt.
+    pub fn mcp(mut self, registry: McpRegistry) -> Self {
+        self.mcp = Some(registry);
+        self
+    }
+
     /// Override the recall strategy (defaults to [`CatalogRecall`]).
     pub fn memory_recall(mut self, recall: impl MemoryRecall + 'static) -> Self {
         self.memory_recall = Some(Arc::new(recall));
@@ -594,11 +642,20 @@ impl AgentBuilder {
 
         // The permission pipeline is just the first hook, exactly as in s04.
         let mut hooks = Hooks::new();
+        let approver: Arc<dyn Approver> = self.approver.unwrap_or_else(|| Arc::new(AutoApprover));
         hooks.register(PermissionHook::new(
             self.policy
                 .unwrap_or_else(|| PermissionPolicy::new(workspace.clone())),
-            self.approver.unwrap_or_else(|| Arc::new(AutoApprover)),
+            Arc::clone(&approver),
         ));
+        // s14: discovered `mcp__*` tools answer to the host policy, not to the
+        // server's own annotations.
+        if let Some(registry) = &self.mcp {
+            hooks.register(McpPermissionHook::new(
+                registry.clone(),
+                Arc::clone(&approver),
+            ));
+        }
         for hook in self.hooks {
             hooks.register_arc(hook);
         }
@@ -616,6 +673,10 @@ impl AgentBuilder {
         if let Some(team) = &self.team {
             register_team_tools(&mut tools, team.clone());
         }
+        // s14: `connect_mcp` shares the registry the tool pool reads from.
+        if let Some(registry) = &self.mcp {
+            register_mcp_tools(&mut tools, registry.clone());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -632,6 +693,12 @@ impl AgentBuilder {
         }
         let observer: Arc<dyn AgentObserver> =
             self.observer.unwrap_or_else(|| Arc::new(NoopObserver));
+        if let Some(registry) = &self.mcp {
+            let observer = Arc::clone(&observer);
+            registry.set_listener(Arc::new(move |server: &str, tools: usize| {
+                observer.on_event(AgentEvent::McpConnected { server, tools });
+            }));
+        }
         let client = self.client.expect("AgentBuilder requires a client");
         let compactor = self.compaction.map(|config| {
             let observer = Arc::clone(&observer);
@@ -667,6 +734,7 @@ impl AgentBuilder {
             background: self.background,
             cron: self.cron,
             team: self.team,
+            mcp: self.mcp,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -1367,5 +1435,97 @@ mod tests {
         assert!(injected.contains("[result] bob: auth done"), "{injected}");
         // The Lead inbox is drained once the events are delivered.
         assert!(!team.bus().peek("lead").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_connected_mcp_tool_is_dispatched_through_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = McpRegistry::new();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use("call_1", "connect_mcp", json!({ "name": "docs" }))],
+                "tool_use",
+            ),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "mcp__docs__search",
+                    json!({ "query": "hooks" }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("done")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .mcp(mcp.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("search the docs")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        // The connect tool ran, and the discovered tool resolved two rounds on.
+        assert!(mcp.is_connected("docs"));
+        let (output, is_error) = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if content.contains("[docs]") => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("the discovered MCP tool result should be in history");
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "[docs] Found 3 results for 'hooks'");
+    }
+
+    #[tokio::test]
+    async fn the_host_policy_gates_unapproved_mcp_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = McpRegistry::new();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "connect_mcp",
+                    json!({ "name": "deploy" }),
+                )],
+                "tool_use",
+            ),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "mcp__deploy__trigger",
+                    json!({ "service": "web" }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("ok")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .mcp(mcp.clone())
+            .approver(crate::permission::DenyApprover)
+            .build();
+
+        let mut history = vec![Message::user_text("deploy web")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let blocked = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if *is_error && content.contains("Permission denied") => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the unapproved MCP tool should have been blocked");
+        assert!(blocked.contains("mcp__deploy__trigger"), "{blocked}");
     }
 }
