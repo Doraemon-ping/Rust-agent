@@ -13,3 +13,7 @@
 
 # cron scheduler (s12)
 /.scheduled_tasks.json
+
+# agent teams (s13)
+/.mailboxes
+/.worktrees

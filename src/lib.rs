@@ -31,6 +31,7 @@ pub mod message;
 pub mod permission;
 pub mod skills;
 pub mod subagent;
+pub mod team;
 pub mod tools;
 
 pub use agent::{
@@ -65,6 +66,15 @@ pub use permission::{
 };
 pub use skills::{parse_frontmatter, Skill, SkillLoader, SKILL_MANIFEST};
 pub use subagent::{subagent_system_prompt, TaskTool, TASK_TOOL_NAME};
+pub use team::{
+    register_team_tools, register_teammate_tools, teammate_system_prompt, CreateWorktreeTool,
+    ListTeammatesTool, MessageBus, PlanGate, RequestKind, RequestStatus, ReviewPlanTool,
+    SendMessageTool, SpawnTeammateTool, SubmitPlanTool, Team, TeamMessage, TeammateStatus,
+    CREATE_WORKTREE_TOOL_NAME, LEAD, LIST_TEAMMATES_TOOL_NAME, MAILBOXES_DIR,
+    REQUEST_PLAN_TOOL_NAME, REQUEST_SHUTDOWN_TOOL_NAME, REVIEW_PLAN_TOOL_NAME,
+    SEND_MESSAGE_TOOL_NAME, SPAWN_TEAMMATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME, TEAM_PROMPT,
+    WORKTREES_DIR,
+};
 pub use tools::{
     register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool, GetTaskTool,
     ListTasksTool, LoadSkillTool, Task, TaskStatus, TaskStore, Tool, ToolContext, ToolRegistry,

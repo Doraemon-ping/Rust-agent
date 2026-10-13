@@ -52,6 +52,10 @@ pub enum Error {
     #[error("memory error: {0}")]
     Memory(String),
 
+    /// The team runtime rejected an operation (s13).
+    #[error("team error: {0}")]
+    Team(String),
+
     /// The loop hit its safety bound without the model stopping.
     #[error("agent exceeded the maximum number of iterations ({0})")]
     MaxIterations(usize),

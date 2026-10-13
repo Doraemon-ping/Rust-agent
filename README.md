@@ -63,6 +63,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/memory.rs` | Durable memory (s09): file-backed store, recall, extract, consolidate |
 | `src/background.rs` | Background Bash tasks (s11): worker threads + `<task_notification>` injection |
 | `src/cron.rs` | Cron scheduler (s12): 5-field expressions, durable jobs, `[Scheduled]` delivery |
+| `src/team.rs` | Agent teams (s13): mailboxes, teammate runtimes, plan gates, worktrees |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -86,6 +87,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s10 | Persistent task graph with `blockedBy` + `owner` | `TaskStore` + the six task tools |
 | s11 | Slow Bash commands leave the loop | `BackgroundManager` + `run_in_background` + `<task_notification>` |
 | s12 | A prompt starts at a scheduled local time | `CronScheduler` + `schedule_cron` / `list_crons` / `cancel_cron` |
+| s13 | Lead delegates to persistent teammates | `Team` + `MessageBus` + `spawn_teammate` and the protocol tools |
 
 ## Skills
 
@@ -293,6 +295,58 @@ and puts the job back in the queue. `durable` jobs are written to
 while the agent sits idle -- delivery still happens at the next turn
 boundary. `cron(..)` emits `AgentEvent::CronDelivered`.
 
+## Agent teams
+
+A subagent (s06) is one call. A *teammate* (s13) is a long-lived runtime: its
+own conversation, its own working directory, and a `WORK -> IDLE -> WORK` loop
+over the shared task board. The two agents never share a `messages` array, so
+they coordinate through file mailboxes instead.
+
+```text
+  Lead ──spawn_teammate──> TeammateRuntime (thread)
+    ^                          │  work / idle scan
+    │  .mailboxes/lead.jsonl    │  claims ready tasks, completes them
+    └── result / idle / plan / shutdown ──┘
+```
+
+| Tool | Effect |
+| --- | --- |
+| `spawn_teammate` | Claim an initial task, then start one persistent teammate |
+| `list_teammates` | One line per teammate: `name: status` |
+| `send_message` | A plain message to `lead` or an active teammate |
+| `request_shutdown` / `review_plan` | Answer the two typed protocols |
+| `request_plan` | Gate a teammate behind a plan review |
+| `create_worktree` | `git worktree add .worktrees/<name>` and bind it to a task |
+
+Teammate-side tools are `send_message` and `submit_plan`, plus the base file and
+shell tools and `list_tasks` / `claim_task` / `complete_task` -- the last two
+claim *for that teammate*, so ownership stays honest on the shared board.
+
+The plan gate rides on the existing hook pipeline: while a teammate's gate is
+`required`, `pending`, or `rejected`, a `PreToolUse` hook blocks `bash`,
+`write_file`, and `edit_file`, and the model is told why. Approval is a typed
+request: `plan_approval_request` carries a `req_NNNNNN` id, `review_plan`
+answers it, and the teammate accepts a response only if its id, sender, target,
+status, and work version still match. Claiming, releasing, or completing a task
+bumps the work version, so a stale approval can never unlock a new assignment.
+
+```rust
+let team = Team::new(workspace, client);
+let agent = Agent::builder()
+    .client(client)
+    .team(team.clone())                    // registers the Lead's tools
+    .system_prompt(format!("{} {}", default_system_prompt(), TEAM_PROMPT))
+    .build();
+```
+
+`Agent::run_turn` drains the Lead's inbox before each model call and folds the
+events in as `[Team events] ...`, emitting `AgentEvent::TeamEventDelivered`.
+The CLI does the same while the REPL is idle, so a teammate's result wakes the
+Lead on its own. Teammates are threads with their own tokio runtime; a
+teammate's working directory is fixed when it is spawned (its task's worktree,
+or the repository), so idle auto-claiming only takes tasks that resolve to that
+same directory. Removing a worktree stays with the host, as in the reference.
+
 ## Getting started
 
 ```sh
@@ -355,10 +409,14 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 - **Memory policy**: `builder().memory(MemoryConfig::default())` and tune the
   thresholds, or leave it off. Swap in a different `MemoryRecall` to change how
   records are selected without touching extraction or consolidation.
+- **Teams**: `builder().team(Team::new(workspace, client))` registers the Lead
+  tools and folds teammate events into the turn. `MessageBus` and the gate
+  protocols are separate seams, so a different transport or approval scheme
+  does not touch the loop.
 
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams
 cargo clippy --all-targets
 ```

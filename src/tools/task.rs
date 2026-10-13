@@ -83,6 +83,9 @@ pub struct Task {
     /// IDs this task waits on (the wire name is `blockedBy`).
     #[serde(rename = "blockedBy", default)]
     pub blocked_by: Vec<String>,
+    /// Optional teammate worktree (s13) bound to this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// Whether `id` matches `task_` followed by 8 lowercase hex digits.
@@ -168,6 +171,7 @@ impl TaskStore {
                 status: TaskStatus::Pending,
                 owner: None,
                 blocked_by: Vec::new(),
+                worktree: None,
             };
             let path = self.path(&task.id)?;
             match fs::OpenOptions::new()
@@ -301,6 +305,23 @@ impl TaskStore {
                 task.blocked_by.push(dependency);
             }
         }
+        self.save(&task)?;
+        Ok(task)
+    }
+
+    /// Bind a task (s13) to a teammate worktree name.
+    pub fn bind_worktree(&self, task_id: &str, name: &str) -> Result<Task> {
+        let mut task = self.load(task_id)?;
+        task.worktree = Some(name.to_string());
+        self.save(&task)?;
+        Ok(task)
+    }
+
+    /// Give a claimed task back to the board: `in_progress` -> `pending`.
+    pub fn release(&self, task_id: &str) -> Result<Task> {
+        let mut task = self.load(task_id)?;
+        task.owner = None;
+        task.status = TaskStatus::Pending;
         self.save(&task)?;
         Ok(task)
     }
@@ -501,8 +522,13 @@ impl Tool for ListTasksTool {
                 } else {
                     format!(" (blockedBy: {})", task.blocked_by.join(", "))
                 };
+                let worktree = task
+                    .worktree
+                    .as_ref()
+                    .map(|name| format!(" (worktree: {name})"))
+                    .unwrap_or_default();
                 format!(
-                    "{} {}: {} [{}]{owner}{dependencies}",
+                    "{} {}: {} [{}]{owner}{dependencies}{worktree}",
                     task.status.marker(),
                     task.id,
                     task.subject,
@@ -543,7 +569,26 @@ impl Tool for GetTaskTool {
 }
 
 /// `claim_task`: take ownership of a pending, unblocked task.
-pub struct ClaimTaskTool;
+pub struct ClaimTaskTool {
+    owner: String,
+}
+
+impl Default for ClaimTaskTool {
+    fn default() -> Self {
+        ClaimTaskTool {
+            owner: DEFAULT_OWNER.to_string(),
+        }
+    }
+}
+
+impl ClaimTaskTool {
+    /// A variant that claims tasks for a named teammate (s13).
+    pub fn owned_by(owner: impl Into<String>) -> Self {
+        ClaimTaskTool {
+            owner: owner.into(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ClaimTaskTool {
@@ -566,12 +611,31 @@ impl Tool for ClaimTaskTool {
 
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let task_id = required_str(&input, "task_id")?;
-        TaskStore::new(ctx.workspace()).claim(task_id, DEFAULT_OWNER)
+        TaskStore::new(ctx.workspace()).claim(task_id, &self.owner)
     }
 }
 
 /// `complete_task`: finish a task this agent owns and report unblocked work.
-pub struct CompleteTaskTool;
+pub struct CompleteTaskTool {
+    owner: String,
+}
+
+impl Default for CompleteTaskTool {
+    fn default() -> Self {
+        CompleteTaskTool {
+            owner: DEFAULT_OWNER.to_string(),
+        }
+    }
+}
+
+impl CompleteTaskTool {
+    /// A variant that completes tasks owned by a named teammate (s13).
+    pub fn owned_by(owner: impl Into<String>) -> Self {
+        CompleteTaskTool {
+            owner: owner.into(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for CompleteTaskTool {
@@ -594,7 +658,7 @@ impl Tool for CompleteTaskTool {
 
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let task_id = required_str(&input, "task_id")?;
-        TaskStore::new(ctx.workspace()).complete(task_id, DEFAULT_OWNER)
+        TaskStore::new(ctx.workspace()).complete(task_id, &self.owner)
     }
 }
 
@@ -604,8 +668,8 @@ pub fn register_task_tools(registry: &mut ToolRegistry) {
     registry.register(UpdateTaskTool);
     registry.register(ListTasksTool);
     registry.register(GetTaskTool);
-    registry.register(ClaimTaskTool);
-    registry.register(CompleteTaskTool);
+    registry.register(ClaimTaskTool::default());
+    registry.register(CompleteTaskTool::default());
 }
 
 #[cfg(test)]

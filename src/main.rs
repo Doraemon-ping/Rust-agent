@@ -13,8 +13,8 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
-    ContentBlock, CronScheduler, LlmClient, MemoryConfig, Message, SkillLoader, ToolCall,
-    ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, TASKS_PROMPT,
+    ContentBlock, CronScheduler, LlmClient, MemoryConfig, Message, SkillLoader, Team, ToolCall,
+    ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, TASKS_PROMPT, TEAM_PROMPT,
 };
 
 #[tokio::main]
@@ -54,6 +54,9 @@ async fn main() -> Result<()> {
     }
     cron.start_ticker();
 
+    // s13: one Lead plus persistent teammates over file mailboxes.
+    let team = Team::new(workspace.clone(), client.clone()).with_observer(TeammateObserver);
+
     let agent = Agent::builder()
         .shared_client(client)
         .tools(tools)
@@ -63,13 +66,15 @@ async fn main() -> Result<()> {
         .memory(MemoryConfig::default())
         .background(BackgroundManager::new())
         .cron(cron.clone())
+        .team(team.clone())
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} {} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
             TASKS_PROMPT,
             BACKGROUND_PROMPT,
-            CRON_PROMPT
+            CRON_PROMPT,
+            TEAM_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -87,6 +92,7 @@ async fn main() -> Result<()> {
     println!("tasks: .tasks/ (create, update, claim, complete)");
     println!("background: bash run_in_background -> <task_notification> (s11)");
     println!("cron: .scheduled_tasks.json (schedule_cron, list_crons, cancel_cron) (s12)");
+    println!("team: .mailboxes/ (spawn_teammate, send_message, review_plan) (s13)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
@@ -97,6 +103,15 @@ async fn main() -> Result<()> {
         // the next prompt: the loop polls the scheduler as it begins.
         if cron.has_due() {
             println!("\x1b[35m[cron] a scheduled job is due\x1b[0m");
+            if let Err(error) = agent.run_turn(&mut history).await {
+                eprintln!("\x1b[31merror: {error}\x1b[0m");
+            }
+            println!();
+        }
+
+        // A teammate event wakes the Lead on its own, exactly like a due job.
+        if team.bus().peek(rust_agent::team::LEAD).unwrap_or(false) {
+            println!("\x1b[35m[team] teammate events arrived\x1b[0m");
             if let Err(error) = agent.run_turn(&mut history).await {
                 eprintln!("\x1b[31merror: {error}\x1b[0m");
             }
@@ -191,6 +206,9 @@ impl AgentObserver for PrintingObserver {
             AgentEvent::CronDelivered { count } => {
                 println!("\x1b[35m[cron] delivered {count} job(s)\x1b[0m");
             }
+            AgentEvent::TeamEventDelivered { count } => {
+                println!("\x1b[35m[team] {count} event(s) from teammates\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -198,6 +216,32 @@ impl AgentObserver for PrintingObserver {
 
 /// Asks the user before running a flagged tool.
 struct InteractiveApprover;
+
+/// Renders a running teammate's own tool traffic, dimmed and prefixed.
+struct TeammateObserver;
+
+impl AgentObserver for TeammateObserver {
+    fn on_event(&self, event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::ToolCall { name, input } => {
+                println!("\x1b[35m  [team] > {name}\x1b[0m {}", compact(input));
+            }
+            AgentEvent::ToolResult {
+                name,
+                output,
+                is_error,
+            } => {
+                let color = if is_error { "\x1b[31m" } else { "\x1b[35m" };
+                let body = preview(output).replace('\n', "\n  ");
+                println!("{color}  [team] {name}: {body}\x1b[0m");
+            }
+            AgentEvent::Blocked { name, reason } => {
+                println!("\x1b[31m  [team] blocked {name}: {reason}\x1b[0m");
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Renders a subagent's own events, prefixed and dimmed.
 struct SubagentObserver;
@@ -231,6 +275,7 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::BackgroundStarted { .. }
             | AgentEvent::BackgroundCollected { .. }
             | AgentEvent::CronDelivered { .. }
+            | AgentEvent::TeamEventDelivered { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

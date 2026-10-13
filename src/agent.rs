@@ -31,6 +31,7 @@ use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
 use crate::permission::{Approver, AutoApprover, PermissionHook, PermissionPolicy};
 use crate::skills::SkillLoader;
+use crate::team::{register_team_tools, Team};
 use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
 
 /// Reminder injected when the model goes several rounds without updating its
@@ -70,6 +71,8 @@ pub enum AgentEvent<'a> {
     BackgroundCollected { count: usize },
     /// Due cron jobs were delivered as `[Scheduled]` user messages (s12).
     CronDelivered { count: usize },
+    /// Teammate events were folded into this turn (s13).
+    TeamEventDelivered { count: usize },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -96,6 +99,7 @@ pub struct Agent {
     observer: Arc<dyn AgentObserver>,
     background: Option<BackgroundManager>,
     cron: Option<CronScheduler>,
+    team: Option<Team>,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -138,6 +142,11 @@ impl Agent {
         self.cron.as_ref()
     }
 
+    /// The team runtime, when teammates are enabled (s13).
+    pub fn team(&self) -> Option<&Team> {
+        self.team.as_ref()
+    }
+
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
     /// with any hook-provided context.
     pub fn prepare_prompt(&self, prompt: &str) -> String {
@@ -156,6 +165,19 @@ impl Agent {
         let mut rounds_since_todo = 0usize;
         let active_request = active_request(history);
         let mut reactive_retries = 0usize;
+
+        // s13: teammates speak to the Lead over mailboxes rather than through
+        // its context; fold whatever arrived into this turn.
+        if let Some(team) = &self.team {
+            if let Ok(events) = team.consume_lead_inbox() {
+                if !events.is_empty() {
+                    self.observer.on_event(AgentEvent::TeamEventDelivered {
+                        count: events.len(),
+                    });
+                    history.push(Message::user_text(Team::format_team_events(&events)));
+                }
+            }
+        }
 
         // s12: a matched cron job becomes a `[Scheduled]` user message for this
         // turn. It is acknowledged only once the model has accepted it, and put
@@ -406,6 +428,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn AgentObserver>>,
     background: Option<BackgroundManager>,
     cron: Option<CronScheduler>,
+    team: Option<Team>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -481,6 +504,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable agent teams (s13).
+    ///
+    /// Registers the Lead's team tools and folds teammate events (results,
+    /// idle notices, plan decisions) into the conversation at the start of
+    /// every turn.
+    pub fn team(mut self, team: Team) -> Self {
+        self.team = Some(team);
+        self
+    }
+
     /// Override the recall strategy (defaults to [`CatalogRecall`]).
     pub fn memory_recall(mut self, recall: impl MemoryRecall + 'static) -> Self {
         self.memory_recall = Some(Arc::new(recall));
@@ -516,6 +549,12 @@ impl AgentBuilder {
     /// Set the event observer (defaults to [`NoopObserver`]).
     pub fn observer(mut self, observer: impl AgentObserver + 'static) -> Self {
         self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Set the event observer from an already-shared handle.
+    pub fn shared_observer(mut self, observer: Arc<dyn AgentObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -573,6 +612,10 @@ impl AgentBuilder {
         if let Some(scheduler) = &self.cron {
             register_cron_tools(&mut tools, scheduler.clone());
         }
+        // s13: the Lead's team tools all share one runtime.
+        if let Some(team) = &self.team {
+            register_team_tools(&mut tools, team.clone());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -623,6 +666,7 @@ impl AgentBuilder {
             observer,
             background: self.background,
             cron: self.cron,
+            team: self.team,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -1285,5 +1329,43 @@ mod tests {
         assert_eq!(history[0].text(), "keep me");
         // The job is queued again for the next turn.
         assert!(cron.has_due());
+    }
+
+    #[tokio::test]
+    async fn teammate_events_are_injected_into_the_lead_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Team::new(dir.path(), Arc::new(ScriptedClient::new(vec![])));
+        team.bus()
+            .send(&crate::team::TeamMessage::new(
+                "bob",
+                "lead",
+                "auth done",
+                "result",
+            ))
+            .unwrap();
+        assert!(team.bus().peek("lead").unwrap());
+
+        let client = ScriptedClient::new(vec![response(
+            vec![ContentBlock::text("noted")],
+            "end_turn",
+        )]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .team(team.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("status?")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let injected = history
+            .iter()
+            .map(Message::text)
+            .find(|text| text.contains("[Team events]"))
+            .expect("team events should have been injected");
+        assert!(injected.contains("[result] bob: auth done"), "{injected}");
+        // The Lead inbox is drained once the events are delivered.
+        assert!(!team.bus().peek("lead").unwrap());
     }
 }
