@@ -23,6 +23,21 @@ pub enum Role {
 pub enum ContentBlock {
     /// Plain text.
     Text { text: String },
+    /// Extended-thinking reasoning emitted alongside the visible answer.
+    ///
+    /// Preserved verbatim (including `signature`) because the Messages API
+    /// requires thinking blocks to be echoed back unmodified on the next turn.
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Encrypted reasoning the model chose not to expose; echoed back as-is.
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
     /// The model asking us to run a tool.
     ToolUse {
         id: String,
@@ -140,5 +155,47 @@ impl Message {
             .iter()
             .filter_map(ContentBlock::as_tool_call)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_blocks_round_trip_verbatim() {
+        let raw = r#"{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "let me plan", "signature": "abc123"},
+                {"type": "text", "text": "here is the plan"}
+            ]
+        }"#;
+        let message: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(message.text(), "here is the plan");
+
+        // The signature must survive the round trip; the API rejects a
+        // replayed thinking block whose signature was dropped.
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["content"][0]["type"], "thinking");
+        assert_eq!(encoded["content"][0]["signature"], "abc123");
+    }
+
+    #[test]
+    fn thinking_and_redacted_blocks_do_not_masquerade_as_text_or_tools() {
+        let raw = r#"[
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "redacted_thinking", "data": "encrypted"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}
+        ]"#;
+        let blocks: Vec<ContentBlock> = serde_json::from_str(raw).unwrap();
+        assert!(blocks.iter().all(|block| block.as_text().is_none()));
+        assert_eq!(
+            blocks.iter().filter_map(ContentBlock::as_tool_call).count(),
+            1
+        );
+        // A missing signature must not be serialized as `null`.
+        let encoded = serde_json::to_value(&blocks[0]).unwrap();
+        assert!(encoded.get("signature").is_none());
     }
 }
