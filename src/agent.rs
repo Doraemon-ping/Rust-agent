@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::background::{placeholder, should_run_background, BackgroundManager};
 use crate::compact::{
     is_context_overflow, CompactConfig, CompactTool, Compactor, COMPACT_TOOL_NAME,
 };
@@ -29,7 +30,7 @@ use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
 use crate::permission::{Approver, AutoApprover, PermissionHook, PermissionPolicy};
 use crate::skills::SkillLoader;
-use crate::tools::{LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
+use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
 
 /// Reminder injected when the model goes several rounds without updating its
 /// todo list (s05).
@@ -62,6 +63,10 @@ pub enum AgentEvent<'a> {
     MemoryRecalled { count: usize },
     /// The post-turn pass stored memories (and possibly consolidated them).
     MemoryStored { stored: usize, consolidated: usize },
+    /// A `bash` call was dispatched to a background thread (s11).
+    BackgroundStarted { task_id: &'a str },
+    /// Completed background results were injected into this turn (s11).
+    BackgroundCollected { count: usize },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -86,6 +91,7 @@ pub struct Agent {
     ctx: ToolContext,
     hooks: Hooks,
     observer: Arc<dyn AgentObserver>,
+    background: Option<BackgroundManager>,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -116,6 +122,11 @@ impl Agent {
     /// The memory manager, when durable memory is enabled.
     pub fn memory(&self) -> Option<&MemoryManager> {
         self.memory.as_deref()
+    }
+
+    /// The background task manager, when background execution is enabled (s11).
+    pub fn background(&self) -> Option<&BackgroundManager> {
+        self.background.as_ref()
     }
 
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
@@ -154,6 +165,19 @@ impl Agent {
 
         for step in 0..self.max_steps {
             self.observer.on_event(AgentEvent::Step(step));
+
+            // s11: completed background results ride in on a later turn, as
+            // independent `<task_notification>` blocks (never on the original
+            // tool_use_id, which the placeholder already answered).
+            if let Some(background) = &self.background {
+                let notifications = background.collect();
+                if !notifications.is_empty() {
+                    self.observer.on_event(AgentEvent::BackgroundCollected {
+                        count: notifications.len(),
+                    });
+                    inject_notifications(history, notifications);
+                }
+            }
 
             if let Some(compactor) = &self.compactor {
                 compactor.prepare(history, &active_request).await?;
@@ -278,6 +302,33 @@ impl Agent {
             return (ContentBlock::tool_result(call.id, reason, true), false);
         }
 
+        // s11: an explicit `run_in_background` hands the command to a worker
+        // thread and answers this call at once with a placeholder result.
+        if let Some(background) = &self.background {
+            if should_run_background(&call.name, &call.input) {
+                let command = call
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let (output, is_error) = match background.start(self.ctx.workspace(), command) {
+                    Ok(task_id) => {
+                        self.observer
+                            .on_event(AgentEvent::BackgroundStarted { task_id: &task_id });
+                        (placeholder(&task_id), false)
+                    }
+                    Err(error) => (format!("Error: {error}"), true),
+                };
+                self.hooks.post_tool_use(&call, &output);
+                self.observer.on_event(AgentEvent::ToolResult {
+                    name: &call.name,
+                    output: &output,
+                    is_error,
+                });
+                return (ContentBlock::tool_result(call.id, output, is_error), true);
+            }
+        }
+
         let (output, is_error) = self.dispatch(&call).await;
         self.hooks.post_tool_use(&call, &output);
         self.observer.on_event(AgentEvent::ToolResult {
@@ -310,6 +361,7 @@ pub struct AgentBuilder {
     approver: Option<Arc<dyn Approver>>,
     hooks: Vec<Arc<dyn Hook>>,
     observer: Option<Arc<dyn AgentObserver>>,
+    background: Option<BackgroundManager>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -361,6 +413,17 @@ impl AgentBuilder {
     /// `<workspace>/.memory/`.
     pub fn memory(mut self, config: MemoryConfig) -> Self {
         self.memory = Some(config);
+        self
+    }
+
+    /// Enable background Bash execution (s11).
+    ///
+    /// Advertises `run_in_background` on the `bash` tool and routes those
+    /// calls through `manager`. A command the model flags runs on a worker
+    /// thread; its result is injected as a `<task_notification>` on a later
+    /// turn, so the loop never blocks on a slow command.
+    pub fn background(mut self, manager: BackgroundManager) -> Self {
+        self.background = Some(manager);
         self
     }
 
@@ -448,6 +511,10 @@ impl AgentBuilder {
         }
 
         let mut tools = self.tools.unwrap_or_else(ToolRegistry::with_defaults);
+        // s11: only advertise `run_in_background` when a manager can honour it.
+        if self.background.is_some() {
+            tools.register(BashTool::default().advertising_background());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -496,6 +563,7 @@ impl AgentBuilder {
             ctx: ToolContext::new(workspace),
             hooks,
             observer,
+            background: self.background,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -517,6 +585,19 @@ pub fn default_system_prompt() -> String {
     format!(
         "You are a coding agent at {cwd}. Environment: {environment} Before starting any multi-step task, use todo_write to plan your steps, then update status as you go."
     )
+}
+
+/// Fold completed background notifications into the conversation.
+///
+/// They extend the trailing user message when there is one (the tool-result
+/// round the loop just pushed), so a notification lands next to the results
+/// the model is already reading.
+fn inject_notifications(history: &mut Vec<Message>, notifications: Vec<String>) {
+    let blocks: Vec<ContentBlock> = notifications.into_iter().map(ContentBlock::text).collect();
+    match history.last_mut() {
+        Some(message) if message.role == Role::User => message.content.extend(blocks),
+        _ => history.push(Message::user_blocks(blocks)),
+    }
 }
 
 /// The most recent user text, kept verbatim in any compaction summary so the
@@ -961,5 +1042,105 @@ mod tests {
         );
         assert!(history[0].text().contains("summary of the past"));
         assert_eq!(history[1].text(), "final answer");
+    }
+
+    #[tokio::test]
+    async fn a_background_bash_call_returns_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "bash",
+                    json!({ "command": "echo inline-marker", "run_in_background": true }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("carrying on")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .background(BackgroundManager::new())
+            .build();
+
+        let mut history = vec![Message::user_text("start it")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let results = history
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            results
+                .iter()
+                .any(|text| text.contains("Background task bg_0001 started")),
+            "{results:?}"
+        );
+        // The command was dispatched, not executed inline.
+        assert!(!results.iter().any(|text| text.contains("inline-marker")));
+        wait_for_background(&agent);
+        assert_eq!(agent.background().unwrap().collect().len(), 1);
+    }
+
+    /// Block until the agent's background manager has a queued result.
+    fn wait_for_background(agent: &Agent) {
+        let manager = agent.background().expect("background enabled");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while manager.ready() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background task did not finish in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_background_result_is_injected_on_a_later_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "bash",
+                    json!({ "command": "echo later-visible", "run_in_background": true }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("started")], "end_turn"),
+            response(vec![ContentBlock::text("noted")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .background(BackgroundManager::new())
+            .build();
+
+        let mut history = vec![Message::user_text("kick it off")];
+        agent.run_turn(&mut history).await.unwrap();
+        wait_for_background(&agent);
+
+        history.push(Message::user_text("any update?"));
+        agent.run_turn(&mut history).await.unwrap();
+
+        let injected = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(ContentBlock::as_text)
+            .find(|text| text.contains("<task_notification>"))
+            .expect("a task_notification should have been injected");
+        assert!(
+            injected.contains("<status>completed</status>"),
+            "{injected}"
+        );
+        assert!(injected.contains("later-visible"), "{injected}");
     }
 }

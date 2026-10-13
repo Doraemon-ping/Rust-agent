@@ -4,7 +4,7 @@ A minimal, extensible coding-agent runtime in Rust.
 
 Rust owns the *harness*: the loop, tool dispatch, and the permission gates.
 The model owns the *agency*. This crate is modelled on the `agent-loop`
-lessons in `learn-claude-code` (s01-s10), re-implemented idiomatically with
+lessons in `learn-claude-code` (s01-s11), re-implemented idiomatically with
 `tokio` + `reqwest` + `serde`.
 
 ## The loop
@@ -61,6 +61,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/skills.rs` | `SkillLoader`: scans `skills/*/SKILL.md`, builds the catalog |
 | `src/compact.rs` | Four-step context compaction and the `compact` tool (s08) |
 | `src/memory.rs` | Durable memory (s09): file-backed store, recall, extract, consolidate |
+| `src/background.rs` | Background Bash tasks (s11): worker threads + `<task_notification>` injection |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -82,6 +83,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s08 | Compact: spill, archive, trim, summarise | `Compactor` + `compact` tool |
 | s09 | Durable memory: recall, extract, consolidate | `MemoryManager` + `MemoryStore` + `CatalogRecall` |
 | s10 | Persistent task graph with `blockedBy` + `owner` | `TaskStore` + the six task tools |
+| s11 | Slow Bash commands leave the loop | `BackgroundManager` + `run_in_background` + `<task_notification>` |
 
 ## Skills
 
@@ -216,6 +218,37 @@ let agent = Agent::builder()
     .build();
 ```
 
+## Background tasks
+
+A slow command need not block the loop. When the model calls `bash` with
+`run_in_background: true` (s11), the loop hands the command to a worker thread
+and answers the call at once with a placeholder result:
+
+```text
+Turn 1: bash "npm install" (run_in_background=true)
+        -> tool_result "[Background task bg_0001 started]"
+Turn 2: read_file "package.json"      (runs while the install churns)
+Turn 3: -> <task_notification> for bg_0001 is injected with the result
+```
+
+The finished result arrives on a later turn as a `<task_notification>` block.
+It deliberately does *not* reuse the original `tool_use_id`: that call was
+already answered by the placeholder, and one `tool_use` maps to exactly one
+`tool_result`.
+
+```rust
+let agent = Agent::builder()
+    .client(client)
+    .background(BackgroundManager::new())   // advertises run_in_background
+    .system_prompt(format!("{} {}", default_system_prompt(), BACKGROUND_PROMPT))
+    .build();
+```
+
+The parameter is explicit: the harness never guesses from keywords such as
+`install` or `build`. `background(..)` emits `AgentEvent::BackgroundStarted`
+and `AgentEvent::BackgroundCollected`; tune the per-command limits with
+`BackgroundManager::with_timeout(..)` / `with_max_output(..)`.
+
 ## Getting started
 
 ```sh
@@ -282,6 +315,6 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background
 cargo clippy --all-targets
 ```

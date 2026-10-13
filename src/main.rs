@@ -12,8 +12,9 @@ use rust_agent::hooks::Hook;
 use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
-    default_system_prompt, Agent, AnthropicClient, CompactConfig, Config, ContentBlock, LlmClient,
-    MemoryConfig, Message, SkillLoader, ToolCall, ToolRegistry, TASKS_PROMPT,
+    default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
+    ContentBlock, LlmClient, MemoryConfig, Message, SkillLoader, ToolCall, ToolRegistry,
+    BACKGROUND_PROMPT, TASKS_PROMPT,
 };
 
 #[tokio::main]
@@ -51,11 +52,13 @@ async fn main() -> Result<()> {
         .skills(skills)
         .compaction(CompactConfig::default())
         .memory(MemoryConfig::default())
+        .background(BackgroundManager::new())
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
-            TASKS_PROMPT
+            TASKS_PROMPT,
+            BACKGROUND_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -71,6 +74,7 @@ async fn main() -> Result<()> {
     println!("skills: {skill_count} loaded from skills/");
     println!("memory: .memory/ (recall + extract + consolidate)");
     println!("tasks: .tasks/ (create, update, claim, complete)");
+    println!("background: bash run_in_background -> <task_notification> (s11)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
@@ -156,6 +160,12 @@ impl AgentObserver for PrintingObserver {
                     println!("\x1b[33m[memory: stored {stored}]\x1b[0m");
                 }
             }
+            AgentEvent::BackgroundStarted { task_id } => {
+                println!("\x1b[35m[background] {task_id} running\x1b[0m");
+            }
+            AgentEvent::BackgroundCollected { count } => {
+                println!("\x1b[35m[background] collected {count} result(s)\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -193,6 +203,8 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::Step(_)
             | AgentEvent::Compacted { .. }
             | AgentEvent::MemoryRecalled { .. }
+            | AgentEvent::BackgroundStarted { .. }
+            | AgentEvent::BackgroundCollected { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

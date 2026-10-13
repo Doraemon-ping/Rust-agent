@@ -19,6 +19,7 @@
 //! ```
 
 pub mod agent;
+pub mod background;
 pub mod compact;
 pub mod config;
 pub mod error;
@@ -33,6 +34,9 @@ pub mod tools;
 
 pub use agent::{
     default_system_prompt, Agent, AgentBuilder, AgentEvent, AgentObserver, NoopObserver,
+};
+pub use background::{
+    placeholder, should_run_background, BackgroundManager, BACKGROUND_PROMPT, NOTIFICATION_TAG,
 };
 pub use compact::{
     is_context_overflow, CompactConfig, CompactTool, CompactionListener, Compactor,
