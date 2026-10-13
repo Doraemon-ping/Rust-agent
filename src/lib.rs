@@ -36,6 +36,7 @@ pub mod skills;
 pub mod subagent;
 pub mod team;
 pub mod tools;
+pub mod ui;
 pub mod workflow;
 
 pub use agent::{

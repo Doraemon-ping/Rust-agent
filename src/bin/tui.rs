@@ -5,6 +5,7 @@
 //! channels: commands go down, events come up, and approvals rendezvous on a
 //! `Mutex`/`Condvar` gate.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -13,15 +14,16 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::layout::Position;
+use ratatui::style::{Color, Modifier};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 
 use rust_agent::agent::{AgentEvent, AgentObserver};
 use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
+use rust_agent::ui::{self, ApprovalView, Entry, EntryKind, StatusInfo, Theme};
 use rust_agent::{
     default_registry, default_system_prompt, parse_goal_command, Agent, AnthropicAgentRunner,
     AnthropicClient, BackgroundManager, CompactConfig, CompletionRequest, CompletionResponse,
@@ -74,6 +76,8 @@ enum UiEvent {
         reason: String,
     },
     Error(String),
+    /// The agent thread picked up a turn (a prompt, or idle work).
+    TurnStarted,
     TurnDone,
 }
 
@@ -82,6 +86,8 @@ enum UiEvent {
 struct ApprovalGate {
     decision: Mutex<Option<bool>>,
     ready: Condvar,
+    /// Tool names the user waved through for the rest of the session.
+    always: Mutex<HashSet<String>>,
 }
 
 impl ApprovalGate {
@@ -98,6 +104,16 @@ impl ApprovalGate {
     fn answer(&self, allow: bool) {
         *self.decision.lock().unwrap() = Some(allow);
         self.ready.notify_all();
+    }
+
+    /// Stop asking about `name` for the rest of the session.
+    fn allow_always(&self, name: &str) {
+        self.always.lock().unwrap().insert(name.to_string());
+    }
+
+    /// True when the user already said "always" for this tool.
+    fn is_always(&self, name: &str) -> bool {
+        self.always.lock().unwrap().contains(name)
     }
 }
 
@@ -215,6 +231,14 @@ struct TuiApprover {
 
 impl Approver for TuiApprover {
     fn approve(&self, call: &ToolCall, reason: &str) -> bool {
+        // The user already waved this tool through for the session.
+        if self.gate.is_always(&call.name) {
+            let _ = self.tx.send(UiEvent::Notice(format!(
+                "[permission] {} allowed for the session",
+                call.name
+            )));
+            return true;
+        }
         let _ = self.tx.send(UiEvent::Approval {
             name: call.name.clone(),
             input: compact(&call.input),
@@ -403,6 +427,7 @@ fn run_turn(
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
 ) {
+    let _ = tx.send(UiEvent::TurnStarted);
     if let Err(error) = runtime.block_on(agent.run_turn(history)) {
         let _ = tx.send(UiEvent::Error(error.to_string()));
     }
@@ -464,26 +489,22 @@ fn idle_wake(agent: &Agent) -> Option<&'static str> {
     None
 }
 
-/// An approval awaiting the user's answer.
-struct Pending {
-    name: String,
-    input: String,
-    reason: String,
-}
-
 /// Everything the UI needs to draw one frame.
 struct UiState {
     model: String,
     workspace: PathBuf,
     skills: usize,
-    transcript: Vec<Line<'static>>,
-    pending_text: String,
+    theme: Theme,
+    entries: Vec<Entry>,
     input: String,
     cursor: usize,
     running: bool,
-    approval: Option<Pending>,
+    approval: Option<ApprovalView>,
     scroll: u16,
+    max_scroll: u16,
     follow: bool,
+    help: bool,
+    tick: usize,
 }
 
 impl UiState {
@@ -492,109 +513,132 @@ impl UiState {
             model,
             workspace,
             skills,
-            transcript: Vec::new(),
-            pending_text: String::new(),
+            theme: Theme::default(),
+            entries: Vec::new(),
             input: String::new(),
             cursor: 0,
             running: false,
             approval: None,
             scroll: 0,
+            max_scroll: 0,
             follow: true,
+            help: false,
+            tick: 0,
         }
     }
 
-    fn push(&mut self, text: impl Into<String>, style: Style) {
-        for line in text.into().split('\n') {
-            self.transcript
-                .push(Line::from(Span::styled(line.to_string(), style)));
+    /// The status row for the current frame.
+    fn status(&self) -> StatusInfo {
+        StatusInfo {
+            model: self.model.clone(),
+            tokens: 0,
+            cost_usd: None,
+            cwd: Some(self.workspace.display().to_string()),
+            busy: self.running,
+            note: Some(format!("skills: {}", self.skills)),
         }
+    }
+
+    fn push(&mut self, entry: Entry) {
+        self.entries.push(entry);
         self.follow = true;
     }
 
-    /// Flush buffered assistant text into the transcript.
-    fn flush_text(&mut self) {
-        if !self.pending_text.is_empty() {
-            let text = std::mem::take(&mut self.pending_text);
-            self.push(text, Style::default());
+    /// Append streamed model text to the block it belongs to.
+    fn push_text(&mut self, text: &str) {
+        if let Some(last) = self.entries.last_mut() {
+            if last.kind == EntryKind::Assistant {
+                last.body.push_str(text);
+                self.follow = true;
+                return;
+            }
+        }
+        self.push(Entry::assistant(text));
+    }
+
+    /// Trim the trailing newline off the in-flight prose block.
+    fn settle_text(&mut self) {
+        if let Some(last) = self.entries.last_mut() {
+            if last.kind == EntryKind::Assistant {
+                let len = last.body.trim_end().len();
+                last.body.truncate(len);
+            }
+        }
+    }
+
+    /// Stop the spinner on the call whose result just arrived.
+    fn settle_call(&mut self, name: &str) {
+        let call = self.entries.iter_mut().rev().find(|entry| {
+            entry.kind == EntryKind::ToolCall && entry.running && entry.title == name
+        });
+        if let Some(call) = call {
+            call.running = false;
         }
     }
 
     fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::AssistantText(text) => self.pending_text.push_str(&text),
+            UiEvent::AssistantText(text) => self.push_text(&text),
             UiEvent::ToolCall { name, input } => {
-                self.flush_text();
-                self.push(
-                    format!("  \u{25b6} {name}  {input}"),
-                    Style::default().fg(Color::Cyan),
-                );
+                self.settle_text();
+                self.push(Entry::tool_call(name, input));
             }
             UiEvent::ToolResult {
                 name,
                 output,
                 is_error,
             } => {
-                let style = if is_error {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                self.push(format!("  {name}: {output}"), style);
+                self.settle_text();
+                self.settle_call(&name);
+                self.push(Entry::tool_result(name, output, is_error));
             }
             UiEvent::Blocked { name, reason } => {
-                self.push(
-                    format!("  [blocked] {name}: {reason}"),
-                    Style::default().fg(Color::Red),
-                );
+                self.settle_text();
+                self.push(Entry::error(format!("[blocked] {name}: {reason}")));
             }
             UiEvent::Compacted { kind, transcript } => {
                 let suffix = transcript.map(|p| format!(" -> {p}")).unwrap_or_default();
-                self.push(
-                    format!("  [compact:{kind}]{suffix}"),
-                    Style::default().fg(Color::Yellow),
-                );
+                self.push(Entry::notice(format!("[compact:{kind}]{suffix}")));
             }
             UiEvent::MemoryRecalled { count } => {
-                self.push(
-                    format!("  [memory: recalled {count}]"),
-                    Style::default().fg(Color::Yellow),
-                );
+                self.push(Entry::notice(format!("[memory] recalled {count}")));
             }
             UiEvent::MemoryStored {
                 stored,
                 consolidated,
             } => {
-                self.push(
-                    format!("  [memory: stored {stored}, consolidated to {consolidated}]"),
-                    Style::default().fg(Color::Yellow),
-                );
+                self.push(Entry::notice(format!(
+                    "[memory] stored {stored}, consolidated to {consolidated}"
+                )));
             }
             UiEvent::Notice(text) => {
-                self.flush_text();
-                self.push(format!("  {text}"), Style::default().fg(Color::Magenta));
+                self.settle_text();
+                self.push(Entry::notice(text));
             }
             UiEvent::Approval {
                 name,
                 input,
                 reason,
             } => {
-                self.flush_text();
-                self.push(
-                    format!("  [permission] {reason}"),
-                    Style::default().fg(Color::Yellow),
-                );
-                self.approval = Some(Pending {
-                    name,
-                    input,
-                    reason,
-                });
+                self.settle_text();
+                self.push(Entry::notice(format!("[permission] {reason}")));
+                self.approval = Some(ApprovalView::new(name, input, reason));
             }
             UiEvent::Error(message) => {
-                self.flush_text();
-                self.push(format!("error: {message}"), Style::default().fg(Color::Red));
+                self.settle_text();
+                self.push(Entry::error(message));
             }
+            UiEvent::TurnStarted => self.running = true,
             UiEvent::TurnDone => {
-                self.flush_text();
+                self.settle_text();
+                let running = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.kind == EntryKind::ToolCall && entry.running);
+                if let Some(call) = running {
+                    call.running = false;
+                }
                 self.running = false;
             }
         }
@@ -636,16 +680,12 @@ fn main() -> Result<()> {
     spawn_agent_thread(agent, command_rx, event_tx);
 
     let mut terminal = ratatui::init();
-    let mut state = UiState::new(model.clone(), workspace, skills);
-    let banner = if demo {
-        format!("rust-agent TUI (demo)  |  model: {model}  |  type anything, Esc to quit")
-    } else {
-        format!(
-            "rust-agent TUI  |  model: {model}  |  type a task, /goal <condition>, /reset to \
-             clear, Esc to quit"
-        )
-    };
-    state.push(banner, Style::default().fg(Color::DarkGray));
+    let mut state = UiState::new(model, workspace, skills);
+    if demo {
+        state.push(Entry::notice(
+            "[demo] scripted model: glob -> bash (permission gate) -> answer",
+        ));
+    }
     let result = run_ui(&mut terminal, &mut event_rx, &command_tx, &gate, &mut state);
     ratatui::restore();
     result
@@ -663,8 +703,10 @@ fn run_ui(
             state.apply(event);
         }
 
-        let height = terminal.size()?.height;
-        update_scroll(state, height);
+        // Keep the spinner turning while a turn is in flight.
+        if state.running {
+            state.tick = state.tick.wrapping_add(1);
+        }
         terminal.draw(|frame| draw(frame, state))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -690,18 +732,31 @@ fn handle_key(
         return true;
     }
 
-    // While a call is pending, y/n (or Esc to deny) answer it.
+    // Any key dismisses the help overlay.
+    if state.help {
+        state.help = false;
+        return false;
+    }
+
+    // While a call is pending, y/a/n (or Esc to deny) answer it.
     if state.approval.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 gate.answer(true);
                 state.approval = None;
-                state.push("  [permission] allowed", Style::default().fg(Color::Green));
+                state.push(Entry::notice("[permission] allowed"));
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if let Some(pending) = state.approval.take() {
+                    gate.allow_always(&pending.name);
+                }
+                gate.answer(true);
+                state.push(Entry::notice("[permission] allowed for the session"));
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 gate.answer(false);
                 state.approval = None;
-                state.push("  [permission] denied", Style::default().fg(Color::Red));
+                state.push(Entry::notice("[permission] denied"));
             }
             _ => {}
         }
@@ -713,7 +768,15 @@ fn handle_key(
     }
 
     match key.code {
+        // Shift+enter types a newline; plain enter sends the prompt.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            state.input.insert(byte_index(state, state.cursor), '\n');
+            state.cursor += 1;
+        }
         KeyCode::Enter => submit(state, command_tx),
+        KeyCode::F(1) => state.help = true,
+        // `?` opens help only on an empty prompt, so it stays typeable.
+        KeyCode::Char('?') if state.input.is_empty() => state.help = true,
         KeyCode::Char(c) => {
             state.input.insert(byte_index(state, state.cursor), c);
             state.cursor += 1;
@@ -762,7 +825,11 @@ fn submit(state: &mut UiState, command_tx: &mpsc::Sender<Command>) {
     match text.as_str() {
         "/reset" => {
             let _ = command_tx.send(Command::Reset);
-            state.push("/reset", Style::default().fg(Color::DarkGray));
+            state.push(Entry::notice("[reset] the conversation was cleared"));
+            return;
+        }
+        "/help" => {
+            state.help = true;
             return;
         }
         "q" | "quit" | "exit" => {
@@ -774,87 +841,128 @@ fn submit(state: &mut UiState, command_tx: &mpsc::Sender<Command>) {
     // s17: `/goal`, `/goal <condition>`, and `/goal clear` go to the goal
     // controller on the agent thread instead of the model.
     if let Some(command) = parse_goal_command(&text) {
-        state.push(
-            format!("\u{203a} {text}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        );
+        state.push(Entry::user(text));
         let _ = command_tx.send(Command::Goal(command));
         return;
     }
+    state.push(Entry::user(text.clone()));
     state.running = true;
-    state.follow = true;
-    state.push(
-        format!("\u{203a} {text}"),
-        Style::default().add_modifier(Modifier::BOLD),
-    );
     let _ = command_tx.send(Command::Prompt(text));
 }
 
-fn update_scroll(state: &mut UiState, height: u16) {
-    if state.follow {
-        let visible = height.saturating_sub(2) as usize;
-        state.scroll = state.transcript.len().saturating_sub(visible) as u16;
-    }
-}
-
+/// Move the viewport, re-enabling follow once the bottom is on screen.
 fn scroll(state: &mut UiState, delta: i32) {
-    state.follow = false;
-    let next = state.scroll as i32 + delta;
-    state.scroll = next.clamp(0, state.transcript.len() as i32) as u16;
+    let next = (state.scroll as i32 + delta).clamp(0, state.max_scroll as i32);
+    state.scroll = next as u16;
+    state.follow = state.scroll >= state.max_scroll;
 }
 
-fn draw(frame: &mut Frame, state: &UiState) {
-    let chunks = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-
-    let transcript = Paragraph::new(state.transcript.clone())
-        .wrap(Wrap { trim: false })
-        .scroll((state.scroll, 0));
-    frame.render_widget(transcript, chunks[0]);
-
-    let status = if let Some(pending) = &state.approval {
-        format!(
-            "PERMISSION [y/n]: {}  |  {} {}",
-            pending.reason, pending.name, pending.input
-        )
-    } else if state.running {
-        "running... (Esc to quit)".to_string()
-    } else {
-        format!(
-            "{}  |  skills: {}  |  {}",
-            state.model,
-            state.skills,
-            state.workspace.display()
+/// Whether a blank line belongs between two transcript blocks.
+fn separates(previous: &Entry, next: &Entry) -> bool {
+    let toolish = |entry: &Entry| {
+        matches!(
+            entry.kind,
+            EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Error
         )
     };
-    let status_style = if state.approval.is_some() {
-        Style::default().fg(Color::Black).bg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    frame.render_widget(Paragraph::new(status).style(status_style), chunks[1]);
+    // A result hangs straight off the call it answers.
+    if matches!(next.kind, EntryKind::ToolResult | EntryKind::Error) && toolish(previous) {
+        return false;
+    }
+    // Runs of system notices stay together.
+    !(previous.kind == EntryKind::Notice && next.kind == EntryKind::Notice)
+}
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled("\u{203a} ", Style::default().fg(Color::Green)),
-        Span::raw(state.input.clone()),
-    ]));
-    frame.render_widget(prompt, chunks[2]);
-    frame.set_cursor_position(Position::new(
-        chunks[2].x + 2 + state.cursor as u16,
-        chunks[2].y,
-    ));
+/// Every transcript entry rendered for one frame, with blank lines between
+/// blocks.
+fn transcript_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut previous: Option<&Entry> = None;
+    for entry in &state.entries {
+        if let Some(previous) = previous {
+            if separates(previous, entry) {
+                lines.push(Line::default());
+            }
+        }
+        lines.extend(ui::entry_lines(entry, &state.theme, width, state.tick));
+        previous = Some(entry);
+    }
+    lines
+}
+
+fn draw(frame: &mut Frame, state: &mut UiState) {
+    let area = frame.area();
+    let input_width = (area.width as usize).saturating_sub(2).max(1);
+    let input_rows = ui::wrap_text(&state.input, input_width).len() as u16;
+    let layout = ui::compute_layout(area, input_rows, state.approval.as_ref());
+
+    if let Some(band) = layout.banner {
+        let lines = ui::banner_lines(&state.theme, band.width as usize);
+        frame.render_widget(Paragraph::new(lines), band);
+    }
+
+    if state.help {
+        let lines = ui::help_overlay(
+            &state.theme,
+            layout.transcript.width as usize,
+            layout.transcript.height as usize,
+        );
+        frame.render_widget(Paragraph::new(lines), layout.transcript);
+    } else {
+        let lines = transcript_lines(state, layout.transcript.width as usize);
+        state.max_scroll = lines
+            .len()
+            .saturating_sub(layout.transcript.height as usize) as u16;
+        let offset = if state.follow {
+            state.max_scroll
+        } else {
+            state.scroll.min(state.max_scroll)
+        };
+        state.scroll = offset;
+        frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), layout.transcript);
+    }
+
+    if let (Some(view), Some(band)) = (state.approval.as_ref(), layout.approval) {
+        let lines = ui::approval_lines(
+            view,
+            &state.theme,
+            band.width as usize,
+            band.height as usize,
+        );
+        frame.render_widget(Paragraph::new(lines), band);
+    }
+
+    let input = ui::input_lines(
+        &state.input,
+        &state.theme,
+        layout.input.width as usize,
+        false,
+    );
+    frame.render_widget(Paragraph::new(input), layout.input);
+
+    let status = ui::status_line(&state.status(), &state.theme, layout.status.width as usize);
+    frame.render_widget(Paragraph::new(status), layout.status);
+
+    let hints = ui::hints_line(&state.theme, layout.hints.width as usize);
+    frame.render_widget(Paragraph::new(hints), layout.hints);
+
+    // Park the terminal cursor where the next typed character will land.
+    let typed = &state.input[..byte_index(state, state.cursor)];
+    let wrapped = ui::wrap_text(typed, input_width);
+    let row = wrapped.len().saturating_sub(1) as u16;
+    let column = ui::text_width(wrapped.last().map(String::as_str).unwrap_or(""));
+    let y = layout.input.y + row.min(layout.input.height.saturating_sub(1));
+    let x = (layout.input.x + 2 + column as u16)
+        .min(layout.input.x + layout.input.width.saturating_sub(1));
+    frame.set_cursor_position(Position::new(x, y));
 }
 
 /// Render one frame off-screen so the layout can be inspected without a TTY
 /// or an API key (`cargo run --bin tui -- --snapshot`, add `--ansi` for color).
 fn snapshot(ansi: bool) -> Result<()> {
-    let state = sample_state();
-    let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
-    terminal.draw(|frame| draw(frame, &state))?;
+    let mut state = sample_state();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
+    terminal.draw(|frame| draw(frame, &mut state))?;
     let buffer = terminal.backend().buffer();
     for y in 0..buffer.area.height {
         if ansi {
@@ -866,63 +974,43 @@ fn snapshot(ansi: bool) -> Result<()> {
     Ok(())
 }
 
-/// A representative scene: a task, tool calls, memory, and a finished answer.
+/// A representative scene: a goal, a task, tool calls and a pending gate.
 fn sample_state() -> UiState {
     let mut state = UiState::new(
         "claude-sonnet-4-5".to_string(),
         PathBuf::from("D:\\Agent\\Rust-agent"),
         2,
     );
-    let dim = Style::default().fg(Color::DarkGray);
-    state.push(
-        "rust-agent TUI  |  model: claude-sonnet-4-5  |  type a task, /reset to clear, Esc to quit",
-        dim,
-    );
-    state.push(
-        "\u{203a} count the rust files",
-        Style::default().add_modifier(Modifier::BOLD),
-    );
-    state.push(
-        "Sure - let me look at the workspace first.",
-        Style::default(),
-    );
+    state.push(Entry::user("/goal the demo loop finishes"));
+    state.apply(UiEvent::Notice(
+        "[goal] active: the demo loop finishes".into(),
+    ));
+    state.push(Entry::user("count the rust files"));
+    state.apply(UiEvent::AssistantText(
+        "Sure - let me look at the workspace first.\n".to_string(),
+    ));
     state.apply(UiEvent::ToolCall {
         name: "glob".into(),
         input: "{\"pattern\":\"src/**/*.rs\"}".into(),
     });
     state.apply(UiEvent::ToolResult {
         name: "glob".into(),
-        output: "src/agent.rs\nsrc/compact.rs\nsrc/config.rs\nsrc/error.rs\nsrc/hooks.rs\n..."
-            .into(),
+        output: "src/agent.rs\nsrc/compact.rs\nsrc/config.rs\n... 34 more".into(),
         is_error: false,
     });
-    state.flush_text();
-    state.push(
-        "Next, a shell step - watch the permission gate.",
-        Style::default(),
-    );
+    state.apply(UiEvent::AssistantText(
+        "Next, a shell step - watch the permission gate.\n".to_string(),
+    ));
     state.apply(UiEvent::ToolCall {
         name: "bash".into(),
         input: "{\"command\":\"echo rm -rf demo\"}".into(),
     });
-    state.push(
-        "  [permission] potentially destructive command",
-        Style::default().fg(Color::Yellow),
-    );
-    state.push("  [permission] allowed", Style::default().fg(Color::Green));
-    state.apply(UiEvent::ToolResult {
+    state.apply(UiEvent::Approval {
         name: "bash".into(),
-        output: "rm -rf demo".into(),
-        is_error: false,
+        input: "{\"command\":\"echo rm -rf demo\"}".into(),
+        reason: "potentially destructive command".into(),
     });
-    state.apply(UiEvent::Notice(
-        "[goal achieved] the transcript shows exit code 0 (evaluations: 2)".into(),
-    ));
-    state.flush_text();
-    state.push(
-        "Done. That is the whole loop: model -> tool -> model.",
-        Style::default(),
-    );
+    state.tick = 3;
     state
 }
 

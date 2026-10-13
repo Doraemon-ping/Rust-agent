@@ -80,6 +80,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/config.rs` | Environment configuration |
 | `src/main.rs` | Interactive REPL |
 | `src/bin/tui.rs` | Experimental `ratatui` TUI front-end over the same agent |
+| `src/ui.rs` | Pure render helpers for the TUI (`Entry`, `Theme`, layout, wrapping) |
 
 ## Mapping to `learn-claude-code`
 
@@ -608,16 +609,19 @@ A `ratatui` front-end over the *same* agent the CLI builds: skills, compaction,
 memory, subagent, task graph, background commands, cron, teams, MCP, recovery,
 workflows, and the `/goal` loop. The agent runs on its own thread with a
 current-thread Tokio runtime, so the blocking approval prompt never freezes the
-screen; every `AgentEvent` streams into a scrolling transcript.
+screen; every `AgentEvent` streams into a scrolling transcript. The visuals live
+in `src/ui.rs` as pure functions over plain data, so `src/bin/tui.rs` is just an
+event/input shell and the rendering is unit-tested without a terminal.
 
 Type a task and press Enter, use `/goal <condition>` (or `/goal` for status and
-`/goal clear`) to drive the goal loop, answer permission prompts with `y`/`n`,
-and `Esc` to quit. While the UI is idle the agent thread keeps polling, so a due
-cron job, an incoming teammate message, or a finished background command starts
-its own turn -- which is how a deferred goal is judged as soon as its evidence
-arrives. `--demo` swaps in a scripted mock model (it answers the goal evaluator
-too), so the UI, the permission gate, and the goal loop can all be exercised
-without an API key.
+`/goal clear`) to drive the goal loop, and answer permission prompts with `y`
+(once), `a` (always, for the session) or `n`. `Shift+Enter` inserts a newline,
+`?` or `/help` shows the key map, and `Esc` quits. While the UI is idle the
+agent thread keeps polling, so a due cron job, an incoming teammate message, or
+a finished background command starts its own turn -- which is how a deferred
+goal is judged as soon as its evidence arrives. `--demo` swaps in a scripted mock
+model (it answers the goal evaluator too), so the UI, the permission gate, and
+the goal loop can all be exercised without an API key.
 
 ## Embedding
 
