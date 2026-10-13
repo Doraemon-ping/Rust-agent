@@ -408,7 +408,7 @@ fn spawn_agent_thread(
             // Work that arrived while the UI was idle wakes the loop on its
             // own, exactly like the CLI: a due job, a teammate, a finished
             // background command (which a pending goal is waiting for).
-            if let Some(reason) = idle_wake(&agent) {
+            if let Some(reason) = agent.idle_wake() {
                 let _ = tx.send(UiEvent::Notice(reason.to_string()));
                 run_turn(&runtime, &agent, &mut history, &tx);
                 let _ = tx.send(UiEvent::TurnDone);
@@ -467,26 +467,6 @@ fn apply_goal(
             }
         },
     }
-}
-
-/// Why the loop should start a turn while the user is idle, if anything.
-fn idle_wake(agent: &Agent) -> Option<&'static str> {
-    if agent.cron().is_some_and(|cron| cron.has_due()) {
-        return Some("[cron] a scheduled job is due");
-    }
-    if agent
-        .team()
-        .is_some_and(|team| team.bus().peek(rust_agent::team::LEAD).unwrap_or(false))
-    {
-        return Some("[team] teammate events arrived");
-    }
-    if agent
-        .background()
-        .is_some_and(|background| background.ready() > 0)
-    {
-        return Some("[background] results ready");
-    }
-    None
 }
 
 /// Everything the UI needs to draw one frame.

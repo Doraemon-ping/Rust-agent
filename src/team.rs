@@ -68,6 +68,10 @@ pub const MSG_MESSAGE: &str = "message";
 pub const MSG_RESULT: &str = "result";
 pub const MSG_IDLE: &str = "idle_notification";
 pub const MSG_ERROR: &str = "error";
+/// A teammate closed a task on the shared board; sent to the Lead the moment
+/// it happens so a finished task is reported even if the model's closing prose
+/// says nothing about it.
+pub const MSG_TASK_COMPLETED: &str = "task_completed";
 pub const MSG_SHUTDOWN_REQUEST: &str = "shutdown_request";
 pub const MSG_SHUTDOWN_RESPONSE: &str = "shutdown_response";
 pub const MSG_PLAN_REQUEST: &str = "plan_request";
@@ -1282,7 +1286,11 @@ impl TeammateRuntime {
         let mut tools = ToolRegistry::base();
         tools.register(ListTasksTool);
         tools.register(ClaimTaskTool::owned_by(&name));
-        tools.register(CompleteTaskTool::owned_by(&name));
+        tools.register(NotifyingCompleteTask::new(
+            CompleteTaskTool::owned_by(&name),
+            team.clone(),
+            name.clone(),
+        ));
         register_teammate_tools(&mut tools, team.clone(), name.clone());
 
         let agent = Agent::builder()
@@ -1878,6 +1886,60 @@ pub fn register_team_tools(registry: &mut ToolRegistry, team: Team) {
     registry.register(SendMessageTool::new(team, LEAD));
 }
 
+/// A teammate's `complete_task` that also tells the Lead the moment a task
+/// closes. The inner tool reports "cannot complete" as a normal `Ok`, so the
+/// board is checked before notifying.
+struct NotifyingCompleteTask {
+    inner: CompleteTaskTool,
+    team: Team,
+    name: String,
+}
+
+impl NotifyingCompleteTask {
+    fn new(inner: CompleteTaskTool, team: Team, name: String) -> Self {
+        NotifyingCompleteTask { inner, team, name }
+    }
+}
+
+#[async_trait]
+impl Tool for NotifyingCompleteTask {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+
+    async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
+        let task_id = input
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let output = self.inner.call(ctx, input).await?;
+        let completed = self
+            .team
+            .tasks()
+            .load(&task_id)
+            .map(|task| task.status == TaskStatus::Completed)
+            .unwrap_or(false);
+        if completed {
+            let _ = self.team.bus().send(&TeamMessage::new(
+                &self.name,
+                LEAD,
+                &output,
+                MSG_TASK_COMPLETED,
+            ));
+        }
+        Ok(output)
+    }
+}
+
 /// Register the teammate-side team tools.
 pub fn register_teammate_tools(registry: &mut ToolRegistry, team: Team, name: String) {
     registry.register(SendMessageTool::new(team.clone(), name.clone()));
@@ -2335,6 +2397,48 @@ mod tests {
         );
         assert_eq!(team.status("writer"), Some(TeammateStatus::Idle));
         assert_eq!(team.assignment("writer").as_deref(), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn completing_a_task_reports_to_the_lead_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskStore::new(dir.path())
+            .create("write the doc", "create the file")
+            .unwrap();
+        // The turn closes the task but says nothing else, so the report has to
+        // come from the runtime rather than the model's closing prose.
+        let client = ScriptedClient::scripted(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "complete_task",
+                    json!({ "task_id": task.id }),
+                )],
+                "tool_use",
+            ),
+            text(""),
+        ]);
+        let team = Team::new(dir.path(), client);
+        team.spawn_teammate(
+            "writer",
+            "technical writer",
+            "Write the doc.",
+            Some(&task.id),
+            false,
+        )
+        .unwrap();
+
+        let mut messages = Vec::new();
+        assert!(
+            wait_for_lead(&team, MSG_TASK_COMPLETED, &mut messages),
+            "the lead never heard the task was completed: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains(&task.id)),
+            "the completion notice should name the task: {messages:?}"
+        );
     }
 
     #[test]

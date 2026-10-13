@@ -1,10 +1,11 @@
 //! The `rust-agent` CLI: a small REPL over the agent loop.
 
 use std::io::Write;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use rust_agent::agent::{AgentEvent, AgentObserver};
@@ -19,6 +20,9 @@ use rust_agent::{
     ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, GOAL_PROMPT, MCP_PROMPT, TASKS_PROMPT,
     TEAM_PROMPT, WORKFLOW_PROMPT,
 };
+
+/// How long the REPL waits for input before checking for idle work.
+const IDLE_POLL: Duration = Duration::from_millis(500);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -129,47 +133,46 @@ async fn main() -> Result<()> {
     println!("recovery: 429/529 backoff, fallback model, max_tokens escalation (s15)");
     println!("Type a task, /reset to clear history, /goal to inspect the goal, or q to quit.\n");
 
-    let mut editor = DefaultEditor::new()?;
     let mut history: Vec<Message> = Vec::new();
     let goal = agent.goal().cloned();
 
+    // Read the prompt on its own thread so a due cron job, a teammate report
+    // or a finished background command can start a turn while the user sits at
+    // an empty prompt. Blocking on `readline` here would keep those events
+    // queued until the user typed something.
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut editor = match DefaultEditor::new() {
+            Ok(editor) => editor,
+            Err(_) => return,
+        };
+        while let Ok(line) = editor.readline("rust-agent >> ") {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let _ = editor.add_history_entry(trimmed);
+            }
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
-        // A job that came due while we were idle starts its own turn before
-        // the next prompt: the loop polls the scheduler as it begins.
-        if cron.has_due() {
-            println!("\x1b[35m[cron] a scheduled job is due\x1b[0m");
-            if let Err(error) = agent.run_turn(&mut history).await {
-                eprintln!("\x1b[31merror: {error}\x1b[0m");
-            }
-            println!();
-        }
-
-        // A teammate event wakes the Lead on its own, exactly like a due job.
-        if team.bus().peek(rust_agent::team::LEAD).unwrap_or(false) {
-            println!("\x1b[35m[team] teammate events arrived\x1b[0m");
-            if let Err(error) = agent.run_turn(&mut history).await {
-                eprintln!("\x1b[31merror: {error}\x1b[0m");
-            }
-            println!();
-        }
-
-        // A finished background command wakes the session too, so an active
-        // goal can judge its result instead of waiting for the next prompt.
-        if agent
-            .background()
-            .is_some_and(|background| background.ready() > 0)
-        {
-            println!("\x1b[35m[background] results ready\x1b[0m");
-            if let Err(error) = agent.run_turn(&mut history).await {
-                eprintln!("\x1b[31merror: {error}\x1b[0m");
-            }
-            println!();
-        }
-
-        let line = match editor.readline("rust-agent >> ") {
+        let line = match line_rx.recv_timeout(IDLE_POLL) {
             Ok(line) => line,
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(error) => return Err(error.into()),
+            // Idle work starts its own turn instead of waiting for the next
+            // prompt.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(reason) = agent.idle_wake() {
+                    println!("\x1b[35m{reason}\x1b[0m");
+                    if let Err(error) = agent.run_turn(&mut history).await {
+                        eprintln!("\x1b[31merror: {error}\x1b[0m");
+                    }
+                    println!();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
         let query = line.trim();
@@ -183,8 +186,6 @@ async fn main() -> Result<()> {
             }
             _ => {}
         }
-
-        let _ = editor.add_history_entry(query);
 
         if let Some(goal) = &goal {
             match parse_goal_command(query) {

@@ -36,7 +36,7 @@ use crate::recovery::{
     classify, is_retryable, ErrorClass, RecoveryConfig, RecoveryState, CONTINUATION_PROMPT,
 };
 use crate::skills::SkillLoader;
-use crate::team::{register_team_tools, Team};
+use crate::team::{register_team_tools, Team, LEAD};
 use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
 use crate::workflow::{register_workflow_tools, WorkflowEvent, WorkflowRegistry};
 
@@ -212,6 +212,34 @@ impl Agent {
     /// Whether this agent may pause and ask the user for approval (s15).
     pub fn is_interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// Work that arrived while the session sat idle and deserves its own turn:
+    /// a due scheduled job, a teammate report, or a finished background
+    /// command.
+    ///
+    /// Host loops (the REPL and the TUI) poll this between turns so those
+    /// events wake the agent on their own instead of waiting for the user to
+    /// type something.
+    pub fn idle_wake(&self) -> Option<&'static str> {
+        if self.cron.as_ref().is_some_and(|cron| cron.has_due()) {
+            return Some("[cron] a scheduled job is due");
+        }
+        if self
+            .team
+            .as_ref()
+            .is_some_and(|team| team.bus().peek(LEAD).unwrap_or(false))
+        {
+            return Some("[team] teammate events arrived");
+        }
+        if self
+            .background
+            .as_ref()
+            .is_some_and(|background| background.ready() > 0)
+        {
+            return Some("[background] results ready");
+        }
+        None
     }
 
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
@@ -1690,6 +1718,33 @@ mod tests {
         assert_eq!(history[0].text(), "keep me");
         // The job is queued again for the next turn.
         assert!(cron.has_due());
+    }
+
+    #[test]
+    fn idle_wake_reports_pending_team_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Team::new(dir.path(), Arc::new(ScriptedClient::new(vec![])));
+        let agent = Agent::builder()
+            .client(ScriptedClient::new(vec![]))
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .team(team.clone())
+            .build();
+        assert_eq!(agent.idle_wake(), None);
+
+        team.bus()
+            .send(&crate::team::TeamMessage::new(
+                "bob",
+                "lead",
+                "auth done",
+                "result",
+            ))
+            .unwrap();
+        assert_eq!(agent.idle_wake(), Some("[team] teammate events arrived"));
+
+        // Draining the mailbox clears the wake.
+        team.consume_lead_inbox().unwrap();
+        assert_eq!(agent.idle_wake(), None);
     }
 
     #[tokio::test]
