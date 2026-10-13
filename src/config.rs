@@ -11,6 +11,8 @@ pub struct Config {
     pub api_key: String,
     /// Model id sent with every request.
     pub model: String,
+    /// Model to fall back to when the primary keeps returning `529`s (s15).
+    pub fallback_model: Option<String>,
     /// Response token budget per model call.
     pub max_tokens: u32,
 }
@@ -20,7 +22,7 @@ impl Config {
     ///
     /// Recognised variables: `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`
     /// (falling back to `ANTHROPIC_AUTH_TOKEN`), `MODEL_ID` (or
-    /// `ANTHROPIC_MODEL`), and `MAX_TOKENS`.
+    /// `ANTHROPIC_MODEL`), `FALLBACK_MODEL_ID`, and `MAX_TOKENS`.
     pub fn from_env() -> Result<Self> {
         let base_url = non_empty_env("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|| "https://api.anthropic.com".to_string());
@@ -43,6 +45,7 @@ impl Config {
             base_url,
             api_key,
             model,
+            fallback_model: non_empty_env("FALLBACK_MODEL_ID"),
             max_tokens,
         })
     }

@@ -9,6 +9,10 @@
 //! | `PreToolUse` | before a tool runs | `Some` blocks the call |
 //! | `PostToolUse` | after a tool runs | ignored (observe only) |
 //! | `Stop` | model stopped asking for tools | `Some` injects a message and continues |
+//!
+//! s17's goal loop is a policy at the same boundary. It runs *after* the
+//! `Stop` hooks because it needs an async evaluator call, so it lives in the
+//! loop rather than in the sync [`Hook`] trait; see [`crate::goal`].
 
 use std::sync::Arc;
 

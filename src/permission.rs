@@ -164,12 +164,28 @@ fn is_destructive(command: &str, hints: &[String]) -> bool {
 pub struct PermissionHook {
     policy: PermissionPolicy,
     approver: Arc<dyn Approver>,
+    interactive: bool,
 }
 
 impl PermissionHook {
     /// Wrap a policy and an approver.
     pub fn new(policy: PermissionPolicy, approver: Arc<dyn Approver>) -> Self {
-        PermissionHook { policy, approver }
+        PermissionHook {
+            policy,
+            approver,
+            interactive: true,
+        }
+    }
+
+    /// Whether this turn may pause and ask the user (s15).
+    ///
+    /// An asynchronous turn -- a teammate, a background worker -- has no
+    /// terminal to prompt on. With `interactive(false)` anything the policy
+    /// would have asked about is denied outright, instead of blocking on an
+    /// input nobody can answer.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
     }
 }
 
@@ -178,6 +194,10 @@ impl Hook for PermissionHook {
         match self.policy.evaluate(call) {
             Decision::Allow => None,
             Decision::Deny(reason) => Some(format!("Permission denied: {reason}")),
+            Decision::Ask(reason) if !self.interactive => Some(format!(
+                "Permission denied: {reason} (interactive approval is unavailable \
+                 during an asynchronous turn)"
+            )),
             Decision::Ask(reason) => {
                 if self.approver.approve(call, &reason) {
                     None

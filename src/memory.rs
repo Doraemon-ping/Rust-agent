@@ -557,6 +557,7 @@ impl MemoryRecall for CatalogRecall {
         );
         let messages = [Message::user_text(prompt)];
         let request = CompletionRequest {
+            model: None,
             system: "You select relevant memory records and reply with JSON only.",
             messages: &messages,
             tools: &[],
@@ -981,6 +982,7 @@ impl MemoryManager {
         let response = self
             .client
             .complete(CompletionRequest {
+                model: None,
                 system: EXTRACT_SYSTEM,
                 messages: &messages,
                 tools: &[],
@@ -1040,6 +1042,7 @@ impl MemoryManager {
         let response = self
             .client
             .complete(CompletionRequest {
+                model: None,
                 system: CONSOLIDATE_SYSTEM,
                 messages: &messages,
                 tools: &[],

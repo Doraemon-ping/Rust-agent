@@ -52,7 +52,27 @@ pub enum Error {
     #[error("memory error: {0}")]
     Memory(String),
 
+    /// The team runtime rejected an operation (s13).
+    #[error("team error: {0}")]
+    Team(String),
+
+    /// The MCP layer rejected a server or a discovered tool (s14).
+    #[error("mcp error: {0}")]
+    Mcp(String),
+
+    /// A retryable model call gave up after the recovery budget ran out (s15).
+    #[error("recovery error: {0}")]
+    Recovery(String),
+
     /// The loop hit its safety bound without the model stopping.
     #[error("agent exceeded the maximum number of iterations ({0})")]
     MaxIterations(usize),
+
+    /// The workflow runtime rejected a run, or a script step failed (s16).
+    #[error("workflow error: {0}")]
+    Workflow(String),
+
+    /// The goal controller rejected a condition, or the evaluator failed (s17).
+    #[error("goal error: {0}")]
+    Goal(String),
 }

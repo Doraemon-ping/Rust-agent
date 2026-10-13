@@ -1,5 +1,6 @@
 //! The `bash` tool: run a shell command inside the workspace.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use crate::error::{Error, Result};
 pub struct BashTool {
     timeout: Duration,
     max_output: usize,
+    advertise_background: bool,
 }
 
 impl Default for BashTool {
@@ -22,6 +24,7 @@ impl Default for BashTool {
         BashTool {
             timeout: Duration::from_secs(120),
             max_output: 50_000,
+            advertise_background: false,
         }
     }
 }
@@ -32,6 +35,63 @@ impl BashTool {
         self.timeout = timeout;
         self
     }
+
+    /// Advertise the `run_in_background` parameter (s11).
+    ///
+    /// The agent loop reads it and dispatches to the background manager; this
+    /// tool never sees it. Only advertise it when a manager is configured.
+    pub fn advertising_background(mut self) -> Self {
+        self.advertise_background = true;
+        self
+    }
+}
+
+/// Combined stdout+stderr of one shell run, plus its exit code.
+pub(crate) struct ShellOutput {
+    pub text: String,
+    pub exit_code: Option<i32>,
+}
+
+/// Build the platform shell invocation (`cmd.exe /C`, or `sh -c`).
+pub(crate) fn shell_command(command: &str) -> Command {
+    if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+}
+
+/// Run a shell command to completion, killing it if it outlives `timeout`.
+pub(crate) async fn run_shell(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<ShellOutput> {
+    let mut process = shell_command(command);
+    process
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(timeout, process.output())
+        .await
+        .map_err(|_| Error::Tool {
+            tool: "bash".into(),
+            message: format!("command timed out after {timeout:?}"),
+        })??;
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(ShellOutput {
+        text: truncate_chars(combined.trim(), max_output),
+        exit_code: output.status.code(),
+    })
 }
 
 #[async_trait]
@@ -49,57 +109,36 @@ impl Tool for BashTool {
     }
 
     fn input_schema(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "command".into(),
+            json!({ "type": "string", "description": "The shell command to run." }),
+        );
+        if self.advertise_background {
+            properties.insert(
+                "run_in_background".into(),
+                json!({
+                    "type": "boolean",
+                    "description": "Set true only for independent, slow commands."
+                }),
+            );
+        }
         json!({
             "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "The shell command to run." }
-            },
+            "properties": Value::Object(properties),
             "required": ["command"]
         })
     }
 
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let command = required_str(&input, "command")?;
-
-        let mut process = if cfg!(windows) {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(command);
-            cmd
-        } else {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(command);
-            cmd
-        };
-
-        process
-            .current_dir(ctx.workspace())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let output = match tokio::time::timeout(self.timeout, process.output()).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(Error::Tool {
-                    tool: "bash".into(),
-                    message: format!("command timed out after {:?}", self.timeout),
-                })
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut combined = String::with_capacity(stdout.len() + stderr.len());
-        combined.push_str(stdout.as_ref());
-        combined.push_str(stderr.as_ref());
-        let combined = combined.trim();
-
-        if combined.is_empty() {
+        let result = run_shell(command, ctx.workspace(), self.timeout, self.max_output).await?;
+        if result.text.is_empty() {
             return Ok(format!(
                 "(no output; exit code {})",
-                output.status.code().unwrap_or(-1)
+                result.exit_code.unwrap_or(-1)
             ));
         }
-
-        Ok(truncate_chars(combined, self.max_output))
+        Ok(result.text)
     }
 }

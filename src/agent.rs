@@ -19,17 +19,26 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::background::{placeholder, should_run_background, BackgroundManager};
 use crate::compact::{
     is_context_overflow, CompactConfig, CompactTool, Compactor, COMPACT_TOOL_NAME,
 };
+use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
+use crate::goal::{goal_continuation, GoalController, GoalDecision, GoalEvent};
 use crate::hooks::{Hook, Hooks};
-use crate::llm::{CompletionRequest, LlmClient};
+use crate::llm::{CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition};
+use crate::mcp::{register_mcp_tools, McpPermissionHook, McpRegistry, MCP_TOOL_PREFIX};
 use crate::memory::{CatalogRecall, MemoryConfig, MemoryManager, MemoryRecall};
 use crate::message::{ContentBlock, Message, Role, ToolCall};
 use crate::permission::{Approver, AutoApprover, PermissionHook, PermissionPolicy};
+use crate::recovery::{
+    classify, is_retryable, ErrorClass, RecoveryConfig, RecoveryState, CONTINUATION_PROMPT,
+};
 use crate::skills::SkillLoader;
-use crate::tools::{LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
+use crate::team::{register_team_tools, Team};
+use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
+use crate::workflow::{register_workflow_tools, WorkflowEvent, WorkflowRegistry};
 
 /// Reminder injected when the model goes several rounds without updating its
 /// todo list (s05).
@@ -62,6 +71,45 @@ pub enum AgentEvent<'a> {
     MemoryRecalled { count: usize },
     /// The post-turn pass stored memories (and possibly consolidated them).
     MemoryStored { stored: usize, consolidated: usize },
+    /// A `bash` call was dispatched to a background thread (s11).
+    BackgroundStarted { task_id: &'a str },
+    /// Completed background results were injected into this turn (s11).
+    BackgroundCollected { count: usize },
+    /// Due cron jobs were delivered as `[Scheduled]` user messages (s12).
+    CronDelivered { count: usize },
+    /// Teammate events were folded into this turn (s13).
+    TeamEventDelivered { count: usize },
+    /// An MCP server was connected and its tools discovered (s14).
+    McpConnected { server: &'a str, tools: usize },
+    /// A transient model failure is being retried (s15).
+    ModelRecovered {
+        kind: &'a str,
+        attempt: usize,
+        delay_ms: u64,
+    },
+    /// Repeated overloads switched the turn to the fallback model (s15).
+    ModelFellBack { model: &'a str },
+    /// A truncated response is retried with a bigger token budget (s15).
+    MaxTokensEscalated { max_tokens: u32 },
+    /// A truncated, tool-less response asked the model to continue (s15).
+    ContinuationRequested { count: usize },
+    /// A workflow run reported lifecycle or progress (s16).
+    WorkflowReported {
+        run_id: &'a str,
+        kind: &'a str,
+        message: &'a str,
+    },
+    /// The goal evaluator judged the turn, or a limit/error ended it (s17).
+    GoalReported {
+        /// `active`, `cleared`, `achieved`, or `failed`.
+        kind: &'a str,
+        active: bool,
+        met: bool,
+        failed: bool,
+        reason: &'a str,
+        iterations: usize,
+        duration_ms: u64,
+    },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -86,6 +134,14 @@ pub struct Agent {
     ctx: ToolContext,
     hooks: Hooks,
     observer: Arc<dyn AgentObserver>,
+    background: Option<BackgroundManager>,
+    cron: Option<CronScheduler>,
+    team: Option<Team>,
+    mcp: Option<McpRegistry>,
+    workflow: Option<WorkflowRegistry>,
+    goal: Option<GoalController>,
+    recovery: Option<RecoveryConfig>,
+    interactive: bool,
     system_prompt: String,
     max_tokens: u32,
     max_steps: usize,
@@ -118,6 +174,46 @@ impl Agent {
         self.memory.as_deref()
     }
 
+    /// The background task manager, when background execution is enabled (s11).
+    pub fn background(&self) -> Option<&BackgroundManager> {
+        self.background.as_ref()
+    }
+
+    /// The cron scheduler, when scheduled prompts are enabled (s12).
+    pub fn cron(&self) -> Option<&CronScheduler> {
+        self.cron.as_ref()
+    }
+
+    /// The team runtime, when teammates are enabled (s13).
+    pub fn team(&self) -> Option<&Team> {
+        self.team.as_ref()
+    }
+
+    /// The MCP registry, when external tools are enabled (s14).
+    pub fn mcp(&self) -> Option<&McpRegistry> {
+        self.mcp.as_ref()
+    }
+
+    /// The model-call recovery policy, when it is enabled (s15).
+    pub fn recovery(&self) -> Option<&RecoveryConfig> {
+        self.recovery.as_ref()
+    }
+
+    /// The workflow registry, when saved procedures are enabled (s16).
+    pub fn workflow(&self) -> Option<&WorkflowRegistry> {
+        self.workflow.as_ref()
+    }
+
+    /// The goal controller, when the goal loop is enabled (s17).
+    pub fn goal(&self) -> Option<&GoalController> {
+        self.goal.as_ref()
+    }
+
+    /// Whether this agent may pause and ask the user for approval (s15).
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
     /// Run `UserPromptSubmit` hooks and return the prompt to send, enriched
     /// with any hook-provided context.
     pub fn prepare_prompt(&self, prompt: &str) -> String {
@@ -132,10 +228,46 @@ impl Agent {
     /// `history` is the live conversation. The loop appends to it, so callers
     /// keep multi-turn context across `run_turn` calls.
     pub async fn run_turn(&self, history: &mut Vec<Message>) -> Result<()> {
-        let tools = self.tools.definitions();
+        // s17: the Stop-hook block cap counts turns within one user query.
+        if let Some(goal) = &self.goal {
+            goal.begin_query();
+        }
         let mut rounds_since_todo = 0usize;
         let active_request = active_request(history);
         let mut reactive_retries = 0usize;
+
+        // s13: teammates speak to the Lead over mailboxes rather than through
+        // its context; fold whatever arrived into this turn.
+        if let Some(team) = &self.team {
+            if let Ok(events) = team.consume_lead_inbox() {
+                if !events.is_empty() {
+                    self.observer.on_event(AgentEvent::TeamEventDelivered {
+                        count: events.len(),
+                    });
+                    history.push(Message::user_text(Team::format_team_events(&events)));
+                }
+            }
+        }
+
+        // s12: a matched cron job becomes a `[Scheduled]` user message for this
+        // turn. It is acknowledged only once the model has accepted it, and put
+        // back (with the message removed) if the call fails.
+        let rollback_to = history.len();
+        let mut cron_unacked: Vec<CronJob> = Vec::new();
+        if let Some(cron) = &self.cron {
+            cron.poll(CronScheduler::now())?;
+            let due = cron.take_due();
+            if !due.is_empty() {
+                self.observer
+                    .on_event(AgentEvent::CronDelivered { count: due.len() });
+                let blocks: Vec<ContentBlock> = due
+                    .iter()
+                    .map(|job| ContentBlock::text(format!("[Scheduled] {}", job.prompt)))
+                    .collect();
+                history.push(Message::user_blocks(blocks));
+                cron_unacked = due;
+            }
+        }
 
         // s09: recall relevant records once per turn; the system prompt is
         // fixed for the whole turn.
@@ -151,25 +283,75 @@ impl Agent {
             }
             None => self.system_prompt.clone(),
         };
+        // s15: per-turn recovery bookkeeping (one escalation, bounded
+        // continuations) and the token budget this turn is currently using.
+        let mut recovery = RecoveryState::new();
+        let mut max_tokens = self.max_tokens;
 
         for step in 0..self.max_steps {
             self.observer.on_event(AgentEvent::Step(step));
+
+            // s11: completed background results ride in on a later turn, as
+            // independent `<task_notification>` blocks (never on the original
+            // tool_use_id, which the placeholder already answered).
+            if let Some(background) = &self.background {
+                let notifications = background.collect();
+                if !notifications.is_empty() {
+                    self.observer.on_event(AgentEvent::BackgroundCollected {
+                        count: notifications.len(),
+                    });
+                    inject_notifications(history, notifications);
+                }
+            }
 
             if let Some(compactor) = &self.compactor {
                 compactor.prepare(history, &active_request).await?;
             }
 
+            // s14: reassemble the tool pool every round, so a server connected
+            // on the previous round is visible to the model on this one.
+            let mut tools = self.tools.definitions();
+            // ...and announce the connected servers alongside it, so the model
+            // does not have to guess which `mcp__*` tools exist.
+            let system_prompt = match &self.mcp {
+                Some(mcp) => {
+                    let section = mcp.prompt_section();
+                    if section.is_empty() {
+                        system_prompt.clone()
+                    } else {
+                        format!("{system_prompt}{section}")
+                    }
+                }
+                None => system_prompt.clone(),
+            };
+            if let Some(mcp) = &self.mcp {
+                tools.extend(mcp.tool_definitions());
+            }
+
             let response = match self
-                .client
-                .complete(CompletionRequest {
-                    system: &system_prompt,
-                    messages: history,
-                    tools: &tools,
-                    max_tokens: self.max_tokens,
-                })
+                .complete_with_recovery(
+                    None,
+                    &system_prompt,
+                    history,
+                    &tools,
+                    max_tokens,
+                    &mut recovery,
+                )
                 .await
             {
                 Ok(response) => {
+                    // s17: the goal's token baseline is the session total.
+                    if let Some(goal) = &self.goal {
+                        if let Some(usage) = &response.usage {
+                            goal.record_usage(usage.input_tokens, usage.output_tokens);
+                        }
+                    }
+                    if !cron_unacked.is_empty() {
+                        if let Some(cron) = &self.cron {
+                            cron.acknowledge(&cron_unacked)?;
+                        }
+                        cron_unacked.clear();
+                    }
                     reactive_retries = 0;
                     response
                 }
@@ -182,9 +364,51 @@ impl Agent {
                         reactive_retries += 1;
                         continue;
                     }
-                    _ => return Err(error),
+                    _ => {
+                        if !cron_unacked.is_empty() {
+                            if let Some(cron) = &self.cron {
+                                cron.restore(&cron_unacked);
+                            }
+                            history.truncate(rollback_to);
+                        }
+                        return Err(error);
+                    }
                 },
             };
+
+            // s15: a response cut off by the token budget is retried once with
+            // a bigger budget; if it is still truncated and there is nothing to
+            // run, keep what we have and ask the model to continue.
+            if response.stop_reason() == StopReason::MaxTokens {
+                if let Some(config) = &self.recovery {
+                    if !recovery.has_escalated && config.escalated_max_tokens > max_tokens {
+                        recovery.has_escalated = true;
+                        max_tokens = config.escalated_max_tokens;
+                        self.observer
+                            .on_event(AgentEvent::MaxTokensEscalated { max_tokens });
+                        continue;
+                    }
+                    if response.tool_calls().is_empty()
+                        && recovery.continuation_count < config.max_continuation_retries
+                    {
+                        recovery.continuation_count += 1;
+                        self.observer.on_event(AgentEvent::ContinuationRequested {
+                            count: recovery.continuation_count,
+                        });
+                        for block in &response.content {
+                            if let Some(text) = block.as_text() {
+                                self.observer.on_event(AgentEvent::AssistantText(text));
+                            }
+                        }
+                        history.push(Message::assistant(response.content));
+                        history.push(Message::user_text(CONTINUATION_PROMPT));
+                        continue;
+                    }
+                }
+            }
+            // A complete response resets the per-turn recovery budget.
+            max_tokens = self.max_tokens;
+            recovery.has_escalated = false;
 
             for block in &response.content {
                 if let Some(text) = block.as_text() {
@@ -200,6 +424,20 @@ impl Agent {
                 if let Some(forced) = self.hooks.stop(history) {
                     history.push(Message::user_text(forced));
                     continue;
+                }
+                // s17: an independent evaluator judges the whole task, not
+                // just this turn, before the loop is allowed to return.
+                if let Some(goal) = &self.goal {
+                    let running = self
+                        .background
+                        .as_ref()
+                        .is_some_and(|background| background.pending() > 0);
+                    let decision = goal.evaluate_after_turn(history, running).await;
+                    if let GoalDecision::Block { reason } = &decision {
+                        let condition = goal.active_condition().unwrap_or_default();
+                        history.push(Message::user_text(goal_continuation(&condition, reason)));
+                        continue;
+                    }
                 }
                 if let Some(memory) = &self.memory {
                     let outcome = memory.after_turn(history).await;
@@ -278,6 +516,33 @@ impl Agent {
             return (ContentBlock::tool_result(call.id, reason, true), false);
         }
 
+        // s11: an explicit `run_in_background` hands the command to a worker
+        // thread and answers this call at once with a placeholder result.
+        if let Some(background) = &self.background {
+            if should_run_background(&call.name, &call.input) {
+                let command = call
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let (output, is_error) = match background.start(self.ctx.workspace(), command) {
+                    Ok(task_id) => {
+                        self.observer
+                            .on_event(AgentEvent::BackgroundStarted { task_id: &task_id });
+                        (placeholder(&task_id), false)
+                    }
+                    Err(error) => (format!("Error: {error}"), true),
+                };
+                self.hooks.post_tool_use(&call, &output);
+                self.observer.on_event(AgentEvent::ToolResult {
+                    name: &call.name,
+                    output: &output,
+                    is_error,
+                });
+                return (ContentBlock::tool_result(call.id, output, is_error), true);
+            }
+        }
+
         let (output, is_error) = self.dispatch(&call).await;
         self.hooks.post_tool_use(&call, &output);
         self.observer.on_event(AgentEvent::ToolResult {
@@ -288,7 +553,91 @@ impl Agent {
         (ContentBlock::tool_result(call.id, output, is_error), true)
     }
 
+    /// s15: ask the model, backing off over transient provider failures.
+    ///
+    /// `429` and `529` are retried with exponential backoff (and jitter) up to
+    /// the configured budget; repeated overloads switch the turn to the
+    /// fallback model. Every other failure is returned untouched, so the
+    /// caller can decide whether to compact and retry or roll the turn back.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_with_recovery(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolDefinition],
+        max_tokens: u32,
+        recovery: &mut RecoveryState,
+    ) -> Result<CompletionResponse> {
+        let Some(config) = &self.recovery else {
+            return self
+                .client
+                .complete(CompletionRequest {
+                    model,
+                    system,
+                    messages: history,
+                    tools,
+                    max_tokens,
+                })
+                .await;
+        };
+
+        let mut attempt = 0usize;
+        loop {
+            let result = self
+                .client
+                .complete(CompletionRequest {
+                    model: recovery.current_model.as_deref().or(model),
+                    system,
+                    messages: history,
+                    tools,
+                    max_tokens,
+                })
+                .await;
+            let error = match result {
+                Ok(response) => {
+                    recovery.consecutive_overloaded = 0;
+                    return Ok(response);
+                }
+                Err(error) => error,
+            };
+
+            let class = classify(&error);
+            if !is_retryable(class) || attempt + 1 >= config.max_retries {
+                return Err(error);
+            }
+            if class == ErrorClass::Overloaded {
+                if let Some(fallback) = config.note_overloaded(recovery) {
+                    self.observer
+                        .on_event(AgentEvent::ModelFellBack { model: &fallback });
+                }
+            }
+            let delay = config.delay(attempt);
+            self.observer.on_event(AgentEvent::ModelRecovered {
+                kind: if class == ErrorClass::RateLimited {
+                    "429"
+                } else {
+                    "529"
+                },
+                attempt: attempt + 1,
+                delay_ms: delay.as_millis() as u64,
+            });
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
     async fn dispatch(&self, call: &ToolCall) -> (String, bool) {
+        // s14: a discovered tool is not in the registry; it lives in the MCP
+        // registry until the turn ends, so dispatch resolves it by prefix.
+        if call.name.starts_with(MCP_TOOL_PREFIX) {
+            if let Some(mcp) = &self.mcp {
+                return match mcp.call_tool(&call.name, &call.input) {
+                    Ok(output) => (output, false),
+                    Err(error) => (format!("Error: {error}"), true),
+                };
+            }
+        }
         match self.tools.execute(&self.ctx, call).await {
             Ok(output) => (output, false),
             Err(error) => (format!("Error: {error}"), true),
@@ -310,6 +659,14 @@ pub struct AgentBuilder {
     approver: Option<Arc<dyn Approver>>,
     hooks: Vec<Arc<dyn Hook>>,
     observer: Option<Arc<dyn AgentObserver>>,
+    background: Option<BackgroundManager>,
+    cron: Option<CronScheduler>,
+    team: Option<Team>,
+    mcp: Option<McpRegistry>,
+    workflow: Option<WorkflowRegistry>,
+    goal: Option<GoalController>,
+    recovery: Option<RecoveryConfig>,
+    interactive: Option<bool>,
     system_prompt: Option<String>,
     max_tokens: Option<u32>,
     max_steps: Option<usize>,
@@ -364,6 +721,93 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable background Bash execution (s11).
+    ///
+    /// Advertises `run_in_background` on the `bash` tool and routes those
+    /// calls through `manager`. A command the model flags runs on a worker
+    /// thread; its result is injected as a `<task_notification>` on a later
+    /// turn, so the loop never blocks on a slow command.
+    pub fn background(mut self, manager: BackgroundManager) -> Self {
+        self.background = Some(manager);
+        self
+    }
+
+    /// Enable scheduled prompts (s12).
+    ///
+    /// Registers `schedule_cron`, `list_crons`, and `cancel_cron`, polls the
+    /// scheduler at the start of every turn, and delivers due jobs as
+    /// `[Scheduled] <prompt>` user messages.
+    pub fn cron(mut self, scheduler: CronScheduler) -> Self {
+        self.cron = Some(scheduler);
+        self
+    }
+
+    /// Enable agent teams (s13).
+    ///
+    /// Registers the Lead's team tools and folds teammate events (results,
+    /// idle notices, plan decisions) into the conversation at the start of
+    /// every turn.
+    pub fn team(mut self, team: Team) -> Self {
+        self.team = Some(team);
+        self
+    }
+
+    /// Enable MCP external tools (s14).
+    ///
+    /// Registers `connect_mcp` and gates the discovered `mcp__*` tools behind
+    /// the host policy. Connected servers' tools join the model's tool pool on
+    /// the next round, and their names are listed in the system prompt.
+    pub fn mcp(mut self, registry: McpRegistry) -> Self {
+        self.mcp = Some(registry);
+        self
+    }
+
+    /// Enable saved workflows (s16).
+    ///
+    /// Registers the `Workflow` tool, which resolves a workflow *name* to a
+    /// trusted host script and runs it (with `agent`/`parallel`/`pipeline`
+    /// steps) under one tool call, journalling every step so an interrupted
+    /// run can be resumed. Lifecycle and progress lines are forwarded to the
+    /// agent's observer.
+    pub fn workflow(mut self, registry: WorkflowRegistry) -> Self {
+        self.workflow = Some(registry);
+        self
+    }
+
+    /// Enable model-call recovery (s15).
+    ///
+    /// Retries `429`/`529` with exponential backoff, switches to the fallback
+    /// model after repeated overloads, escalates the token budget once when a
+    /// response is truncated, and asks the model to continue when a truncated
+    /// turn has nothing left to run.
+    pub fn recovery(mut self, config: RecoveryConfig) -> Self {
+        self.recovery = Some(config);
+        self
+    }
+
+    /// Enable the goal loop (s17).
+    ///
+    /// When the model stops calling tools, the controller's independent,
+    /// tool-free evaluator judges the session's completion condition. If it is
+    /// not met the reason is appended to the conversation and the loop keeps
+    /// going; a satisfied or impossible goal is cleared. `/goal` in the REPL
+    /// sets, inspects, and clears the condition. Lifecycle transitions are
+    /// forwarded to the agent's observer.
+    pub fn goal(mut self, controller: GoalController) -> Self {
+        self.goal = Some(controller);
+        self
+    }
+
+    /// Whether this agent may pause and ask the user for approval (s15).
+    ///
+    /// Defaults to `true`. An asynchronous turn is built with `false`, so
+    /// anything the policy would have asked about is denied instead of
+    /// blocking on an unreachable prompt.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = Some(interactive);
+        self
+    }
+
     /// Override the recall strategy (defaults to [`CatalogRecall`]).
     pub fn memory_recall(mut self, recall: impl MemoryRecall + 'static) -> Self {
         self.memory_recall = Some(Arc::new(recall));
@@ -399,6 +843,12 @@ impl AgentBuilder {
     /// Set the event observer (defaults to [`NoopObserver`]).
     pub fn observer(mut self, observer: impl AgentObserver + 'static) -> Self {
         self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Set the event observer from an already-shared handle.
+    pub fn shared_observer(mut self, observer: Arc<dyn AgentObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -438,16 +888,50 @@ impl AgentBuilder {
 
         // The permission pipeline is just the first hook, exactly as in s04.
         let mut hooks = Hooks::new();
-        hooks.register(PermissionHook::new(
-            self.policy
-                .unwrap_or_else(|| PermissionPolicy::new(workspace.clone())),
-            self.approver.unwrap_or_else(|| Arc::new(AutoApprover)),
-        ));
+        // s15: a turn with no terminal to prompt on denies instead of asking.
+        let interactive = self.interactive.unwrap_or(true);
+        let approver: Arc<dyn Approver> = self.approver.unwrap_or_else(|| Arc::new(AutoApprover));
+        hooks.register(
+            PermissionHook::new(
+                self.policy
+                    .unwrap_or_else(|| PermissionPolicy::new(workspace.clone())),
+                Arc::clone(&approver),
+            )
+            .interactive(interactive),
+        );
+        // s14: discovered `mcp__*` tools answer to the host policy, not to the
+        // server's own annotations.
+        if let Some(registry) = &self.mcp {
+            hooks.register(
+                McpPermissionHook::new(registry.clone(), Arc::clone(&approver))
+                    .interactive(interactive),
+            );
+        }
         for hook in self.hooks {
             hooks.register_arc(hook);
         }
 
         let mut tools = self.tools.unwrap_or_else(ToolRegistry::with_defaults);
+        // s11: only advertise `run_in_background` when a manager can honour it.
+        if self.background.is_some() {
+            tools.register(BashTool::default().advertising_background());
+        }
+        // s12: the cron tools share the scheduler's job table.
+        if let Some(scheduler) = &self.cron {
+            register_cron_tools(&mut tools, scheduler.clone());
+        }
+        // s13: the Lead's team tools all share one runtime.
+        if let Some(team) = &self.team {
+            register_team_tools(&mut tools, team.clone());
+        }
+        // s14: `connect_mcp` shares the registry the tool pool reads from.
+        if let Some(registry) = &self.mcp {
+            register_mcp_tools(&mut tools, registry.clone());
+        }
+        // s16: the `Workflow` tool resolves saved scripts from the registry.
+        if let Some(registry) = &self.workflow {
+            register_workflow_tools(&mut tools, registry.clone());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -464,6 +948,46 @@ impl AgentBuilder {
         }
         let observer: Arc<dyn AgentObserver> =
             self.observer.unwrap_or_else(|| Arc::new(NoopObserver));
+        if let Some(registry) = &self.mcp {
+            let observer = Arc::clone(&observer);
+            registry.set_listener(Arc::new(move |server: &str, tools: usize| {
+                observer.on_event(AgentEvent::McpConnected { server, tools });
+            }));
+        }
+        if let Some(registry) = &self.workflow {
+            let observer = Arc::clone(&observer);
+            registry.set_listener(Arc::new(move |event: &WorkflowEvent| {
+                observer.on_event(AgentEvent::WorkflowReported {
+                    run_id: &event.run_id,
+                    kind: &event.kind,
+                    message: &event.message,
+                });
+            }));
+        }
+        // s17: every goal transition reaches the observer as one event.
+        if let Some(goal) = &self.goal {
+            let observer = Arc::clone(&observer);
+            goal.set_listener(Arc::new(move |event: &GoalEvent| {
+                let kind = if event.met {
+                    "achieved"
+                } else if event.failed {
+                    "failed"
+                } else if event.active {
+                    "active"
+                } else {
+                    "cleared"
+                };
+                observer.on_event(AgentEvent::GoalReported {
+                    kind,
+                    active: event.active,
+                    met: event.met,
+                    failed: event.failed,
+                    reason: &event.reason,
+                    iterations: event.iterations,
+                    duration_ms: event.duration_ms,
+                });
+            }));
+        }
         let client = self.client.expect("AgentBuilder requires a client");
         let compactor = self.compaction.map(|config| {
             let observer = Arc::clone(&observer);
@@ -496,6 +1020,14 @@ impl AgentBuilder {
             ctx: ToolContext::new(workspace),
             hooks,
             observer,
+            background: self.background,
+            cron: self.cron,
+            team: self.team,
+            mcp: self.mcp,
+            workflow: self.workflow,
+            goal: self.goal,
+            recovery: self.recovery,
+            interactive,
             system_prompt,
             max_tokens: self.max_tokens.unwrap_or(8192),
             max_steps: self.max_steps.unwrap_or(64),
@@ -517,6 +1049,19 @@ pub fn default_system_prompt() -> String {
     format!(
         "You are a coding agent at {cwd}. Environment: {environment} Before starting any multi-step task, use todo_write to plan your steps, then update status as you go."
     )
+}
+
+/// Fold completed background notifications into the conversation.
+///
+/// They extend the trailing user message when there is one (the tool-result
+/// round the loop just pushed), so a notification lands next to the results
+/// the model is already reading.
+fn inject_notifications(history: &mut Vec<Message>, notifications: Vec<String>) {
+    let blocks: Vec<ContentBlock> = notifications.into_iter().map(ContentBlock::text).collect();
+    match history.last_mut() {
+        Some(message) if message.role == Role::User => message.content.extend(blocks),
+        _ => history.push(Message::user_blocks(blocks)),
+    }
 }
 
 /// The most recent user text, kept verbatim in any compaction summary so the
@@ -961,5 +1506,616 @@ mod tests {
         );
         assert!(history[0].text().contains("summary of the past"));
         assert_eq!(history[1].text(), "final answer");
+    }
+
+    #[tokio::test]
+    async fn a_background_bash_call_returns_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "bash",
+                    json!({ "command": "echo inline-marker", "run_in_background": true }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("carrying on")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .background(BackgroundManager::new())
+            .build();
+
+        let mut history = vec![Message::user_text("start it")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let results = history
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            results
+                .iter()
+                .any(|text| text.contains("Background task bg_0001 started")),
+            "{results:?}"
+        );
+        // The command was dispatched, not executed inline.
+        assert!(!results.iter().any(|text| text.contains("inline-marker")));
+        wait_for_background(&agent);
+        assert_eq!(agent.background().unwrap().collect().len(), 1);
+    }
+
+    /// Block until the agent's background manager has a queued result.
+    fn wait_for_background(agent: &Agent) {
+        let manager = agent.background().expect("background enabled");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while manager.ready() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background task did not finish in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_background_result_is_injected_on_a_later_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "bash",
+                    json!({ "command": "echo later-visible", "run_in_background": true }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("started")], "end_turn"),
+            response(vec![ContentBlock::text("noted")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .background(BackgroundManager::new())
+            .build();
+
+        let mut history = vec![Message::user_text("kick it off")];
+        agent.run_turn(&mut history).await.unwrap();
+        wait_for_background(&agent);
+
+        history.push(Message::user_text("any update?"));
+        agent.run_turn(&mut history).await.unwrap();
+
+        let injected = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(ContentBlock::as_text)
+            .find(|text| text.contains("<task_notification>"))
+            .expect("a task_notification should have been injected");
+        assert!(
+            injected.contains("<status>completed</status>"),
+            "{injected}"
+        );
+        assert!(injected.contains("later-visible"), "{injected}");
+    }
+
+    #[tokio::test]
+    async fn a_due_cron_job_becomes_a_scheduled_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        let job = cron
+            .schedule("* * * * *", "run tests", true, false)
+            .unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+        assert!(cron.has_due());
+
+        let client = ScriptedClient::new(vec![response(
+            vec![ContentBlock::text("on it")],
+            "end_turn",
+        )]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = Vec::new();
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0].text().contains("[Scheduled] run tests"),
+            "{}",
+            history[0].text()
+        );
+        // Acknowledged: the recurring job stays and waits for the next match.
+        assert!(!cron.has_due());
+        assert_eq!(cron.jobs().len(), 1);
+        assert_eq!(cron.jobs()[0].id, job.id);
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_cron_job_is_removed_once_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        cron.schedule("* * * * *", "once only", false, false)
+            .unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+
+        let client =
+            ScriptedClient::new(vec![response(vec![ContentBlock::text("ok")], "end_turn")]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = Vec::new();
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert!(cron.jobs().is_empty());
+        assert!(!cron.has_due());
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_rolls_back_the_scheduled_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = CronScheduler::new(dir.path());
+        cron.schedule("* * * * *", "retry me", true, false).unwrap();
+        cron.poll(CronScheduler::now()).unwrap();
+
+        let client = ScriptedClient::new(vec![]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .cron(cron.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("keep me")];
+        let error = agent.run_turn(&mut history).await.unwrap_err();
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text(), "keep me");
+        // The job is queued again for the next turn.
+        assert!(cron.has_due());
+    }
+
+    #[tokio::test]
+    async fn teammate_events_are_injected_into_the_lead_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Team::new(dir.path(), Arc::new(ScriptedClient::new(vec![])));
+        team.bus()
+            .send(&crate::team::TeamMessage::new(
+                "bob",
+                "lead",
+                "auth done",
+                "result",
+            ))
+            .unwrap();
+        assert!(team.bus().peek("lead").unwrap());
+
+        let client = ScriptedClient::new(vec![response(
+            vec![ContentBlock::text("noted")],
+            "end_turn",
+        )]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .team(team.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("status?")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let injected = history
+            .iter()
+            .map(Message::text)
+            .find(|text| text.contains("[Team events]"))
+            .expect("team events should have been injected");
+        assert!(injected.contains("[result] bob: auth done"), "{injected}");
+        // The Lead inbox is drained once the events are delivered.
+        assert!(!team.bus().peek("lead").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_connected_mcp_tool_is_dispatched_through_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = McpRegistry::new();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use("call_1", "connect_mcp", json!({ "name": "docs" }))],
+                "tool_use",
+            ),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "mcp__docs__search",
+                    json!({ "query": "hooks" }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("done")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .mcp(mcp.clone())
+            .build();
+
+        let mut history = vec![Message::user_text("search the docs")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        // The connect tool ran, and the discovered tool resolved two rounds on.
+        assert!(mcp.is_connected("docs"));
+        let (output, is_error) = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if content.contains("[docs]") => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("the discovered MCP tool result should be in history");
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "[docs] Found 3 results for 'hooks'");
+    }
+
+    #[tokio::test]
+    async fn the_host_policy_gates_unapproved_mcp_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = McpRegistry::new();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use(
+                    "call_1",
+                    "connect_mcp",
+                    json!({ "name": "deploy" }),
+                )],
+                "tool_use",
+            ),
+            response(
+                vec![tool_use(
+                    "call_2",
+                    "mcp__deploy__trigger",
+                    json!({ "service": "web" }),
+                )],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("ok")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .mcp(mcp.clone())
+            .approver(crate::permission::DenyApprover)
+            .build();
+
+        let mut history = vec![Message::user_text("deploy web")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let blocked = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if *is_error && content.contains("Permission denied") => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the unapproved MCP tool should have been blocked");
+        assert!(blocked.contains("mcp__deploy__trigger"), "{blocked}");
+    }
+
+    /// Replays a script of successes *and* failures, recording the model asked for.
+    struct FlakyClient {
+        script: Mutex<VecDeque<Result<CompletionResponse>>>,
+        models: Mutex<Vec<Option<String>>>,
+    }
+
+    impl FlakyClient {
+        fn new(script: Vec<Result<CompletionResponse>>) -> Self {
+            FlakyClient {
+                script: Mutex::new(script.into()),
+                models: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn models(&self) -> Vec<Option<String>> {
+            self.models.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for FlakyClient {
+        async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+            self.models
+                .lock()
+                .unwrap()
+                .push(request.model.map(str::to_string));
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(Error::Config("no scripted response left".into())))
+        }
+    }
+
+    /// Records only the s15 recovery events.
+    struct RecoveryObserver {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentObserver for RecoveryObserver {
+        fn on_event(&self, event: AgentEvent<'_>) {
+            let label = match event {
+                AgentEvent::ModelRecovered { kind, attempt, .. } => {
+                    format!("recovered {kind} #{attempt}")
+                }
+                AgentEvent::ModelFellBack { model } => format!("fellback {model}"),
+                AgentEvent::MaxTokensEscalated { max_tokens } => format!("escalated {max_tokens}"),
+                AgentEvent::ContinuationRequested { count } => format!("continuation #{count}"),
+                _ => return,
+            };
+            self.events.lock().unwrap().push(label);
+        }
+    }
+
+    fn fast_recovery() -> RecoveryConfig {
+        RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            ..RecoveryConfig::default()
+        }
+    }
+
+    fn recovery_observer() -> (RecoveryObserver, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            RecoveryObserver {
+                events: Arc::clone(&events),
+            },
+            events,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_call_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = FlakyClient::new(vec![
+            Err(Error::Api {
+                status: 429,
+                message: "slow down".into(),
+            }),
+            Ok(response(vec![ContentBlock::text("recovered")], "end_turn")),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(fast_recovery())
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.last().unwrap().text(), "recovered");
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "recovered 429 #1"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_overloads_switch_to_the_fallback_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let overload = || Error::Api {
+            status: 529,
+            message: "overloaded".into(),
+        };
+        let client = Arc::new(FlakyClient::new(vec![
+            Err(overload()),
+            Err(overload()),
+            Ok(response(
+                vec![ContentBlock::text("from backup")],
+                "end_turn",
+            )),
+        ]));
+        let config = RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            fallback_model: Some("backup-model".to_string()),
+            ..RecoveryConfig::default()
+        };
+        let agent = Agent::builder()
+            .shared_client(client.clone())
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(config)
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        assert_eq!(history.last().unwrap().text(), "from backup");
+        let models = client.models();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0], None);
+        assert_eq!(models[2].as_deref(), Some("backup-model"));
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "fellback backup-model"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_is_retried_with_a_bigger_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = ScriptedClient::new(vec![
+            response(vec![ContentBlock::text("half")], "max_tokens"),
+            response(vec![ContentBlock::text("whole answer")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(fast_recovery())
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        // The truncated text is discarded, not appended.
+        assert_eq!(history.last().unwrap().text(), "whole answer");
+        assert!(!history.iter().any(|message| message.text() == "half"));
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "escalated 16000"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_turn_with_nothing_to_run_is_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, events) = recovery_observer();
+        let client = ScriptedClient::new(vec![
+            response(vec![ContentBlock::text("half")], "max_tokens"),
+            response(vec![ContentBlock::text("rest")], "end_turn"),
+        ]);
+        let config = RecoveryConfig {
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            escalated_max_tokens: 8192, // no headroom: escalation is skipped
+            ..RecoveryConfig::default()
+        };
+        let agent = Agent::builder()
+            .client(client)
+            .tools(echo_registry())
+            .workspace(dir.path())
+            .recovery(config)
+            .observer(observer)
+            .build();
+
+        let mut history = vec![Message::user_text("go")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let texts: Vec<String> = history.iter().map(Message::text).collect();
+        assert!(texts.iter().any(|text| text == "half"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text == CONTINUATION_PROMPT),
+            "{texts:?}"
+        );
+        assert_eq!(history.last().unwrap().text(), "rest");
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "continuation #1"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_interactive_turn_denies_instead_of_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![
+            response(
+                vec![tool_use("c1", "bash", json!({ "command": "rm -rf build" }))],
+                "tool_use",
+            ),
+            response(vec![ContentBlock::text("understood")], "end_turn"),
+        ]);
+        let agent = Agent::builder()
+            .client(client)
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .interactive(false)
+            .build();
+
+        let mut history = vec![Message::user_text("clean up")];
+        agent.run_turn(&mut history).await.unwrap();
+
+        let blocked = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } if *is_error && content.contains("asynchronous turn") => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a destructive command should be denied without a prompt");
+        assert!(blocked.contains("Permission denied"), "{blocked}");
+    }
+
+    #[tokio::test]
+    async fn the_workflow_tool_is_registered_and_reported() {
+        struct RecordingObserver(Arc<Mutex<Vec<String>>>);
+
+        impl AgentObserver for RecordingObserver {
+            fn on_event(&self, event: AgentEvent<'_>) {
+                if let AgentEvent::WorkflowReported { kind, .. } = event {
+                    self.0.lock().unwrap().push(kind.to_string());
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .client(ScriptedClient::new(Vec::new()))
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .workflow(crate::workflow::default_registry().unwrap())
+            .observer(RecordingObserver(Arc::clone(&events)))
+            .build();
+
+        let names: Vec<String> = agent
+            .tools
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(names.contains(&crate::workflow::WORKFLOW_TOOL_NAME.to_string()));
+
+        let tool = agent
+            .tools
+            .get(crate::workflow::WORKFLOW_TOOL_NAME)
+            .expect("the Workflow tool is registered");
+        let output = tool
+            .call(
+                agent.context(),
+                json!({ "name": "review-changes", "args": { "changes": "let x = 1;" } }),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("local_workflow_"));
+
+        let seen = events.lock().unwrap().clone();
+        assert!(seen.contains(&"async_launched".to_string()), "{seen:?}");
+        assert!(seen.contains(&"task_notification".to_string()), "{seen:?}");
+        assert!(seen.contains(&"workflow_phase".to_string()), "{seen:?}");
     }
 }

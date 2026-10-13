@@ -559,6 +559,7 @@ impl Compactor {
         let response = self
             .client
             .complete(CompletionRequest {
+                model: None,
                 system: SUMMARY_SYSTEM,
                 messages: &input,
                 tools: &[],
