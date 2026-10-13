@@ -37,6 +37,7 @@ use crate::recovery::{
 use crate::skills::SkillLoader;
 use crate::team::{register_team_tools, Team};
 use crate::tools::{BashTool, LoadSkillTool, ToolContext, ToolRegistry, TODO_TOOL_NAME};
+use crate::workflow::{register_workflow_tools, WorkflowEvent, WorkflowRegistry};
 
 /// Reminder injected when the model goes several rounds without updating its
 /// todo list (s05).
@@ -91,6 +92,12 @@ pub enum AgentEvent<'a> {
     MaxTokensEscalated { max_tokens: u32 },
     /// A truncated, tool-less response asked the model to continue (s15).
     ContinuationRequested { count: usize },
+    /// A workflow run reported lifecycle or progress (s16).
+    WorkflowReported {
+        run_id: &'a str,
+        kind: &'a str,
+        message: &'a str,
+    },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -119,6 +126,7 @@ pub struct Agent {
     cron: Option<CronScheduler>,
     team: Option<Team>,
     mcp: Option<McpRegistry>,
+    workflow: Option<WorkflowRegistry>,
     recovery: Option<RecoveryConfig>,
     interactive: bool,
     system_prompt: String,
@@ -176,6 +184,11 @@ impl Agent {
     /// The model-call recovery policy, when it is enabled (s15).
     pub fn recovery(&self) -> Option<&RecoveryConfig> {
         self.recovery.as_ref()
+    }
+
+    /// The workflow registry, when saved procedures are enabled (s16).
+    pub fn workflow(&self) -> Option<&WorkflowRegistry> {
+        self.workflow.as_ref()
     }
 
     /// Whether this agent may pause and ask the user for approval (s15).
@@ -608,6 +621,7 @@ pub struct AgentBuilder {
     cron: Option<CronScheduler>,
     team: Option<Team>,
     mcp: Option<McpRegistry>,
+    workflow: Option<WorkflowRegistry>,
     recovery: Option<RecoveryConfig>,
     interactive: Option<bool>,
     system_prompt: Option<String>,
@@ -702,6 +716,18 @@ impl AgentBuilder {
     /// the next round, and their names are listed in the system prompt.
     pub fn mcp(mut self, registry: McpRegistry) -> Self {
         self.mcp = Some(registry);
+        self
+    }
+
+    /// Enable saved workflows (s16).
+    ///
+    /// Registers the `Workflow` tool, which resolves a workflow *name* to a
+    /// trusted host script and runs it (with `agent`/`parallel`/`pipeline`
+    /// steps) under one tool call, journalling every step so an interrupted
+    /// run can be resumed. Lifecycle and progress lines are forwarded to the
+    /// agent's observer.
+    pub fn workflow(mut self, registry: WorkflowRegistry) -> Self {
+        self.workflow = Some(registry);
         self
     }
 
@@ -846,6 +872,10 @@ impl AgentBuilder {
         if let Some(registry) = &self.mcp {
             register_mcp_tools(&mut tools, registry.clone());
         }
+        // s16: the `Workflow` tool resolves saved scripts from the registry.
+        if let Some(registry) = &self.workflow {
+            register_workflow_tools(&mut tools, registry.clone());
+        }
         if let Some(loader) = &self.skills {
             tools.register(LoadSkillTool::new(Arc::clone(loader)));
         }
@@ -866,6 +896,16 @@ impl AgentBuilder {
             let observer = Arc::clone(&observer);
             registry.set_listener(Arc::new(move |server: &str, tools: usize| {
                 observer.on_event(AgentEvent::McpConnected { server, tools });
+            }));
+        }
+        if let Some(registry) = &self.workflow {
+            let observer = Arc::clone(&observer);
+            registry.set_listener(Arc::new(move |event: &WorkflowEvent| {
+                observer.on_event(AgentEvent::WorkflowReported {
+                    run_id: &event.run_id,
+                    kind: &event.kind,
+                    message: &event.message,
+                });
             }));
         }
         let client = self.client.expect("AgentBuilder requires a client");
@@ -904,6 +944,7 @@ impl AgentBuilder {
             cron: self.cron,
             team: self.team,
             mcp: self.mcp,
+            workflow: self.workflow,
             recovery: self.recovery,
             interactive,
             system_prompt,
@@ -1946,5 +1987,54 @@ mod tests {
             })
             .expect("a destructive command should be denied without a prompt");
         assert!(blocked.contains("Permission denied"), "{blocked}");
+    }
+
+    #[tokio::test]
+    async fn the_workflow_tool_is_registered_and_reported() {
+        struct RecordingObserver(Arc<Mutex<Vec<String>>>);
+
+        impl AgentObserver for RecordingObserver {
+            fn on_event(&self, event: AgentEvent<'_>) {
+                if let AgentEvent::WorkflowReported { kind, .. } = event {
+                    self.0.lock().unwrap().push(kind.to_string());
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .client(ScriptedClient::new(Vec::new()))
+            .tools(ToolRegistry::with_defaults())
+            .workspace(dir.path())
+            .workflow(crate::workflow::default_registry().unwrap())
+            .observer(RecordingObserver(Arc::clone(&events)))
+            .build();
+
+        let names: Vec<String> = agent
+            .tools
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(names.contains(&crate::workflow::WORKFLOW_TOOL_NAME.to_string()));
+
+        let tool = agent
+            .tools
+            .get(crate::workflow::WORKFLOW_TOOL_NAME)
+            .expect("the Workflow tool is registered");
+        let output = tool
+            .call(
+                agent.context(),
+                json!({ "name": "review-changes", "args": { "changes": "let x = 1;" } }),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("local_workflow_"));
+
+        let seen = events.lock().unwrap().clone();
+        assert!(seen.contains(&"async_launched".to_string()), "{seen:?}");
+        assert!(seen.contains(&"task_notification".to_string()), "{seen:?}");
+        assert!(seen.contains(&"workflow_phase".to_string()), "{seen:?}");
     }
 }

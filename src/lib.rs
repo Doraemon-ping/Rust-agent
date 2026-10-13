@@ -35,6 +35,7 @@ pub mod skills;
 pub mod subagent;
 pub mod team;
 pub mod tools;
+pub mod workflow;
 
 pub use agent::{
     default_system_prompt, Agent, AgentBuilder, AgentEvent, AgentObserver, NoopObserver,
@@ -91,4 +92,14 @@ pub use tools::{
     UpdateTaskTool, CLAIM_TASK_TOOL_NAME, COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME,
     DEFAULT_OWNER, GET_TASK_TOOL_NAME, LIST_TASKS_TOOL_NAME, LOAD_SKILL_TOOL_NAME, TASKS_DIR,
     TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
+};
+pub use workflow::{
+    create_task_id, default_registry, fill_schema, findings_schema, last_run,
+    register_workflow_tools, review_changes_meta, review_changes_script, stable_hash, valid_run_id,
+    valid_workflow_name, validate_schema, verdict_schema, AgentRunner, AnthropicAgentRunner,
+    BoxWorkflowFuture, Budget, ExecutionContext, ExecutionLimits, MockAgentRunner, PipelineStage,
+    ProgressEvent, RunnerOutput, WorkflowEvent, WorkflowJournal, WorkflowListener, WorkflowMeta,
+    WorkflowRegistry, WorkflowScript, WorkflowTask, WorkflowTool, AGENT_CAP, CONCURRENCY,
+    DEMO_CHANGES, LAST_RUN_FILE, REVIEW_DIMENSIONS, WORKFLOWS_DIR, WORKFLOW_AGENT_MAX_TOKENS,
+    WORKFLOW_AGENT_SYSTEM, WORKFLOW_PROMPT, WORKFLOW_TOOL_NAME,
 };

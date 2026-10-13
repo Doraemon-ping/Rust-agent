@@ -67,4 +67,8 @@ pub enum Error {
     /// The loop hit its safety bound without the model stopping.
     #[error("agent exceeded the maximum number of iterations ({0})")]
     MaxIterations(usize),
+
+    /// The workflow runtime rejected a run, or a script step failed (s16).
+    #[error("workflow error: {0}")]
+    Workflow(String),
 }

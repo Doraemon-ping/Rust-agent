@@ -11,11 +11,12 @@ use rust_agent::agent::{AgentEvent, AgentObserver};
 use rust_agent::hooks::Hook;
 use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
+use rust_agent::AnthropicAgentRunner;
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
     ContentBlock, CronScheduler, LlmClient, McpRegistry, MemoryConfig, Message, RecoveryConfig,
     SkillLoader, Team, ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, MCP_PROMPT,
-    TASKS_PROMPT, TEAM_PROMPT,
+    TASKS_PROMPT, TEAM_PROMPT, WORKFLOW_PROMPT,
 };
 
 #[tokio::main]
@@ -61,6 +62,11 @@ async fn main() -> Result<()> {
     // s14: external tools arrive through MCP servers, gated by host policy.
     let mcp = McpRegistry::new();
 
+    // s16: saved procedures run through the host's own model client, so a
+    // workflow step costs one model call rather than a whole subagent loop.
+    let workflow = rust_agent::default_registry()?
+        .with_runner(Arc::new(AnthropicAgentRunner::new(client.clone())));
+
     // s15: retry transient model failures, fall back, and escalate truncation.
     let mut recovery = RecoveryConfig::default();
     if let Some(model) = &config.fallback_model {
@@ -79,16 +85,18 @@ async fn main() -> Result<()> {
         .cron(cron.clone())
         .team(team.clone())
         .mcp(mcp.clone())
+        .workflow(workflow.clone())
         .recovery(recovery)
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
             TASKS_PROMPT,
             BACKGROUND_PROMPT,
             CRON_PROMPT,
             TEAM_PROMPT,
-            MCP_PROMPT
+            MCP_PROMPT,
+            WORKFLOW_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -108,6 +116,7 @@ async fn main() -> Result<()> {
     println!("cron: .scheduled_tasks.json (schedule_cron, list_crons, cancel_cron) (s12)");
     println!("team: .mailboxes/ (spawn_teammate, send_message, review_plan) (s13)");
     println!("mcp: connect_mcp -> mcp__<server>__<tool> (docs, deploy) (s14)");
+    println!("workflow: Workflow(review-changes) -> .workflow/ journal + resume (s16)");
     println!("recovery: 429/529 backoff, fallback model, max_tokens escalation (s15)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
@@ -244,6 +253,14 @@ impl AgentObserver for PrintingObserver {
             AgentEvent::ContinuationRequested { count } => {
                 println!("\x1b[33m[continuation {count}] asking the model to continue\x1b[0m");
             }
+            AgentEvent::WorkflowReported {
+                run_id,
+                kind,
+                message,
+            } => {
+                let short = run_id.strip_prefix("wf_").unwrap_or(run_id);
+                println!("\x1b[35m[workflow {short}] {kind}: {message}\x1b[0m");
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -316,6 +333,7 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::ModelFellBack { .. }
             | AgentEvent::MaxTokensEscalated { .. }
             | AgentEvent::ContinuationRequested { .. }
+            | AgentEvent::WorkflowReported { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

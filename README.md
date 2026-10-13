@@ -66,6 +66,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/team.rs` | Agent teams (s13): mailboxes, teammate runtimes, plan gates, worktrees |
 | `src/mcp.rs` | MCP tools (s14): connect servers, namespace discovered tools, host policy |
 | `src/recovery.rs` | Model-call recovery (s15): classify 429/529, backoff, fallback model, escalation |
+| `src/workflow.rs` | Workflow runtime (s16): saved scripts, `agent`/`parallel`/`pipeline`, journal, resume |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -92,6 +93,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s13 | Lead delegates to persistent teammates | `Team` + `MessageBus` + `spawn_teammate` and the protocol tools |
 | s14 | Connect a server, discover and call its tools | `McpRegistry` + `McpServer` + `connect_mcp` + `mcp__{server}__{tool}` |
 | s15 | Many mechanisms, one loop; recover from provider failures | the whole `Agent` + `RecoveryConfig` + `Agent::builder().interactive(..)` |
+| s16 | A saved script orchestrates the subagents | `WorkflowRegistry` + `WorkflowTool` + `ExecutionContext` + `WorkflowJournal` |
 
 ## Skills
 
@@ -437,6 +439,58 @@ let agent = Agent::builder()
 `MaxTokensEscalated`, and `ContinuationRequested`; `Config::fallback_model`
 comes from `FALLBACK_MODEL_ID`.
 
+## Workflow runtime
+
+Every round so far is model-driven: the model reads the tool results and picks
+the next step. That is right when the next step depends on what the last one
+found. Some tasks instead repeat a fixed procedure -- review four dimensions,
+verify each finding, keep the ones that survive, sort by severity -- and the
+host already knows the steps and their order. `builder().workflow(registry)`
+exposes those saved procedures as one `Workflow` tool.
+
+The model supplies a **name** and args, never code. Behind a single `tool_use`
+a host script coordinates the subagent calls with four primitives:
+
+| Primitive | Meaning |
+| --- | --- |
+| `agent(prompt, schema?, label?, phase?)` | run one subagent, optionally constrained to a JSON schema |
+| `parallel(thunks)` | **barrier**: run all of them, return results in input order |
+| `pipeline(items, stages)` | per-item staged flow, **no barrier** between stages |
+| `phase(title)` / `log(message)` | progress markers, a phase is announced once |
+
+Each `agent()` call is journalled under a *semantic* key -- a hash of
+`kind|label|prompt|schema`, never a call counter -- so concurrent completion
+order cannot shift the keys. `Workflow(name, resume_from_run_id: ..)` replays
+the journalled results and only re-runs the steps that changed. With a
+`schema`, an answer that fails validation is re-asked once before it becomes an
+error. A `budget` arg caps the run's tokens; `AGENT_CAP` caps `agent()` calls.
+
+Intermediate values live in the script's variables; only the final result and a
+task summary go back to the conversation:
+
+```json
+{ "launched": { "taskId": "local_workflow_wf_review-changes_1a2b3c4d5e6f7a8b", "runId": "wf_review-changes_1a2b3c4d5e6f7a8b", "workflowName": "review-changes" },
+  "result":   { "confirmed": [ { "dimension": "security", "title": "...", "severity": "high" } ] },
+  "task":     { "status": "completed", "usage": { "agents": 9, "tokens": 1204 }, "progress": [ ".." ] } }
+```
+
+A run keeps its data in `<workspace>/.workflow/`: a snapshot (`<runId>.json`), an
+output file (`<runId>.output.json`), the journal (`<runId>.journal.jsonl`), and
+`last_run.txt` naming the most recent run. Lifecycle and progress lines
+(`async_launched`, `task_started`, `workflow_phase`, `workflow_agent`,
+`task_notification`) reach the observer as `AgentEvent::WorkflowReported`.
+
+The built-in `review-changes` workflow runs a `pipeline` over four review
+dimensions: four auditors, then each finding verified adversarially by its own
+subagent, then the confirmed findings sorted by severity. Swap in a mock runner
+and the whole plan is deterministic and offline:
+
+```rust
+let registry = rust_agent::default_registry()?
+    .with_runner(Arc::new(AnthropicAgentRunner::new(client.clone())));
+let agent = Agent::builder().client(client).workflow(registry).build();
+```
+
 ## Getting started
 
 ```sh
@@ -514,10 +568,15 @@ let answer = agent.ask("summarise src/lib.rs").await?;
   exactly once per round.
 - **Asynchronous approval**: `builder().interactive(false)` turns "ask the user"
   into "deny, with a reason" -- for turns with no terminal to prompt on.
+- **Saved workflows**: `builder().workflow(registry)` registers the `Workflow`
+  tool. Register trusted scripts with `registry.register(meta, script)`; the
+  model only ever passes a name and args. `WorkflowRegistry::set_runner` swaps
+  the step runner (mock, another model, a fixed fixture) without touching a
+  script.
 
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery, workflows
 cargo clippy --all-targets
 ```
