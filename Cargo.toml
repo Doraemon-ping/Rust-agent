@@ -1,0 +1,35 @@
+[package]
+name = "rust-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A minimal, extensible coding-agent runtime in Rust: the agent loop, tool dispatch, and permissions."
+license = "MIT"
+publish = false
+
+[lib]
+name = "rust_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dotenvy = "0.15"
+glob = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustyline = "14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

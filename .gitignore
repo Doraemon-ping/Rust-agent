@@ -1,0 +1,9 @@
+/target
+.env
+
+# compaction artifacts (s08)
+/.transcripts
+/.task_outputs
+
+# memory store (s09)
+/.memory
