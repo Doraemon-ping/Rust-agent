@@ -7,3 +7,6 @@
 
 # memory store (s09)
 /.memory
+
+# task graph (s10)
+/.tasks

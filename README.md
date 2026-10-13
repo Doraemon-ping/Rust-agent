@@ -4,7 +4,7 @@ A minimal, extensible coding-agent runtime in Rust.
 
 Rust owns the *harness*: the loop, tool dispatch, and the permission gates.
 The model owns the *agency*. This crate is modelled on the `agent-loop`
-lessons in `learn-claude-code` (s01-s09), re-implemented idiomatically with
+lessons in `learn-claude-code` (s01-s10), re-implemented idiomatically with
 `tokio` + `reqwest` + `serde`.
 
 ## The loop
@@ -56,6 +56,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/tools/bash.rs` | `bash` tool (platform shell, timeout, output cap) |
 | `src/tools/fs.rs` | `read_file`, `write_file`, `edit_file`, `glob` |
 | `src/tools/todo.rs` | Stateful `todo_write` task list (s05) |
+| `src/tools/task.rs` | Persistent task graph: `create_task` / `update_task` / `claim_task` / `complete_task` (s10) |
 | `src/tools/skill.rs` | `load_skill` tool: reads a full `SKILL.md` on demand (s07) |
 | `src/skills.rs` | `SkillLoader`: scans `skills/*/SKILL.md`, builds the catalog |
 | `src/compact.rs` | Four-step context compaction and the `compact` tool (s08) |
@@ -80,6 +81,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s07 | Skills: catalog first, content on demand | `SkillLoader` + `load_skill` |
 | s08 | Compact: spill, archive, trim, summarise | `Compactor` + `compact` tool |
 | s09 | Durable memory: recall, extract, consolidate | `MemoryManager` + `MemoryStore` + `CatalogRecall` |
+| s10 | Persistent task graph with `blockedBy` + `owner` | `TaskStore` + the six task tools |
 
 ## Skills
 
@@ -180,6 +182,40 @@ on `MemoryConfig`; leave it off to disable durable memory entirely. Recall is
 itself a `MemoryRecall`, so a vector index can replace `CatalogRecall` without
 touching the loop.
 
+## Tasks
+
+`todo_write` is a checklist for the current session. The task system (s10) is
+the durable version: each task is a JSON file under `<workspace>/.tasks/`, the
+`blockedBy` edges form a dependency graph, and `owner` records who claimed it.
+Because it lives on disk, progress is recoverable across sessions.
+
+```text
+create_task ─► pending ─claim─► in_progress ─complete─► completed
+                                                            │
+                        unblocks downstream tasks ◄─────────┘
+```
+
+The model builds the graph in two phases: create every node, then wire the
+edges with the ids `create_task` returned (a tool result cannot feed its own
+arguments, so ids only exist after the create call returns).
+
+| Tool | Effect |
+| --- | --- |
+| `create_task` | New `pending` task; returns its `task_xxxxxxxx` id |
+| `update_task` | Add `blockedBy` edges (pending + unowned only; self/cycle rejected) |
+| `list_tasks` | One line per task: status marker, owner, dependencies |
+| `get_task` | Full JSON, for recovering a description across sessions |
+| `claim_task` | `pending` → `in_progress`, once every dependency is complete |
+| `complete_task` | `in_progress` → `completed`, reporting what it unblocked |
+
+```rust
+let agent = Agent::builder()
+    .client(client)
+    .tools(ToolRegistry::with_tasks())   // defaults + the six task tools
+    .system_prompt(format!("{} {}", default_system_prompt(), TASKS_PROMPT))
+    .build();
+```
+
 ## Getting started
 
 ```sh
@@ -246,6 +282,6 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks
 cargo clippy --all-targets
 ```

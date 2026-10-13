@@ -55,4 +55,10 @@ pub use permission::{
 };
 pub use skills::{parse_frontmatter, Skill, SkillLoader, SKILL_MANIFEST};
 pub use subagent::{subagent_system_prompt, TaskTool, TASK_TOOL_NAME};
-pub use tools::{LoadSkillTool, Tool, ToolContext, ToolRegistry, LOAD_SKILL_TOOL_NAME};
+pub use tools::{
+    register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool, GetTaskTool,
+    ListTasksTool, LoadSkillTool, Task, TaskStatus, TaskStore, Tool, ToolContext, ToolRegistry,
+    UpdateTaskTool, CLAIM_TASK_TOOL_NAME, COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME,
+    DEFAULT_OWNER, GET_TASK_TOOL_NAME, LIST_TASKS_TOOL_NAME, LOAD_SKILL_TOOL_NAME, TASKS_DIR,
+    TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
+};

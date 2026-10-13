@@ -13,7 +13,7 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, Agent, AnthropicClient, CompactConfig, Config, ContentBlock, LlmClient,
-    MemoryConfig, Message, SkillLoader, ToolCall, ToolRegistry,
+    MemoryConfig, Message, SkillLoader, ToolCall, ToolRegistry, TASKS_PROMPT,
 };
 
 #[tokio::main]
@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
         .approver(InteractiveApprover)
         .build();
 
-    let mut tools = ToolRegistry::with_defaults();
+    // s10: defaults plus the persistent task graph.
+    let mut tools = ToolRegistry::with_tasks();
     tools.register(TaskTool::new(subagent));
 
     // s07: skills live in `<workspace>/skills/*/SKILL.md`.
@@ -52,8 +53,9 @@ async fn main() -> Result<()> {
         .memory(MemoryConfig::default())
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} Use task for focused exploration or a self-contained subtask.",
-            default_system_prompt()
+            "{} {} Use task for focused exploration or a self-contained subtask.",
+            default_system_prompt(),
+            TASKS_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -68,6 +70,7 @@ async fn main() -> Result<()> {
     );
     println!("skills: {skill_count} loaded from skills/");
     println!("memory: .memory/ (recall + extract + consolidate)");
+    println!("tasks: .tasks/ (create, update, claim, complete)");
     println!("Type a task, or /reset to clear history, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
@@ -121,6 +124,8 @@ impl AgentObserver for PrintingObserver {
             } => {
                 if name == "todo_write" && !is_error {
                     println!("\x1b[33m## Current Tasks\x1b[0m\n{}", preview(output));
+                } else if name == "list_tasks" && !is_error {
+                    println!("\x1b[33m## Task Graph\x1b[0m\n{}", preview(output));
                 } else {
                     let color = if is_error { "\x1b[31m" } else { "\x1b[90m" };
                     println!("{color}{}\x1b[0m", preview(output));

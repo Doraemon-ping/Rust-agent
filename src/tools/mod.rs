@@ -7,11 +7,18 @@
 pub mod bash;
 pub mod fs;
 pub mod skill;
+pub mod task;
 pub mod todo;
 
 pub use bash::BashTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use skill::{LoadSkillTool, LOAD_SKILL_TOOL_NAME};
+pub use task::{
+    register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool, GetTaskTool,
+    ListTasksTool, Task, TaskStatus, TaskStore, UpdateTaskTool, CLAIM_TASK_TOOL_NAME,
+    COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME, DEFAULT_OWNER, GET_TASK_TOOL_NAME,
+    LIST_TASKS_TOOL_NAME, TASKS_DIR, TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
+};
 pub use todo::{Todo, TodoList, TodoStatus, TodoTool, TODO_TOOL_NAME};
 
 use std::collections::BTreeMap;
@@ -101,6 +108,13 @@ impl ToolRegistry {
     pub fn with_defaults() -> Self {
         let mut registry = Self::base();
         registry.register(TodoTool::default());
+        registry
+    }
+
+    /// The task-aware tool set: defaults plus the s10 task system.
+    pub fn with_tasks() -> Self {
+        let mut registry = Self::with_defaults();
+        register_task_tools(&mut registry);
         registry
     }
 
