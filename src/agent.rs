@@ -25,6 +25,7 @@ use crate::compact::{
 };
 use crate::cron::{register_cron_tools, CronJob, CronScheduler};
 use crate::error::{Error, Result};
+use crate::goal::{goal_continuation, GoalController, GoalDecision, GoalEvent};
 use crate::hooks::{Hook, Hooks};
 use crate::llm::{CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition};
 use crate::mcp::{register_mcp_tools, McpPermissionHook, McpRegistry, MCP_TOOL_PREFIX};
@@ -98,6 +99,17 @@ pub enum AgentEvent<'a> {
         kind: &'a str,
         message: &'a str,
     },
+    /// The goal evaluator judged the turn, or a limit/error ended it (s17).
+    GoalReported {
+        /// `active`, `cleared`, `achieved`, or `failed`.
+        kind: &'a str,
+        active: bool,
+        met: bool,
+        failed: bool,
+        reason: &'a str,
+        iterations: usize,
+        duration_ms: u64,
+    },
 }
 
 /// Receives [`AgentEvent`]s. Implement to render progress (see the CLI) or to
@@ -127,6 +139,7 @@ pub struct Agent {
     team: Option<Team>,
     mcp: Option<McpRegistry>,
     workflow: Option<WorkflowRegistry>,
+    goal: Option<GoalController>,
     recovery: Option<RecoveryConfig>,
     interactive: bool,
     system_prompt: String,
@@ -191,6 +204,11 @@ impl Agent {
         self.workflow.as_ref()
     }
 
+    /// The goal controller, when the goal loop is enabled (s17).
+    pub fn goal(&self) -> Option<&GoalController> {
+        self.goal.as_ref()
+    }
+
     /// Whether this agent may pause and ask the user for approval (s15).
     pub fn is_interactive(&self) -> bool {
         self.interactive
@@ -210,6 +228,10 @@ impl Agent {
     /// `history` is the live conversation. The loop appends to it, so callers
     /// keep multi-turn context across `run_turn` calls.
     pub async fn run_turn(&self, history: &mut Vec<Message>) -> Result<()> {
+        // s17: the Stop-hook block cap counts turns within one user query.
+        if let Some(goal) = &self.goal {
+            goal.begin_query();
+        }
         let mut rounds_since_todo = 0usize;
         let active_request = active_request(history);
         let mut reactive_retries = 0usize;
@@ -318,6 +340,12 @@ impl Agent {
                 .await
             {
                 Ok(response) => {
+                    // s17: the goal's token baseline is the session total.
+                    if let Some(goal) = &self.goal {
+                        if let Some(usage) = &response.usage {
+                            goal.record_usage(usage.input_tokens, usage.output_tokens);
+                        }
+                    }
                     if !cron_unacked.is_empty() {
                         if let Some(cron) = &self.cron {
                             cron.acknowledge(&cron_unacked)?;
@@ -396,6 +424,20 @@ impl Agent {
                 if let Some(forced) = self.hooks.stop(history) {
                     history.push(Message::user_text(forced));
                     continue;
+                }
+                // s17: an independent evaluator judges the whole task, not
+                // just this turn, before the loop is allowed to return.
+                if let Some(goal) = &self.goal {
+                    let running = self
+                        .background
+                        .as_ref()
+                        .is_some_and(|background| background.pending() > 0);
+                    let decision = goal.evaluate_after_turn(history, running).await;
+                    if let GoalDecision::Block { reason } = &decision {
+                        let condition = goal.active_condition().unwrap_or_default();
+                        history.push(Message::user_text(goal_continuation(&condition, reason)));
+                        continue;
+                    }
                 }
                 if let Some(memory) = &self.memory {
                     let outcome = memory.after_turn(history).await;
@@ -622,6 +664,7 @@ pub struct AgentBuilder {
     team: Option<Team>,
     mcp: Option<McpRegistry>,
     workflow: Option<WorkflowRegistry>,
+    goal: Option<GoalController>,
     recovery: Option<RecoveryConfig>,
     interactive: Option<bool>,
     system_prompt: Option<String>,
@@ -739,6 +782,19 @@ impl AgentBuilder {
     /// turn has nothing left to run.
     pub fn recovery(mut self, config: RecoveryConfig) -> Self {
         self.recovery = Some(config);
+        self
+    }
+
+    /// Enable the goal loop (s17).
+    ///
+    /// When the model stops calling tools, the controller's independent,
+    /// tool-free evaluator judges the session's completion condition. If it is
+    /// not met the reason is appended to the conversation and the loop keeps
+    /// going; a satisfied or impossible goal is cleared. `/goal` in the REPL
+    /// sets, inspects, and clears the condition. Lifecycle transitions are
+    /// forwarded to the agent's observer.
+    pub fn goal(mut self, controller: GoalController) -> Self {
+        self.goal = Some(controller);
         self
     }
 
@@ -908,6 +964,30 @@ impl AgentBuilder {
                 });
             }));
         }
+        // s17: every goal transition reaches the observer as one event.
+        if let Some(goal) = &self.goal {
+            let observer = Arc::clone(&observer);
+            goal.set_listener(Arc::new(move |event: &GoalEvent| {
+                let kind = if event.met {
+                    "achieved"
+                } else if event.failed {
+                    "failed"
+                } else if event.active {
+                    "active"
+                } else {
+                    "cleared"
+                };
+                observer.on_event(AgentEvent::GoalReported {
+                    kind,
+                    active: event.active,
+                    met: event.met,
+                    failed: event.failed,
+                    reason: &event.reason,
+                    iterations: event.iterations,
+                    duration_ms: event.duration_ms,
+                });
+            }));
+        }
         let client = self.client.expect("AgentBuilder requires a client");
         let compactor = self.compaction.map(|config| {
             let observer = Arc::clone(&observer);
@@ -945,6 +1025,7 @@ impl AgentBuilder {
             team: self.team,
             mcp: self.mcp,
             workflow: self.workflow,
+            goal: self.goal,
             recovery: self.recovery,
             interactive,
             system_prompt,

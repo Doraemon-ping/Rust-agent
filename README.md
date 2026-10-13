@@ -4,7 +4,7 @@ A minimal, extensible coding-agent runtime in Rust.
 
 Rust owns the *harness*: the loop, tool dispatch, and the permission gates.
 The model owns the *agency*. This crate is modelled on the `agent-loop`
-lessons in `learn-claude-code` (s01-s15), re-implemented idiomatically with
+lessons in `learn-claude-code` (s01-s17), re-implemented idiomatically with
 `tokio` + `reqwest` + `serde`.
 
 ## The loop
@@ -14,7 +14,7 @@ Everything reduces to one pattern:
 ```text
 User prompt --UserPromptSubmit--> LLM
                                    |
-                    (tool_use?) ---+--- no --> Stop hook? --no--> done
+                    (tool_use?) ---+--- no --> Stop hooks, then the goal evaluator?
                           |          yes           |
                           |                        +---> LLM (continue)
                           v
@@ -35,6 +35,11 @@ for step in 0..max_steps {
 
     let calls = response.tool_calls();
     if calls.is_empty() {
+        // s17: /goal re-enters the loop until its condition is met
+        if let GoalDecision::Block { reason } = goal.evaluate_after_turn(&history, running).await {
+            history.push(Message::user_text(reason));
+            continue;
+        }
         return Ok(()); // the model is done
     }
 
@@ -67,6 +72,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | `src/mcp.rs` | MCP tools (s14): connect servers, namespace discovered tools, host policy |
 | `src/recovery.rs` | Model-call recovery (s15): classify 429/529, backoff, fallback model, escalation |
 | `src/workflow.rs` | Workflow runtime (s16): saved scripts, `agent`/`parallel`/`pipeline`, journal, resume |
+| `src/goal.rs` | Goal loop (s17): a session condition plus an independent, tool-free evaluator at the Stop boundary |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -94,6 +100,7 @@ That is the whole agent. Everything else is a seam you can replace.
 | s14 | Connect a server, discover and call its tools | `McpRegistry` + `McpServer` + `connect_mcp` + `mcp__{server}__{tool}` |
 | s15 | Many mechanisms, one loop; recover from provider failures | the whole `Agent` + `RecoveryConfig` + `Agent::builder().interactive(..)` |
 | s16 | A saved script orchestrates the subagents | `WorkflowRegistry` + `WorkflowTool` + `ExecutionContext` + `WorkflowJournal` |
+| s17 | Stay in the loop until an independent evaluator agrees | `GoalController` + `PromptGoalEvaluator` + `/goal` |
 
 ## Skills
 
@@ -491,6 +498,80 @@ let registry = rust_agent::default_registry()?
 let agent = Agent::builder().client(client).workflow(registry).build();
 ```
 
+## Goal loop
+
+One exit condition has stood since s01: the model stops calling tools, so the
+turn returns. That is right for ordinary conversation, but wrong for "keep
+fixing until every test passes" -- no `tool_use` proves only that *this* turn
+ended, not that the whole task is done. `builder().goal(controller)` adds one
+independent check at that boundary.
+
+```text
+/goal pytest tests/auth exits 0 and lint reports no errors
+```
+
+The condition is stored for the session and handed to the model as the current
+task. When the model stops asking for tools, the goal Stop hook runs inside the
+same loop:
+
+```rust
+let decision = goal.evaluate_after_turn(history, background_running).await;
+if let GoalDecision::Block { reason } = decision {
+    history.push(Message::user_text(goal_continuation(condition, reason)));
+    continue;                     // the same loop, no second entry point
+}
+return Ok(());
+```
+
+| Decision | Meaning |
+| --- | --- |
+| `Allow` | no active goal: stop exactly as in s01 |
+| `Defer` | a background command is still running; skip the evaluator, keep the goal |
+| `Block` | the condition is not met: append the reason and keep looping |
+| `Achieved` / `Failed` | the condition was met, or judged impossible; the goal is cleared |
+| `Limit` | the Stop hook blocked `DEFAULT_STOP_HOOK_BLOCK_CAP` turns in a row |
+| `Error` | the evaluator call failed; the goal stays active and the error surfaces |
+
+The evaluator is a **separate model call with no tools**. It sees only the
+condition and the conversation -- a transcript of recent messages, with tool
+calls and results rendered inline, and only an oversized newest message trimmed
+-- so it judges the evidence the worker actually surfaced. It cannot read a
+file or rerun a test. `PromptGoalEvaluator` asks for exactly one JSON object:
+
+```json
+{ "ok": false, "reason": "The conversation does not contain pytest's exit code yet.", "impossible": false }
+```
+
+`ok` must be a bool, `reason` a non-empty string, `impossible` a bool, and never
+both `ok` and `impossible`. A fenced code block is tolerated; anything else is
+an evaluator error, which keeps the goal active rather than claiming success.
+
+In the REPL:
+
+| Command | Effect |
+| --- | --- |
+| `/goal` | show the condition, elapsed time, evaluations, tokens, and last reason |
+| `/goal <condition>` | set or replace the goal and start working immediately |
+| `/goal clear` | clear it (`stop`, `off`, `reset`, `none`, `cancel` also work) |
+
+Two exits live *outside* the goal: the loop's global `max_steps`, and the
+consecutive-block cap. Either one returns control to the user with the goal
+still active -- it is never silently marked complete or cleared. A defer is
+resumed when a finished background command wakes the session, and its result
+enters the conversation like any other message before the evaluator judges it.
+
+```rust
+let goal = GoalController::with_defaults(Arc::new(
+    PromptGoalEvaluator::from_env(client.clone()),   // GOAL_EVALUATOR_MODEL_ID
+));
+let agent = Agent::builder().client(client).goal(goal.clone()).build();
+```
+
+`GoalController::restore(evaluator, events, block_cap)` revives a still-active
+goal from the `goal_status` records a host persisted: the condition carries
+over, while count, elapsed time, and the token baseline start fresh. Transitions
+reach the observer as `AgentEvent::GoalReported`.
+
 ## Getting started
 
 ```sh
@@ -506,9 +587,11 @@ Environment variables:
 | `ANTHROPIC_API_KEY` | API key (falls back to `ANTHROPIC_AUTH_TOKEN`) | required |
 | `MODEL_ID` | Model id (falls back to `ANTHROPIC_MODEL`) | required |
 | `FALLBACK_MODEL_ID` | Model used after repeated `529`s (s15) | none |
+| `GOAL_EVALUATOR_MODEL_ID` | Cheaper model for the goal evaluator (s17) | the worker's model |
 | `MAX_TOKENS` | Response budget per call | `8192` |
 
-In the REPL: type a task, `/reset` to clear history, `q` to quit.
+In the REPL: type a task, `/goal <condition>` to keep working until it is met,
+`/reset` to clear history, `q` to quit.
 
 ## Embedding
 
@@ -543,6 +626,10 @@ let answer = agent.ask("summarise src/lib.rs").await?;
   `Approver`.
 - **Planning cadence**: tune or disable the todo reminder with
   `Agent::builder().todo_reminder_after(n)`.
+- **Completion criteria**: set a `/goal` condition, or install a controller
+  with `Agent::builder().goal(..)`. Implement `GoalEvaluator` to judge the
+  transcript with your own rule -- a test report parser, a checklist, another
+  model. The loop is untouched either way.
 - **Delegation**: wrap a subagent with `TaskTool::new(subagent)` and register
   it on the parent. Give the subagent `ToolRegistry::base()` (no `task` tool)
   and it cannot recurse; only its final text returns.
@@ -577,6 +664,6 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery, workflows
+cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery, workflows, goals
 cargo clippy --all-targets
 ```

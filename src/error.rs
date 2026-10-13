@@ -71,4 +71,8 @@ pub enum Error {
     /// The workflow runtime rejected a run, or a script step failed (s16).
     #[error("workflow error: {0}")]
     Workflow(String),
+
+    /// The goal controller rejected a condition, or the evaluator failed (s17).
+    #[error("goal error: {0}")]
+    Goal(String),
 }

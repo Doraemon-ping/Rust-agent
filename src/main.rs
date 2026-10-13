@@ -13,10 +13,11 @@ use rust_agent::permission::Approver;
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::AnthropicAgentRunner;
 use rust_agent::{
-    default_system_prompt, Agent, AnthropicClient, BackgroundManager, CompactConfig, Config,
-    ContentBlock, CronScheduler, LlmClient, McpRegistry, MemoryConfig, Message, RecoveryConfig,
-    SkillLoader, Team, ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, MCP_PROMPT,
-    TASKS_PROMPT, TEAM_PROMPT, WORKFLOW_PROMPT,
+    default_system_prompt, parse_goal_command, Agent, AnthropicClient, BackgroundManager,
+    CompactConfig, Config, ContentBlock, CronScheduler, GoalCommand, GoalController, LlmClient,
+    McpRegistry, MemoryConfig, Message, PromptGoalEvaluator, RecoveryConfig, SkillLoader, Team,
+    ToolCall, ToolRegistry, BACKGROUND_PROMPT, CRON_PROMPT, GOAL_PROMPT, MCP_PROMPT, TASKS_PROMPT,
+    TEAM_PROMPT, WORKFLOW_PROMPT,
 };
 
 #[tokio::main]
@@ -67,6 +68,11 @@ async fn main() -> Result<()> {
     let workflow = rust_agent::default_registry()?
         .with_runner(Arc::new(AnthropicAgentRunner::new(client.clone())));
 
+    // s17: a separate, tool-free model call decides whether the session goal
+    // is complete. GOAL_EVALUATOR_MODEL_ID may point it at a cheaper model.
+    let goal =
+        GoalController::with_defaults(Arc::new(PromptGoalEvaluator::from_env(client.clone())));
+
     // s15: retry transient model failures, fall back, and escalate truncation.
     let mut recovery = RecoveryConfig::default();
     if let Some(model) = &config.fallback_model {
@@ -86,17 +92,19 @@ async fn main() -> Result<()> {
         .team(team.clone())
         .mcp(mcp.clone())
         .workflow(workflow.clone())
+        .goal(goal.clone())
         .recovery(recovery)
         .max_tokens(config.max_tokens)
         .system_prompt(format!(
-            "{} {} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
+            "{} {} {} {} {} {} {} {} Use task for focused exploration or a self-contained subtask.",
             default_system_prompt(),
             TASKS_PROMPT,
             BACKGROUND_PROMPT,
             CRON_PROMPT,
             TEAM_PROMPT,
             MCP_PROMPT,
-            WORKFLOW_PROMPT
+            WORKFLOW_PROMPT,
+            GOAL_PROMPT
         ))
         .observer(PrintingObserver)
         .approver(InteractiveApprover)
@@ -117,11 +125,13 @@ async fn main() -> Result<()> {
     println!("team: .mailboxes/ (spawn_teammate, send_message, review_plan) (s13)");
     println!("mcp: connect_mcp -> mcp__<server>__<tool> (docs, deploy) (s14)");
     println!("workflow: Workflow(review-changes) -> .workflow/ journal + resume (s16)");
+    println!("goal: /goal <condition> -- an independent evaluator continues until it is met (s17)");
     println!("recovery: 429/529 backoff, fallback model, max_tokens escalation (s15)");
-    println!("Type a task, or /reset to clear history, or q to quit.\n");
+    println!("Type a task, /reset to clear history, /goal to inspect the goal, or q to quit.\n");
 
     let mut editor = DefaultEditor::new()?;
     let mut history: Vec<Message> = Vec::new();
+    let goal = agent.goal().cloned();
 
     loop {
         // A job that came due while we were idle starts its own turn before
@@ -137,6 +147,19 @@ async fn main() -> Result<()> {
         // A teammate event wakes the Lead on its own, exactly like a due job.
         if team.bus().peek(rust_agent::team::LEAD).unwrap_or(false) {
             println!("\x1b[35m[team] teammate events arrived\x1b[0m");
+            if let Err(error) = agent.run_turn(&mut history).await {
+                eprintln!("\x1b[31merror: {error}\x1b[0m");
+            }
+            println!();
+        }
+
+        // A finished background command wakes the session too, so an active
+        // goal can judge its result instead of waiting for the next prompt.
+        if agent
+            .background()
+            .is_some_and(|background| background.ready() > 0)
+        {
+            println!("\x1b[35m[background] results ready\x1b[0m");
             if let Err(error) = agent.run_turn(&mut history).await {
                 eprintln!("\x1b[31merror: {error}\x1b[0m");
             }
@@ -162,6 +185,36 @@ async fn main() -> Result<()> {
         }
 
         let _ = editor.add_history_entry(query);
+
+        if let Some(goal) = &goal {
+            match parse_goal_command(query) {
+                Some(GoalCommand::Status) => {
+                    println!("{}\n", goal.status());
+                    continue;
+                }
+                Some(GoalCommand::Clear) => {
+                    println!("{}\n", goal.clear("cleared"));
+                    continue;
+                }
+                Some(GoalCommand::Set(condition)) => match goal.set_goal(&condition) {
+                    Ok(state) => {
+                        println!("\x1b[35m[goal] active: {}\x1b[0m", state.condition);
+                        history.push(Message::user_text(state.condition));
+                        if let Err(error) = agent.run_turn(&mut history).await {
+                            eprintln!("\x1b[31merror: {error}\x1b[0m");
+                        }
+                        println!();
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("\x1b[31m[goal] error: {error}\x1b[0m\n");
+                        continue;
+                    }
+                },
+                None => {}
+            }
+        }
+
         history.push(Message::user_text(agent.prepare_prompt(query)));
 
         if let Err(error) = agent.run_turn(&mut history).await {
@@ -261,6 +314,23 @@ impl AgentObserver for PrintingObserver {
                 let short = run_id.strip_prefix("wf_").unwrap_or(run_id);
                 println!("\x1b[35m[workflow {short}] {kind}: {message}\x1b[0m");
             }
+            AgentEvent::GoalReported {
+                kind,
+                reason,
+                iterations,
+                duration_ms,
+                ..
+            } => {
+                let color = match kind {
+                    "achieved" => "\x1b[32m",
+                    "failed" => "\x1b[31m",
+                    _ => "\x1b[35m",
+                };
+                println!(
+                    "{color}[goal {kind}] {reason} (evaluations: {iterations}, {}s)\x1b[0m",
+                    duration_ms / 1000
+                );
+            }
             AgentEvent::Step(_) => {}
         }
     }
@@ -334,6 +404,7 @@ impl AgentObserver for SubagentObserver {
             | AgentEvent::MaxTokensEscalated { .. }
             | AgentEvent::ContinuationRequested { .. }
             | AgentEvent::WorkflowReported { .. }
+            | AgentEvent::GoalReported { .. }
             | AgentEvent::MemoryStored { .. } => {}
         }
     }

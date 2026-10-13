@@ -24,6 +24,7 @@ pub mod compact;
 pub mod config;
 pub mod cron;
 pub mod error;
+pub mod goal;
 pub mod hooks;
 pub mod llm;
 pub mod mcp;
@@ -54,6 +55,13 @@ pub use cron::{
     LIST_CRONS_TOOL_NAME, SCHEDULED_TASKS_FILE, SCHEDULE_CRON_TOOL_NAME,
 };
 pub use error::{Error, Result};
+pub use goal::{
+    goal_continuation, parse_goal_command, parse_goal_evaluation, transcript_text, GoalCommand,
+    GoalController, GoalDecision, GoalEvaluation, GoalEvaluator, GoalEvent, GoalListener,
+    GoalState, PromptGoalEvaluator, CLEAR_ALIASES, DEFAULT_EVALUATOR_MAX_TOKENS,
+    DEFAULT_STOP_HOOK_BLOCK_CAP, GOAL_EVALUATOR_MODEL_ENV, GOAL_EVALUATOR_SYSTEM, GOAL_PROMPT,
+    MAX_GOAL_LENGTH, MAX_TRANSCRIPT_CHARS,
+};
 pub use hooks::{Hook, Hooks};
 pub use llm::{
     AnthropicClient, CompletionRequest, CompletionResponse, LlmClient, StopReason, ToolDefinition,
