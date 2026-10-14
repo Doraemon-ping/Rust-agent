@@ -507,8 +507,29 @@ impl Bridge {
 }
 /// One dispatched request: what to answer, and whether to stop afterwards.
 struct Turn {
-    response: Response,
+    /// The answer to write back, or `None` when it is not this loop's to give:
+    /// a `chat.cancel` is answered by the turn it stopped, and only once that
+    /// turn is over.
+    response: Option<Response>,
     shutdown: bool,
+}
+
+impl Turn {
+    /// A request answered here and now.
+    fn answered(response: Response) -> Self {
+        Turn {
+            response: Some(response),
+            shutdown: false,
+        }
+    }
+
+    /// A request whose answer the turn that is stopping still owes.
+    fn owed() -> Self {
+        Turn {
+            response: None,
+            shutdown: false,
+        }
+    }
 }
 
 fn dispatch(
@@ -518,49 +539,33 @@ fn dispatch(
     handle: &tokio::runtime::Handle,
 ) -> Turn {
     match request.method.as_str() {
-        "runtime.ping" => Turn {
-            response: Response::ok(&request.request_id, bridge.ping()),
-            shutdown: false,
-        },
-        "runtime.status" => Turn {
-            response: Response::ok(&request.request_id, bridge.snapshot()),
-            shutdown: false,
-        },
+        "runtime.ping" => Turn::answered(Response::ok(&request.request_id, bridge.ping())),
+        "runtime.status" => Turn::answered(Response::ok(&request.request_id, bridge.snapshot())),
         "runtime.shutdown" => Turn {
-            response: Response::ok(&request.request_id, json!({ "stopping": true })),
+            response: Some(Response::ok(
+                &request.request_id,
+                json!({ "stopping": true }),
+            )),
             shutdown: true,
         },
         "chat.send" => accept_chat(request, chat, handle),
-        "chat.cancel" => Turn {
-            response: Response::ok(
-                &request.request_id,
-                json!({ "cancelled": chat.cancel.stop() }),
-            ),
-            shutdown: false,
-        },
-        "chat.history" => Turn {
-            response: Response::ok(&request.request_id, chat.log.snapshot()),
-            shutdown: false,
-        },
-        "sessions.list" => Turn {
-            response: Response::ok(&request.request_id, chat.sessions_snapshot()),
-            shutdown: false,
-        },
+        "chat.cancel" => accept_cancel(request, chat, handle),
+        "chat.history" => Turn::answered(Response::ok(&request.request_id, chat.log.snapshot())),
+        "sessions.list" => {
+            Turn::answered(Response::ok(&request.request_id, chat.sessions_snapshot()))
+        }
         "sessions.new" => accept_new_session(request, chat),
         "sessions.open" => accept_open_session(request, chat),
-        other => Turn {
-            response: Response::failed(
-                &request.request_id,
-                ProtocolError::new(
-                    UNKNOWN_METHOD,
-                    format!(
-                        "unknown method `{other}`; this build answers: {}",
-                        METHODS.join(", ")
-                    ),
+        other => Turn::answered(Response::failed(
+            &request.request_id,
+            ProtocolError::new(
+                UNKNOWN_METHOD,
+                format!(
+                    "unknown method `{other}`; this build answers: {}",
+                    METHODS.join(", ")
                 ),
             ),
-            shutdown: false,
-        },
+        )),
     }
 }
 
@@ -1164,41 +1169,90 @@ impl Drop for Busy<'_> {
     }
 }
 
-/// The way out of the turn that is running.
+/// The way out of the turn that is running, and the way to know it has gone.
 ///
 /// One turn runs at a time, so one slot is enough: `chat.send` puts the sender
 /// for its own turn here and hands the receiver to the turn, and `chat.cancel`
 /// takes the sender and flips it. A turn that has already stopped is not
 /// cancelled late: `disarm` empties the slot when the turn is over, so a stop
 /// aimed at nothing answers that nothing was running.
+///
+/// A stop also takes the channel the turn closes when it is done, because it is
+/// not answered on the spot. The page that pressed stop sends its next prompt on
+/// the back of that answer, and that prompt has to find the one-turn slot free
+/// rather than be told the turn it just ended is still running.
 #[derive(Default)]
-struct TurnCancel(Mutex<Option<tokio::sync::watch::Sender<bool>>>);
+struct TurnCancel {
+    /// The sender for the turn that is running, if any.
+    running: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// The receiver that resolves when that turn is over, if any.
+    over: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+}
 
 impl TurnCancel {
-    /// A channel for a turn that is about to start.
-    fn arm(&self) -> tokio::sync::watch::Receiver<bool> {
-        let (send, recv) = tokio::sync::watch::channel(false);
-        let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        *slot = Some(send);
-        recv
+    /// A channel for a turn that is about to start: the stop it listens on, and
+    /// the one it closes when it is done.
+    fn arm(
+        &self,
+    ) -> (
+        tokio::sync::watch::Receiver<bool>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (stop, listening) = tokio::sync::watch::channel(false);
+        let (closing, over) = tokio::sync::watch::channel(false);
+        {
+            let mut slot = self
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = Some(stop);
+        }
+        {
+            let mut slot = self.over.lock().unwrap_or_else(|error| error.into_inner());
+            *slot = Some(over);
+        }
+        (listening, closing)
     }
 
-    /// Ask the running turn to stop. `false` when nothing was running.
-    fn stop(&self) -> bool {
-        let taken = {
-            let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
+    /// Ask the running turn to stop, and take the channel that says when it
+    /// has. `None` when nothing was running.
+    fn stop(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let running = {
+            let mut slot = self
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             slot.take()
         };
-        match taken {
-            Some(send) => send.send(true).is_ok(),
-            None => false,
+        let over = {
+            let mut slot = self.over.lock().unwrap_or_else(|error| error.into_inner());
+            slot.take()
+        };
+        match running {
+            Some(send) => {
+                // A receiver that has an unseen version resolves `changed`
+                // before it ever looks at whether the sender still exists,
+                // which is what lets the stop land and the slot empty at once.
+                let _ = send.send(true);
+                over
+            }
+            None => None,
         }
     }
 
-    /// The turn is over; its channel must not outlive it.
+    /// The turn is over; its channels must not outlive it.
     fn disarm(&self) {
-        let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        *slot = None;
+        {
+            let mut slot = self
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = None;
+        }
+        {
+            let mut slot = self.over.lock().unwrap_or_else(|error| error.into_inner());
+            *slot = None;
+        }
     }
 }
 
@@ -1292,7 +1346,7 @@ fn build_agent(
 /// Accept one prompt, or explain why it cannot run.
 fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Handle) -> Turn {
     let rejected = |error| Turn {
-        response: Response::failed(&request.request_id, error),
+        response: Some(Response::failed(&request.request_id, error)),
         shutdown: false,
     };
 
@@ -1335,22 +1389,28 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
     chat.name_session(prompt);
     // Armed before the turn starts, so a stop that arrives while the first model
     // call is still being set up is not lost.
-    let stop = chat.cancel.arm();
+    let (stop, over) = chat.cancel.arm();
     let chat = Arc::clone(chat);
     let prompt = prompt.to_string();
     let running = turn.clone();
     handle.spawn(async move {
-        let _busy = Busy(&chat.busy);
+        let busy = Busy(&chat.busy);
         chat.tag.set(&running);
-        run_turn(&chat, &running, &prompt, stop).await;
+        let stopped = run_turn(&chat, &running, &prompt, stop).await;
         chat.cancel.disarm();
+        // The slot is free before anything says the turn is over: a prompt sent
+        // the moment the page hears that must be taken, not told a turn it has
+        // just seen end is still running. Nothing waits on `over` unless a stop
+        // was asked for, and a stop that did gets its answer here.
+        drop(busy);
+        let _ = over.send(stopped);
     });
 
     Turn {
-        response: Response::ok(
+        response: Some(Response::ok(
             &request.request_id,
             json!({ "accepted": true, "turn": turn }),
-        ),
+        )),
         shutdown: false,
     }
 }
@@ -1360,10 +1420,7 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
 /// Nothing is dropped: every finished turn of the old conversation is on disk
 /// already, and the new one is written the moment it has a turn worth keeping.
 fn accept_new_session(request: &Request, chat: &Arc<Chat>) -> Turn {
-    let rejected = |error| Turn {
-        response: Response::failed(&request.request_id, error),
-        shutdown: false,
-    };
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
     if chat.busy.load(Ordering::SeqCst) {
         return rejected(ProtocolError::new(
             CHAT_BUSY,
@@ -1375,18 +1432,15 @@ fn accept_new_session(request: &Request, chat: &Arc<Chat>) -> Turn {
     let id = session.id.clone();
     chat.adopt(session);
     log(Level::Info, format!("started session {id}"));
-    Turn {
-        response: Response::ok(&request.request_id, json!({ "session": id, "turns": 0 })),
-        shutdown: false,
-    }
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "session": id, "turns": 0 }),
+    ))
 }
 
 /// Continue a conversation this workspace already holds.
 fn accept_open_session(request: &Request, chat: &Arc<Chat>) -> Turn {
-    let rejected = |error| Turn {
-        response: Response::failed(&request.request_id, error),
-        shutdown: false,
-    };
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
     if chat.busy.load(Ordering::SeqCst) {
         return rejected(ProtocolError::new(
             CHAT_BUSY,
@@ -1425,20 +1479,55 @@ fn accept_open_session(request: &Request, chat: &Arc<Chat>) -> Turn {
         format!("continuing session {id} ({turns} turns)"),
     );
     Turn {
-        response: Response::ok(
+        response: Some(Response::ok(
             &request.request_id,
             json!({ "session": id, "turns": turns }),
-        ),
+        )),
         shutdown: false,
     }
+}
+
+/// Ask the turn that is running to stop.
+///
+/// A stop that finds nothing running answers at once. A stop that reaches a turn
+/// is answered by that turn instead, once it is over and the slot it held is
+/// free: the page that pressed stop then sends its next prompt, and that prompt
+/// must be taken rather than refused as a turn already running.
+fn accept_cancel(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Handle) -> Turn {
+    let Some(mut over) = chat.cancel.stop() else {
+        return Turn::answered(Response::ok(
+            &request.request_id,
+            json!({ "cancelled": false }),
+        ));
+    };
+
+    let request_id = request.request_id.clone();
+    handle.spawn(async move {
+        // `false` is the honest answer for a turn that finished a moment after
+        // the stop was asked for -- and the answer left behind by a turn that
+        // ended some other way than through its own channel.
+        let mut stopped = false;
+        if over.changed().await.is_ok() {
+            stopped = *over.borrow_and_update();
+        }
+        let _ = send(&Response::ok(&request_id, json!({ "cancelled": stopped })));
+    });
+
+    Turn::owed()
 }
 
 /// Run one prompt and stream it back.
 ///
 /// A second prompt is refused while this one runs rather than queued behind it,
 /// and a turn that failed -- or was stopped -- is rolled back instead of leaving
-/// half an exchange for the model to trip over next time.
-async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watch::Receiver<bool>) {
+/// half an exchange for the model to trip over next time. Answers whether it was
+/// the stop, rather than the model, that ended the turn.
+async fn run_turn(
+    chat: &Chat,
+    turn: &str,
+    prompt: &str,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> bool {
     let agent = match chat.agent() {
         Ok(agent) => agent,
         Err(error) => {
@@ -1446,7 +1535,7 @@ async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watc
             chat.log.record(&failed);
             chat.commit(None);
             let _ = send(&failed);
-            return;
+            return false;
         }
     };
 
@@ -1484,6 +1573,7 @@ async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watc
             chat.log.record(&done);
             chat.commit(Some(history));
             let _ = send(&done);
+            false
         }
         Some(Err(error)) => {
             history.truncate(rollback);
@@ -1491,6 +1581,7 @@ async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watc
             chat.log.record(&failed);
             chat.commit(Some(history));
             let _ = send(&failed);
+            false
         }
         None => {
             // Stopped on request. Whatever the model streamed stays on the page,
@@ -1501,6 +1592,7 @@ async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watc
             chat.log.record(&cancelled);
             chat.commit(Some(history));
             let _ = send(&cancelled);
+            true
         }
     }
 }
@@ -1782,7 +1874,7 @@ fn run() -> i32 {
                     request_id: Some(request_id),
                     error,
                 } => Turn {
-                    response: Response::failed(&request_id, error),
+                    response: Some(Response::failed(&request_id, error)),
                     shutdown: false,
                 },
                 Parsed::Rejected {
@@ -1795,10 +1887,14 @@ fn run() -> i32 {
             },
         };
 
-        if let Err(error) = send(&turn.response) {
-            log(Level::Error, format!("cannot write to stdout: {error}"));
-            code = EXIT_IO;
-            break;
+        // A request whose answer is still owed is not written here: the turn
+        // that owes it writes it, once the slot it held is free.
+        if let Some(response) = &turn.response {
+            if let Err(error) = send(response) {
+                log(Level::Error, format!("cannot write to stdout: {error}"));
+                code = EXIT_IO;
+                break;
+            }
         }
 
         if turn.shutdown {
@@ -1851,6 +1947,14 @@ mod tests {
             chat,
             tokio::runtime::Runtime::new().unwrap(),
         )
+    }
+
+    /// The answer a dispatched request gave on the spot. A request whose answer
+    /// the turn it stopped still owes has none here.
+    fn answered(turn: &Turn) -> &Response {
+        turn.response
+            .as_ref()
+            .expect("expected an answer from `dispatch`")
     }
 
     #[test]
@@ -1978,13 +2082,11 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&request, &bridge, &chat, runtime.handle());
         assert!(!turn.shutdown);
-        assert_eq!(turn.response.request_id, "r-7");
-        assert!(!turn.response.ok);
+        let answer = answered(&turn);
+        assert_eq!(answer.request_id, "r-7");
+        assert!(!answer.ok);
         assert_eq!(
-            turn.response
-                .error
-                .as_ref()
-                .map(|error| error.code.as_str()),
+            answer.error.as_ref().map(|error| error.code.as_str()),
             Some(UNKNOWN_METHOD)
         );
     }
@@ -2000,15 +2102,15 @@ mod tests {
         let chat = Arc::new(Chat::new(dir.path().to_path_buf(), bridge.cron.clone()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&ping, &bridge, &chat, runtime.handle());
-        assert!(turn.response.ok);
+        assert!(answered(&turn).ok);
         assert!(!turn.shutdown);
-        assert_eq!(turn.response.result.unwrap()["pong"], json!(true));
+        assert_eq!(answered(&turn).result.clone().unwrap()["pong"], json!(true));
 
         let Parsed::Request(shutdown) = parse_request(&request("r-2", "runtime.shutdown")) else {
             panic!("expected a request");
         };
         let turn = dispatch(&shutdown, &bridge, &chat, runtime.handle());
-        assert!(turn.response.ok);
+        assert!(answered(&turn).ok);
         assert!(turn.shutdown);
     }
 
@@ -2147,10 +2249,10 @@ mod tests {
             panic!("expected a request");
         };
         let turn = dispatch(&history, &bridge, &chat, runtime.handle());
-        assert!(turn.response.ok);
+        assert!(answered(&turn).ok);
         assert!(!turn.shutdown);
 
-        let result = turn.response.result.unwrap();
+        let result = answered(&turn).result.clone().unwrap();
         assert_eq!(result["turns"][0]["prompt"], json!("hi"));
         assert_eq!(result["turns"][0]["status"], json!("done"));
     }
@@ -2187,9 +2289,9 @@ mod tests {
             };
             let turn = dispatch(&request, &bridge, &chat, runtime.handle());
             assert!(!turn.shutdown);
-            assert!(!turn.response.ok, "`{case}` was accepted");
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
             assert_eq!(
-                turn.response
+                answered(&turn)
                     .error
                     .as_ref()
                     .map(|error| error.code.as_str()),
@@ -2447,15 +2549,15 @@ mod tests {
             &chat,
             runtime.handle(),
         );
-        assert!(turn.response.ok);
-        assert_eq!(turn.response.result, Some(json!({ "cancelled": false })));
+        assert!(answered(&turn).ok);
+        assert_eq!(answered(&turn).result, Some(json!({ "cancelled": false })));
     }
 
     #[test]
     fn a_stop_reaches_the_turn_that_armed_it() {
         let cancel = TurnCancel::default();
-        let mut armed = cancel.arm();
-        assert!(cancel.stop());
+        let (mut armed, turn_over) = cancel.arm();
+        let mut stop_over = cancel.stop().expect("a turn was running");
         // The turn learns about it, and reads the value a stop sets. The sender
         // is gone by then: a receiver that has an unseen version resolves
         // `changed` before it ever looks at whether the sender still exists,
@@ -2467,12 +2569,21 @@ mod tests {
         });
 
         // The slot is emptied by the stop itself: a second one finds nothing.
-        assert!(!cancel.stop());
+        assert!(cancel.stop().is_none());
 
-        // A turn that is over takes its channel with it.
-        let _armed_again = cancel.arm();
+        // The turn says how it ended on the channel the stop took with it. The
+        // stop's answer waits on that, so a page told its stop took effect can
+        // send its next prompt at once instead of hearing a turn is running.
+        assert!(turn_over.send(true).is_ok());
+        runtime.block_on(async {
+            assert!(stop_over.changed().await.is_ok());
+            assert!(*stop_over.borrow_and_update());
+        });
+
+        // A turn that is over takes its channels with it.
+        let (_armed_again, _over_again) = cancel.arm();
         cancel.disarm();
-        assert!(!cancel.stop());
+        assert!(cancel.stop().is_none());
     }
 
     #[test]
@@ -2522,8 +2633,8 @@ mod tests {
             &chat,
             runtime.handle(),
         );
-        assert!(turn.response.ok);
-        let result = turn.response.result.unwrap();
+        assert!(answered(&turn).ok);
+        let result = answered(&turn).result.clone().unwrap();
         assert_eq!(result["current"], json!(chat.session().id));
         assert_eq!(result["sessions"], json!([]));
     }
@@ -2553,7 +2664,7 @@ mod tests {
             &chat,
             runtime.handle(),
         );
-        assert!(started.response.ok);
+        assert!(answered(&started).ok);
         assert_ne!(chat.session().id, saved.id);
         assert!(chat.session().messages.is_empty());
 
@@ -2563,7 +2674,7 @@ mod tests {
             &chat,
             runtime.handle(),
         );
-        let result = listed.response.result.unwrap();
+        let result = answered(&listed).result.clone().unwrap();
         assert_eq!(result["sessions"][0]["id"], json!(saved.id));
         assert_eq!(
             result["sessions"][0]["title"],
@@ -2579,7 +2690,7 @@ mod tests {
             &chat,
             runtime.handle(),
         );
-        assert!(opened.response.ok);
+        assert!(answered(&opened).ok);
         assert_eq!(chat.session().id, saved.id);
         assert_eq!(chat.session().messages.len(), 1);
         assert_eq!(chat.log.snapshot(), log.snapshot());
@@ -2606,9 +2717,9 @@ mod tests {
                 &chat,
                 runtime.handle(),
             );
-            assert!(!turn.response.ok, "`{case}` was accepted");
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
             assert_eq!(
-                turn.response
+                answered(&turn)
                     .error
                     .as_ref()
                     .map(|error| error.code.as_str()),
