@@ -16,6 +16,9 @@ pub const BRIDGE_BINARY: &str = "rust-agent-bridge";
 /// Name the sibling cargo binary builds to.
 pub const BRIDGE_DEV_BINARY: &str = "desktop_bridge";
 
+/// How many characters of a workspace's name survive into its store key.
+const KEY_PREFIX_CHARS: usize = 40;
+
 fn exe_suffix() -> &'static str {
     if cfg!(windows) {
         ".exe"
@@ -148,6 +151,80 @@ pub fn resolve_workspace(app: &AppHandle) -> Result<PathBuf, HostError> {
     Ok(workspace)
 }
 
+/// The directory that holds one workspace's conversations.
+///
+/// Conversations are the app's, not the project's: they live under the per-user
+/// app data directory, one directory per workspace, so a folder the runtime is
+/// pointed at is never also a folder the runtime writes into. The key is derived
+/// from the workspace path, so the same project always opens the same
+/// conversations, and two projects with the same folder name do not share them.
+pub fn sessions_dir(app: &AppHandle, workspace: &Path) -> Result<PathBuf, HostError> {
+    let base = app.path().app_data_dir().map_err(|error| {
+        HostError::new(
+            "no_app_data_dir",
+            format!("could not resolve the application data directory: {error}"),
+        )
+    })?;
+    let dir = base.join("sessions").join(workspace_key(workspace));
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        HostError::new(
+            "sessions_dir_unavailable",
+            format!("could not create {}: {error}", dir.display()),
+        )
+    })?;
+    Ok(dir)
+}
+
+/// A stable, filesystem-safe name for one workspace.
+///
+/// The folder's own name comes first because it is what a human reads when
+/// looking through the store, and the hash of the whole path is what actually
+/// keeps two workspaces apart. Lower-cased on Windows, where the path the user
+/// picked and the path the filesystem reports are the same folder.
+fn workspace_key(workspace: &Path) -> String {
+    let path = workspace.to_string_lossy();
+    let path = if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.into_owned()
+    };
+    let name = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let slug: String = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(KEY_PREFIX_CHARS)
+        .collect();
+    let slug = if slug.trim_matches('-').is_empty() {
+        "workspace".to_string()
+    } else {
+        slug
+    };
+    format!("{slug}-{:016x}", fnv1a(path.as_bytes()))
+}
+
+/// FNV-1a over the path's bytes.
+///
+/// A directory name needs a hash that is stable across runs and cheap; it does
+/// not need to be a cryptographic one, and this crate does not carry a hashing
+/// dependency for a name.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +261,31 @@ mod tests {
             assert_eq!(error.code, "runtime_not_found");
             assert!(error.message.contains("pnpm bridge:build"));
         }
+    }
+
+    #[test]
+    fn one_workspace_gets_one_store_key_whatever_the_path_looks_like() {
+        let demo = Path::new("projects").join("demo");
+        let key = workspace_key(&demo);
+        assert_eq!(key, workspace_key(&demo));
+        assert!(key.starts_with("demo-"), "{key}");
+
+        // Two projects whose folders share a name are still two stores: the
+        // hash is over the whole path, not just the last segment.
+        assert_ne!(key, workspace_key(&Path::new("elsewhere").join("demo")));
+        // A path with no name of its own still gets a usable key.
+        assert!(workspace_key(Path::new("/")).starts_with("workspace-"));
+    }
+
+    #[test]
+    fn a_store_key_is_a_name_a_filesystem_will_take() {
+        let odd = Path::new("odd dir").join("na:me*?").join("folder. ");
+        let key = workspace_key(&odd);
+        assert!(!key.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']), "{key}");
+        assert!(!key.ends_with('.') && !key.ends_with(' '), "{key}");
+        assert!(key.len() <= KEY_PREFIX_CHARS + 17, "{key}");
+        // One component, so joining it to a base directory cannot climb out of
+        // it or land somewhere else than intended.
+        assert_eq!(Path::new(&key).components().count(), 1, "{key}");
     }
 }

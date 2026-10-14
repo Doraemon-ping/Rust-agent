@@ -151,6 +151,9 @@ impl RuntimeManager {
     async fn try_start(&self) -> Result<Status, HostError> {
         let bridge = paths::resolve_bridge()?;
         let workspace = self.workspace().await?;
+        // Conversations are kept in the app's own store, one directory per
+        // workspace, so the project the runtime works in stays the project's.
+        let sessions = paths::sessions_dir(&self.app, &workspace)?;
         // Read once per start, before the lock, so the environment a child gets
         // is one snapshot of the store rather than a value that moves underneath
         // it.
@@ -175,6 +178,8 @@ impl RuntimeManager {
             command
                 .arg("--workspace")
                 .arg(&workspace)
+                .arg("--sessions-dir")
+                .arg(&sessions)
                 // The runtime's working directory is the workspace it was given,
                 // so the system prompt it builds from the current directory, and
                 // any relative path inside a tool, agree with the project the UI
@@ -439,6 +444,40 @@ impl RuntimeManager {
             ));
         }
         self.request("sessions.open", json!({ "id": id }), CHAT_TIMEOUT)
+            .await
+    }
+
+    /// Give a conversation this workspace holds a name of its own.
+    ///
+    /// The page may name a conversation and the words it names it with; it still
+    /// cannot name a path. An id that is not one this runtime listed is refused
+    /// on the other side of the pipe.
+    pub async fn chat_rename_session(&self, id: &str, title: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_session",
+                "a session id cannot be empty",
+            ));
+        }
+        self.request(
+            "sessions.rename",
+            json!({ "id": id, "title": title }),
+            CHAT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Forget a conversation. The runtime says which one it is continuing now.
+    pub async fn chat_delete_session(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_session",
+                "a session id cannot be empty",
+            ));
+        }
+        self.request("sessions.delete", json!({ "id": id }), CHAT_TIMEOUT)
             .await
     }
 

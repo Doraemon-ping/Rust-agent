@@ -7,7 +7,7 @@
 // the shipped artifact and not just against unit tests.
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -37,7 +37,8 @@ class Harness {
     this.stderr = []
     this.exited = null
     this.waiters = []
-    this.child = spawn(bridgePath, ['--workspace', workspace], {
+      const args = ['--workspace', workspace, ...(options.args ?? [])]
+      this.child = spawn(bridgePath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       // The host decides this child's environment, so a check that depends on
@@ -160,7 +161,7 @@ async function main() {
     check('the bridge announces runtime.ready', ready !== undefined)
     check('runtime.ready carries the workspace', ready?.data?.workspace === workspace)
     check('runtime.ready reports protocol 1', ready?.data?.protocol_version === PROTOCOL_VERSION)
-    check('runtime.ready lists every method', ready?.data?.methods?.length === 9)
+      check('runtime.ready lists every method', ready?.data?.methods?.length === 11)
     check('runtime.ready advertises chat.send', ready?.data?.methods?.includes('chat.send'))
     check('runtime.ready advertises chat.cancel', ready?.data?.methods?.includes('chat.cancel'))
     check('runtime.ready advertises chat.history', ready?.data?.methods?.includes('chat.history'))
@@ -168,6 +169,8 @@ async function main() {
       'sessions.list',
       'sessions.new',
       'sessions.open',
+        'sessions.rename',
+        'sessions.delete',
     ].every((method) => ready?.data?.methods?.includes(method)))
 
     bridge.request('r-1', 'runtime.ping')
@@ -622,6 +625,48 @@ async function main() {
       const reopened = await resumed.waitFor((messages) => byId(messages, 'c-25'))
       check('opening it brings its turns back', (reopened?.result?.turns ?? []).length === 5)
 
+        // Renaming is about the conversation, not the page: the name goes into
+        // the file the turns are in, so it is still there next time.
+        resumed.request('c-30', 'sessions.rename', {
+          params: { id: current, title: 'renamed by the page' },
+        })
+        const renamed = await resumed.waitFor((messages) => byId(messages, 'c-30'))
+        check('a conversation can be renamed', renamed?.result?.title === 'renamed by the page')
+        check('renaming answers about the conversation it renamed', renamed?.result?.session === current)
+        const renamedFile = JSON.parse(readFileSync(join(mock, '.sessions', `${current}.json`), 'utf8'))
+        check(
+          'the new name is in the file the turns are in',
+          renamedFile.title === 'renamed by the page',
+          renamedFile.title,
+        )
+        resumed.request('c-31', 'sessions.list')
+        const renamedList = await resumed.waitFor((messages) => byId(messages, 'c-31'))
+        check(
+          'the list shows the new name',
+          (renamedList?.result?.sessions ?? []).find((session) => session.id === current)?.title ===
+            'renamed by the page',
+        )
+
+        resumed.request('c-32', 'sessions.rename', {
+          params: { id: 's1-2-3', title: 'nothing to name' },
+        })
+        const unrenamed = await resumed.waitFor((messages) => byId(messages, 'c-32'))
+        check(
+          'renaming a conversation this workspace does not hold is refused',
+          unrenamed?.error?.code === 'session_unknown',
+          unrenamed?.error?.code,
+        )
+
+        // The new conversation was never written -- it had no turn -- so it is
+        // not something the store can be asked to delete.
+        resumed.request('c-33', 'sessions.delete', { params: { id: freshId } })
+        const undeleted = await resumed.waitFor((messages) => byId(messages, 'c-33'))
+        check(
+          'deleting a conversation that was never written is refused',
+          undeleted?.error?.code === 'session_unknown',
+          undeleted?.error?.code,
+        )
+
       // A session id is a file name, so the shape is checked before the disk is
       // touched, and a well-formed id that is not there is a different answer.
       resumed.request('c-26', 'sessions.open', { params: { id: 'not/a/session' } })
@@ -646,6 +691,28 @@ async function main() {
         numbered?.result?.turn === 'turn-6',
         numbered?.result?.turn,
       )
+
+        // One thing at a time: the turn has to be over before its conversation
+        // can be deleted, so this waits for the turn rather than assuming it.
+        const finished = await resumed.waitFor((messages) =>
+          messages.find((message) => message.event === 'chat.done' && message.data?.turn === 'turn-6'),
+        )
+        check('the turn after a resume finished', finished !== undefined)
+
+        // Deleting the conversation in hand is allowed, and leaves the runtime
+        // somewhere to put the next prompt rather than nowhere.
+        resumed.request('c-34', 'sessions.delete', { params: { id: current } })
+        const deleted = await resumed.waitFor((messages) => byId(messages, 'c-34'))
+        check('the conversation in hand can be deleted', deleted?.result?.deleted === current, JSON.stringify(deleted?.result))
+        check('deleting it moves the runtime to another conversation', deleted?.result?.current !== current)
+        check('its file is gone', !existsSync(join(mock, '.sessions', `${current}.json`)))
+        resumed.request('c-35', 'chat.history')
+        const afterDelete = await resumed.waitFor((messages) => byId(messages, 'c-35'))
+        check(
+          'the conversation it moved to is its own, not the deleted one',
+          (afterDelete?.result?.turns ?? []).length === 0,
+          JSON.stringify((afterDelete?.result?.turns ?? []).map((turn) => turn.turn)),
+        )
     } finally {
       await resumed.stop()
     }
@@ -673,6 +740,64 @@ async function main() {
     await chat.stop()
     rmSync(mock, { recursive: true, force: true })
     model.close()
+  }
+
+  // --- conversations can be kept outside the workspace ---
+  //
+  // The desktop host names the store, so a project the runtime is working in is
+  // never also a directory the runtime writes conversations into.
+  const clean = mkdtempSync(join(tmpdir(), 'bridge-clean-'))
+  const storeRoot = mkdtempSync(join(tmpdir(), 'bridge-store-'))
+  // Deliberately one level down: the bridge has to create it.
+  const store = join(storeRoot, 'conversations')
+  const hosted = new Harness(clean, { args: ['--sessions-dir', store], env: scrubbed })
+  try {
+    const ready = await hosted.waitFor((messages) => named(messages, 'runtime.ready'))
+    check('a bridge given its own sessions directory is ready', ready !== undefined)
+    check('the workspace it was given is the one it reports', ready?.data?.workspace === clean)
+    check('the sessions directory is created when it is missing', existsSync(store))
+
+    hosted.request('s1', 'runtime.status')
+    const status = await hosted.waitFor((messages) => byId(messages, 's1'))
+    check(
+      'runtime.status reports the sessions directory it was given',
+      status?.result?.paths?.sessions === store,
+      status?.result?.paths?.sessions,
+    )
+
+    hosted.request('s2', 'sessions.list')
+    const before = await hosted.waitFor((messages) => byId(messages, 's2'))
+    const mine = before?.result?.current
+    check('an empty store still has the conversation in hand', typeof mine === 'string' && mine !== '')
+
+    hosted.request('s3', 'sessions.rename', {
+      params: { id: mine, title: 'named before it is written' },
+    })
+    const renamed = await hosted.waitFor((messages) => byId(messages, 's3'))
+    check(
+      'a conversation can be named before it has a file',
+      renamed?.result?.title === 'named before it is written',
+    )
+    hosted.request('s4', 'sessions.list')
+    const listed = await hosted.waitFor((messages) => byId(messages, 's4'))
+    check(
+      'and the name is what the list shows',
+      (listed?.result?.sessions ?? []).find((session) => session.id === mine)?.title ===
+        'named before it is written',
+      JSON.stringify(listed?.result?.sessions),
+    )
+
+    hosted.request('s5', 'sessions.delete', { params: { id: mine } })
+    const gone = await hosted.waitFor((messages) => byId(messages, 's5'))
+    check('the conversation in hand can be deleted', gone?.result?.deleted === mine, JSON.stringify(gone?.result))
+    check('and the runtime is left in another one', gone?.result?.current !== mine)
+
+    check('nothing was written into the workspace', !existsSync(join(clean, '.sessions')))
+    check('the store directory is where the host put it', existsSync(store))
+  } finally {
+    await hosted.stop()
+    rmSync(clean, { recursive: true, force: true })
+    rmSync(storeRoot, { recursive: true, force: true })
   }
 
   console.log('')

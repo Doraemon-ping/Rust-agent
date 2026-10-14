@@ -249,6 +249,22 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Rename a conversation the store holds.
+    ///
+    /// `false` when there is no file for `id`: a conversation that has never
+    /// been written has nothing on disk to rename, and whoever asked for the
+    /// rename is the one holding it.
+    pub fn rename(&self, id: &str, title: &str) -> Result<bool> {
+        let path = self.resolve(id)?;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let mut session: Session = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        session.title = title.to_string();
+        self.save(&mut session)?;
+        Ok(true)
+    }
+
     /// Keep the newest `max` conversations and drop the rest.
     ///
     /// Only ever called after a save, and never for the conversation that was
@@ -399,6 +415,25 @@ mod tests {
         assert!(!store.delete(&gone.id).unwrap());
         assert_eq!(store.list().unwrap().len(), 1);
         assert!(store.load(&kept.id).is_ok());
+    }
+
+    #[test]
+    fn renaming_a_conversation_rewrites_only_its_title() {
+        let (_dir, store) = store();
+        let session = conversation(&store, "first name", 2);
+        let created_at = session.created_at.clone();
+
+        assert!(store.rename(&session.id, "second name").unwrap());
+        let renamed = store.load(&session.id).unwrap();
+        assert_eq!(renamed.title, "second name");
+        assert_eq!(renamed.created_at, created_at);
+        assert_eq!(renamed.messages.len(), 2);
+
+        // A conversation the store does not hold is `false` rather than an
+        // error: an unsaved one is still a conversation somebody is holding.
+        assert!(!store.rename("s1-2-3", "anything").unwrap());
+        // And an id that could name another file is refused before the disk.
+        assert!(store.rename("../escape", "anything").is_err());
     }
 
     #[test]

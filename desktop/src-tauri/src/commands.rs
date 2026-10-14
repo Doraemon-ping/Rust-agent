@@ -101,6 +101,31 @@ pub async fn chat_open_session(
     manager.chat_open_session(&id).await
 }
 
+/// Rename a conversation this workspace already holds.
+///
+/// The page names a conversation the runtime itself listed, and the words to
+/// call it: a name is not a path, and it is bounded on the other side.
+#[tauri::command]
+pub async fn chat_rename_session(
+    id: String,
+    title: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_rename_session(&id, &title).await
+}
+
+/// Forget a conversation. The answer says which one is being continued now.
+///
+/// Deleting is not an undo, so the page asks once and means it: what goes is one
+/// conversation the runtime listed, and the folder the user chose is untouched.
+#[tauri::command]
+pub async fn chat_delete_session(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_delete_session(&id).await
+}
+
 /// The most recent log lines, oldest first.
 #[tauri::command]
 pub async fn runtime_logs(

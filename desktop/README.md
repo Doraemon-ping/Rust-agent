@@ -137,13 +137,16 @@ events go through, so a reload in the middle of an answer picks it up where it
 was. An event that arrives before the turn it names is held rather than dropped,
 for the same reason.
 
-The conversation is also written down as it goes, under `<workspace>/.sessions`,
-so it outlives the process that held it. Restarting the runtime -- or choosing
-another project, which restarts it -- does not end it: the runtime continues the
-conversation it was last holding, and a page that reloads reads it back the way
-it reads back a reload. The conversation picker on the chat page lists what this
-workspace holds, marks the one being continued, and can start a fresh one or
-pick up an older one.
+The conversation is also written down as it goes, so it outlives the process
+that held it. Where it is written is the host's decision rather than the
+project's: the host names a store under the per-user app data directory, one
+directory per workspace, so a folder the runtime works in is never also a folder
+the runtime writes into. Restarting the runtime -- or choosing another project,
+which restarts it -- does not end it: the runtime continues the conversation it
+was last holding, and a page that reloads reads it back the way it reads back a
+reload. The conversation picker on the chat page lists what this workspace
+holds, marks the one being continued, starts a fresh one, picks up an older one,
+and renames or deletes any of them.
 
 - The agent is built on the first prompt, not at startup, so a runtime with no
   model configured still starts and still answers for itself. A prompt sent
@@ -190,17 +193,18 @@ share. The runtime seam exposes `getRuntimeStatus`,
 `pickProject`, `selectProject`, and `removeProject`. The provider seam exposes
 `getProviderSettings` and `saveProviderSettings`. The chat seam exposes
 `sendChatPrompt`, `cancelChatTurn`, `fetchChatHistory`, `fetchChatSessions`,
-`newChatSession`, `openChatSession`, and `subscribeChatEvents`; a prompt is the
-one thing the page chooses there, and the answer arrives on the events rather
-than the command.
+`newChatSession`, `openChatSession`, `renameChatSession`, `deleteChatSession`,
+and `subscribeChatEvents`; a prompt is the one thing the page chooses there, and
+the answer arrives on the events rather than the command.
 
 **Host commands** (`src-tauri/src/commands.rs`) are thin wrappers:
 `runtime_status`, `runtime_start`, `runtime_stop`, `runtime_restart`,
 `runtime_ping`, `runtime_logs`, `runtime_host_info`, `projects_list`,
 `projects_pick`, `projects_select`, `projects_remove`, `provider_get`,
 `provider_save`, `chat_send`, `chat_cancel`, `chat_history`, `chat_sessions`,
-`chat_new_session`, and `chat_open_session`. None of them takes a path, a
-binary, or a command line from the caller, and the commands that name something
+`chat_new_session`, `chat_open_session`, `chat_rename_session`, and
+`chat_delete_session`. None of them takes a path, a binary, or a command line
+from the caller, and the commands that name something
 the runtime holds -- a project, a conversation -- take an id the runtime itself
 handed out. `provider_save` is the one command that takes a secret in -- and its
 answer still does not contain one. `chat_send` takes the prompt text and nothing
@@ -208,6 +212,8 @@ else; the workspace, the model, and the credentials are all decided in the host.
 `chat_open_session` takes a session id, and only one this workspace holds: the
 runtime checks its shape before it touches the disk, and answers
 `session_unknown` for an id that is well formed but not there.
+`chat_rename_session` adds the name to give it, and `chat_delete_session` takes
+nothing but the id.
 
 **Host events** are `runtime://status`, `runtime://message`, `runtime://log`,
 and `runtime://chat`. Status is pushed on every state change; the page never
@@ -222,6 +228,16 @@ pass it a command line. There is no shell capability in
 `capabilities/default.json` beyond `core:event:default`; the folder picker is
 opened by the host from Rust, so the page is granted no dialog permission
 either. It can ask for a picker, not for a directory.
+
+**Where conversations live** is decided there too. `sessions_dir` puts them under
+the per-user app data directory, at `<app data>/sessions/<key>`, where `<key>` is
+the workspace's folder name plus a hash of its whole path -- readable at a
+glance, and still one store per workspace when two projects share a folder name.
+The runtime is told with `--sessions-dir`, so it never writes conversations into
+the project it is working in, and switching projects switches conversation sets
+with it. Conversations written by an older build, which kept them in
+`<workspace>/.sessions`, are not moved for the user: copy the `.json` files into
+the store directory to keep them.
 
 ## Protocol (v1)
 
@@ -254,8 +270,9 @@ Unattributable failure, when there is no request to blame:
 ```
 
 Methods: `runtime.status` (a full snapshot), `runtime.ping`, `runtime.shutdown`,
-`chat.send`, `chat.cancel`, `chat.history`, `sessions.list`, `sessions.new`, and
-`sessions.open`. Only `chat.send` and `sessions.open` take parameters -- the
+`chat.send`, `chat.cancel`, `chat.history`, `sessions.list`, `sessions.new`,
+`sessions.open`, `sessions.rename`, and `sessions.delete`. Only `chat.send`,
+`sessions.open`, `sessions.rename`, and `sessions.delete` take parameters -- the
 others refuse any key at all, so a host that thinks it is talking to a newer
 bridge finds out at once. `chat.send`'s request carries the prompt and nothing
 else:
@@ -294,10 +311,13 @@ held is free. That is what makes the two usable in sequence: the prompt the page
 sends on the back of the answer is taken, rather than refused as a turn still
 running.
 
-Conversations are written to `<workspace>/.sessions/<id>.json`, and the runtime
-continues the newest one it finds when it starts. `sessions.list` takes no
-parameters and answers with what this workspace holds, newest first, plus the id
-being continued:
+Conversations are written to `<id>.json` in a directory the host names with
+`--sessions-dir`; without it they go to `<workspace>/.sessions`, where the
+CLI-driven runtime has always kept them. The desktop host passes a directory
+under the per-user app data directory, one per workspace, so a project stays the
+project's. The runtime continues the newest conversation it finds when it starts.
+`sessions.list` takes no parameters and answers with what that store holds,
+newest first, plus the id being continued:
 
 ```json
 {"protocol_version":1,"type":"response","request_id":"host-11","ok":true,"result":{"current":"s1750000000000-4821-0","sessions":[{"id":"s1750000000000-4821-0","title":"say hello","created_at":"2026-10-14T05:12:00.123456700+00:00","updated_at":"2026-10-14T05:14:31.765432100+00:00","messages":6}]}}
@@ -308,18 +328,29 @@ has not run a turn -- so the page can always see which conversation it is in,
 and the id in `current` is always one of the entries. A conversation is only
 written once it has a turn worth keeping: an empty one is not a file, and a
 window that never sent a prompt leaves nothing behind. It does, therefore, not
-survive a restart until its first turn has finished.
+survive a restart until its first turn has finished -- though a name given to one
+is kept, and goes out with that first turn.
 
 `sessions.new` takes no parameters and starts a fresh conversation, leaving the
 old one on disk; `sessions.open` takes the id of one this workspace holds and
-continues it, numbering its turns after the ones it already has. Both refuse
-while a turn is running. A turn the file caught mid-flight -- the process was
-killed, not stopped -- reads back as `failed` with `chat_interrupted` rather than
-left spinning, because whatever was going to finish it is gone.
+continues it, numbering its turns after the ones it already has. `sessions.rename`
+takes `{"id","title"}` and gives a conversation the name the user typed -- trimmed,
+at most 120 characters, and empty is allowed because it means "unnamed" -- so a
+conversation that has a file is renamed in that file, and one that has none is
+named in memory. `sessions.delete` takes `{"id"}` and answers
+`{"deleted","current"}`. Deleting the conversation in hand is allowed: the runtime
+then continues the newest conversation that is left, or starts an empty one when
+nothing is left, because the next prompt still has to have somewhere to go.
+Deleting a conversation that was never written and is not the one in hand is
+`session_unknown`. All four refuse while a turn is running. A turn the file caught
+mid-flight -- the process was killed, not stopped -- reads back as `failed` with
+`chat_interrupted` rather than left spinning, because whatever was going to finish
+it is gone.
 
 Request error codes: `invalid_json`, `invalid_utf8`, `invalid_request`,
 `invalid_params`, `message_too_large`, `unknown_method`, `session_unknown`,
-`unsupported_protocol_version`. A turn that failed reports its own code on
+`session_store` (the conversations could not be read or written where they are
+kept), `unsupported_protocol_version`. A turn that failed reports its own code on
 `chat.failed`, so the page can branch on it: `chat_busy`,
 `chat_not_configured`, `chat_unauthorized`, `chat_rate_limited`,
 `chat_api_error`, `chat_step_limit`, `chat_recovery_failed`, `chat_turn_failed`,
@@ -332,8 +363,9 @@ exits or the connection drops; `runtime.ready` is what makes a start "connected"
 rather than merely "spawned".
 
 Exit codes of `desktop_bridge`: `0` clean (including stdin EOF), `1` I/O error,
-`2` usage error, `3` workspace error. Closing stdin is a valid stop signal, so
-an orphaned child exits on its own even if the host never asks politely.
+`2` usage error, `3` workspace error, `4` the conversations' directory could not
+be used. Closing stdin is a valid stop signal, so an orphaned child exits on its
+own even if the host never asks politely.
 
 ## Lifecycle
 
@@ -361,15 +393,17 @@ cd desktop/src-tauri && cargo test --all-targets
 
 Measured on Windows 11, `x86_64-pc-windows-msvc`, 2026-10-14:
 
-- `cargo test --all-targets`: 201 passed / 0 failed, plus 35 for the bridge.
-- `desktop/src-tauri` `cargo test --all-targets`: 41 passed / 0 failed.
-- `node scripts/desktop-bridge-smoke.mjs`: 94 of 94 checks passed against the
+- `cargo test --all-targets`: 202 passed / 0 failed, plus 43 for the bridge.
+- `desktop/src-tauri` `cargo test --all-targets`: 43 passed / 0 failed.
+- `node scripts/desktop-bridge-smoke.mjs`: 116 of 116 checks passed against the
   built binary (framing, ids, errors, stdout purity, clean shutdown, the
   workspace `.env` precedence, and a full chat turn driven against a local HTTP
   stand-in for the model, read back afterwards through `chat.history`; a turn
   stopped mid-flight and the prompt that follows it; and a conversation left on
   disk and picked up by a second process, with a 新会话 listed as the one being
-  continued before it has anything to write).
+  continued before it has anything to write, renamed and then deleted; and a
+  bridge given its own `--sessions-dir`, which leaves the workspace without a
+  `.sessions` directory at all).
 - `pnpm typecheck` and `pnpm build`: clean.
 - `pnpm app:build`: builds both bundles, and leaves a runnable layout in
   `src-tauri/target/release/` -- the app next to its sidecar, so it can be run
@@ -418,6 +452,16 @@ back as `cancelled`), the same conversation re-opened by a second process,
 `pnpm typecheck`, and `pnpm build`. Still to check by hand: pressing 停止 in a
 real window, watching 新会话 and the conversation picker swap transcripts, and
 seeing a reload come back to a conversation a restart no longer loses.
+
+Renaming and deleting conversations, and keeping them outside the workspace, came
+after that pass too. What is covered: `session.rs` unit tests (a rename that
+rewrites the title and nothing else), the bridge's `sessions.*` unit tests (an
+in-memory name for a conversation with no file yet, deleting the conversation in
+hand, deleting the last one, and every refusal), `paths.rs` unit tests for the
+store key, the smoke test's rename and delete round trips plus a run with
+`--sessions-dir`, `pnpm typecheck`, and `pnpm build`. Still to check by hand:
+renaming and deleting from the picker in a real window, and a project whose
+conversations now live under the app data directory rather than in the folder.
 
 ## Platform status
 

@@ -12,12 +12,16 @@
 //! drives and reports the turn as `chat.*` events while it happens, `chat.cancel`
 //! stops that turn, `chat.history` hands the reported turns back to a page that
 //! reloaded, and `sessions.list` / `sessions.new` / `sessions.open` decide which
-//! conversation is being continued.
+//! conversation is being continued. `sessions.rename` and `sessions.delete` are
+//! what the page's conversation menu does to them.
 //!
-//! Conversations are written to `<workspace>/.sessions` through the runtime's own
-//! `SessionStore`, so they outlive the process: a restart -- and choosing another
-//! project restarts the runtime -- resumes the conversation the user was reading
-//! instead of starting an empty one.
+//! Conversations are written through the runtime's own `SessionStore`, so they
+//! outlive the process: a restart -- and choosing another project restarts the
+//! runtime -- resumes the conversation the user was reading instead of starting
+//! an empty one. Where they are kept is the host's choice: `--sessions-dir` names
+//! the directory, which is how the desktop app keeps them in its own store rather
+//! than inside the project it happens to be working in. Without the flag they
+//! stay under `<workspace>/.sessions`, where the runtime has always put them.
 //!
 //! The agent is built on the first prompt, not at startup, so a workspace with
 //! no model credentials still starts and still answers for itself.
@@ -49,7 +53,7 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Every method this build answers, in the order we advertise them.
-const METHODS: [&str; 9] = [
+const METHODS: [&str; 11] = [
     "runtime.status",
     "runtime.ping",
     "runtime.shutdown",
@@ -59,12 +63,17 @@ const METHODS: [&str; 9] = [
     "sessions.list",
     "sessions.new",
     "sessions.open",
+    "sessions.rename",
+    "sessions.delete",
 ];
 
 /// The methods that take parameters. Everything else refuses them, so a host
 /// that thinks it is talking to a newer bridge finds out at once.
 fn takes_params(method: &str) -> bool {
-    matches!(method, "chat.send" | "sessions.open")
+    matches!(
+        method,
+        "chat.send" | "sessions.open" | "sessions.rename" | "sessions.delete"
+    )
 }
 
 /// Exit codes, so the host can tell a bad invocation from a broken pipe.
@@ -72,14 +81,18 @@ const EXIT_OK: i32 = 0;
 const EXIT_IO: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const EXIT_WORKSPACE: i32 = 3;
+/// The conversations' directory could not be used.
+const EXIT_STORE: i32 = 4;
 const USAGE: &str = "\
 rust-agent desktop bridge
 
-usage: desktop_bridge --workspace <dir>
+usage: desktop_bridge --workspace <dir> [--sessions-dir <dir>]
 
-  --workspace <dir>  runtime workspace; must exist (default: the cwd)
-  --help             print this text on stderr
-  --version          print the version on stderr
+  --workspace <dir>    runtime workspace; must exist (default: the cwd)
+  --sessions-dir <dir> where conversations are kept, created if missing
+                       (default: <workspace>/.sessions)
+  --help               print this text on stderr
+  --version            print the version on stderr
 
 Protocol: one JSON object per line on stdin, one JSON object per line on
 stdout. Diagnostics go to stderr. See desktop/README.md for message shapes.
@@ -377,6 +390,9 @@ fn send<M: Serialize>(message: &M) -> io::Result<()> {
 /// the shell never shows stale counts.
 struct Bridge {
     workspace: PathBuf,
+    /// Where conversations are kept. The host decides this, so the desktop app
+    /// can hold them in its own store instead of inside the project.
+    sessions_dir: PathBuf,
     started: Instant,
     started_at: String,
     cron: CronScheduler,
@@ -386,7 +402,7 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn new(workspace: PathBuf) -> Self {
+    fn new(workspace: PathBuf, sessions_dir: PathBuf) -> Self {
         let cron = CronScheduler::new(workspace.clone());
         let mut warnings = Vec::new();
         match cron.load() {
@@ -407,6 +423,7 @@ impl Bridge {
 
         let bridge = Bridge {
             workspace,
+            sessions_dir,
             started: Instant::now(),
             started_at: Utc::now().to_rfc3339(),
             cron,
@@ -497,7 +514,7 @@ impl Bridge {
                 "skills": skills.dir().display().to_string(),
                 "tasks": tasks.root().display().to_string(),
                 "memory": memories.dir().display().to_string(),
-                "sessions": self.workspace.join(SESSIONS_DIR).display().to_string(),
+                "sessions": self.sessions_dir.display().to_string(),
                 "mailboxes": self.workspace.join(MAILBOXES_DIR).display().to_string(),
                 "workflow": self.workspace.join(WORKFLOWS_DIR).display().to_string(),
             },
@@ -556,6 +573,8 @@ fn dispatch(
         }
         "sessions.new" => accept_new_session(request, chat),
         "sessions.open" => accept_open_session(request, chat),
+        "sessions.rename" => accept_rename_session(request, chat),
+        "sessions.delete" => accept_delete_session(request, chat),
         other => Turn::answered(Response::failed(
             &request.request_id,
             ProtocolError::new(
@@ -594,6 +613,12 @@ const CHAT_BUSY: &str = "chat_busy";
 const CHAT_NOT_CONFIGURED: &str = "chat_not_configured";
 /// Asked for a conversation this workspace does not hold.
 const SESSION_UNKNOWN: &str = "session_unknown";
+/// The conversations could not be read or written where they are kept.
+const SESSION_STORE: &str = "session_store";
+
+/// Longest name a conversation may be given, in characters. Long enough for a
+/// sentence, short enough that a list can show it.
+const MAX_SESSION_TITLE_CHARS: usize = 120;
 
 /// Which turn the shared observer should attribute its events to.
 ///
@@ -1002,7 +1027,8 @@ struct Chat {
     /// the messages out for its length instead of holding the lock, so the
     /// reader loop keeps answering while the model thinks.
     session: Mutex<Session>,
-    /// Where conversations live: `<workspace>/.sessions`.
+    /// Where conversations live. The host decides this, so the desktop app can
+    /// keep them in its own store; it is `<workspace>/.sessions` by default.
     sessions: SessionStore,
     /// The way out of the turn that is running.
     cancel: TurnCancel,
@@ -1016,8 +1042,8 @@ struct Chat {
 }
 
 impl Chat {
-    fn new(workspace: PathBuf, cron: CronScheduler) -> Self {
-        let sessions = SessionStore::new(&workspace);
+    fn new(workspace: PathBuf, sessions_dir: PathBuf, cron: CronScheduler) -> Self {
+        let sessions = SessionStore::at(sessions_dir);
         // Pick up where the last run left off. A store this build cannot read is
         // reported and stepped over: history is not worth refusing to start a
         // conversation over.
@@ -1121,6 +1147,25 @@ impl Chat {
         if guard.title.is_empty() {
             guard.title = session_title(prompt);
         }
+    }
+
+    /// Give the conversation in hand a name of its own, whether or not it
+    /// already had one.
+    ///
+    /// The file is written here rather than left to the next turn, so a rename
+    /// survives a restart that happens before another prompt. A conversation
+    /// that has no file yet keeps none: it is written the moment it has a turn
+    /// worth keeping, and the name goes out with it.
+    fn rename(&self, title: &str) -> Result<(), Error> {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.title = title.to_string();
+        // The store's own rename re-reads the file, so it answers `false` --
+        // and writes nothing -- for a conversation that is not on disk.
+        self.sessions.rename(&guard.id, title)?;
+        Ok(())
     }
 
     /// Every conversation this workspace holds, and the one being continued.
@@ -1493,6 +1538,133 @@ fn accept_open_session(request: &Request, chat: &Arc<Chat>) -> Turn {
     }
 }
 
+/// Rename a conversation.
+///
+/// The one in hand is renamed in memory first and written after, so a file that
+/// cannot be written still leaves the conversation named on the page; any other
+/// one is renamed in its file, and an id this workspace does not hold is refused
+/// rather than invented. A name is not a file name, so it is bounded but never
+/// sanitised: what the user typed is what the list shows back.
+fn accept_rename_session(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    if chat.busy.load(Ordering::SeqCst) {
+        return rejected(ProtocolError::new(
+            CHAT_BUSY,
+            "a turn is running; stop it or wait for it before renaming a conversation",
+        ));
+    }
+
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`sessions.rename` needs an `id` string",
+        ));
+    };
+    if !is_session_id(id) {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a session id"),
+        ));
+    }
+    let Some(title) = request.params.get("title").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`sessions.rename` needs a `title` string",
+        ));
+    };
+    let title = title.trim();
+    if title.chars().count() > MAX_SESSION_TITLE_CHARS {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("a conversation name is at most {MAX_SESSION_TITLE_CHARS} characters"),
+        ));
+    }
+
+    if chat.session().id == id {
+        if let Err(error) = chat.rename(title) {
+            log(Level::Warn, format!("could not write the rename: {error}"));
+        }
+    } else {
+        match chat.sessions.rename(id, title) {
+            Ok(true) => {}
+            Ok(false) => {
+                return rejected(ProtocolError::new(
+                    SESSION_UNKNOWN,
+                    format!("no session `{id}`"),
+                ))
+            }
+            Err(error) => return rejected(ProtocolError::new(SESSION_STORE, error.to_string())),
+        }
+    }
+
+    log(Level::Info, format!("renamed session {id}"));
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "session": id, "title": title }),
+    ))
+}
+
+/// Forget a conversation.
+///
+/// The one in hand can be deleted as well: the runtime then continues the newest
+/// conversation that is left, or starts an empty one when nothing is left,
+/// because the next prompt still has to have somewhere to go. The answer names
+/// the conversation the page is in now, whether or not it changed.
+fn accept_delete_session(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    if chat.busy.load(Ordering::SeqCst) {
+        return rejected(ProtocolError::new(
+            CHAT_BUSY,
+            "a turn is running; stop it or wait for it before deleting a conversation",
+        ));
+    }
+
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`sessions.delete` needs an `id` string",
+        ));
+    };
+    if !is_session_id(id) {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a session id"),
+        ));
+    }
+
+    let in_hand = chat.session().id == id;
+    let on_disk = match chat.sessions.delete(id) {
+        Ok(removed) => removed,
+        Err(error) => return rejected(ProtocolError::new(SESSION_STORE, error.to_string())),
+    };
+    // The one in hand is a conversation the page showed even before it had a
+    // file, so deleting it is deleting it; any other has to be on disk.
+    if !on_disk && !in_hand {
+        return rejected(ProtocolError::new(
+            SESSION_UNKNOWN,
+            format!("no session `{id}`"),
+        ));
+    }
+
+    if in_hand {
+        let next = match chat.sessions.latest() {
+            Ok(next) => next,
+            Err(error) => return rejected(ProtocolError::new(SESSION_STORE, error.to_string())),
+        };
+        chat.adopt(next.unwrap_or_else(|| chat.sessions.create("")));
+    }
+
+    let current = chat.session().id;
+    log(
+        Level::Info,
+        format!("deleted session {id}; continuing {current}"),
+    );
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "deleted": id, "current": current }),
+    ))
+}
+
 /// Ask the turn that is running to stop.
 ///
 /// A stop that finds nothing running answers at once. A stop that reaches a turn
@@ -1697,12 +1869,14 @@ fn read_capped<R: BufRead>(reader: &mut R, cap: usize) -> io::Result<Line> {
 
 struct Options {
     workspace: Option<PathBuf>,
+    sessions_dir: Option<PathBuf>,
 }
 
 /// `Ok(None)` means an informational flag was handled and we should exit 0.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let args: Vec<String> = args.collect();
     let mut workspace = None;
+    let mut sessions_dir = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1711,6 +1885,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                 match args.get(index) {
                     Some(value) => workspace = Some(PathBuf::from(value)),
                     None => return Err("--workspace needs a directory path".to_string()),
+                }
+            }
+            "--sessions-dir" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => sessions_dir = Some(PathBuf::from(value)),
+                    None => return Err("--sessions-dir needs a directory path".to_string()),
                 }
             }
             "--help" | "-h" => {
@@ -1725,7 +1906,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         }
         index += 1;
     }
-    Ok(Some(Options { workspace }))
+    Ok(Some(Options {
+        workspace,
+        sessions_dir,
+    }))
 }
 
 /// Make `requested` absolute without touching the filesystem.
@@ -1735,7 +1919,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
 /// minimum Rust version. A relative path is therefore resolved against the
 /// current directory and an absolute one is kept as it is; `run` checks that the
 /// result is a directory before the bridge starts.
-fn resolve_workspace(requested: &Path) -> io::Result<PathBuf> {
+fn resolve_path(requested: &Path) -> io::Result<PathBuf> {
     if requested.is_absolute() {
         return Ok(requested.to_path_buf());
     }
@@ -1784,7 +1968,7 @@ fn run() -> i32 {
         },
     };
 
-    let workspace = match resolve_workspace(&requested) {
+    let workspace = match resolve_path(&requested) {
         Ok(path) => path,
         Err(error) => {
             log(
@@ -1801,6 +1985,37 @@ fn run() -> i32 {
         );
         return EXIT_WORKSPACE;
     }
+    // Where conversations live. The host names it when it has a store of its
+    // own; otherwise they stay under the workspace, which is where the
+    // CLI-driven runtime has always kept them. It is created here so
+    // `runtime.status` reports a directory that exists, and so a bad argument
+    // fails the start rather than the first prompt.
+    let sessions_dir = match options.sessions_dir {
+        Some(requested) => {
+            let dir = match resolve_path(&requested) {
+                Ok(path) => path,
+                Err(error) => {
+                    log(
+                        Level::Error,
+                        format!("could not resolve {}: {error}", requested.display()),
+                    );
+                    return EXIT_STORE;
+                }
+            };
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                log(
+                    Level::Error,
+                    format!(
+                        "could not use the sessions directory {}: {error}",
+                        dir.display()
+                    ),
+                );
+                return EXIT_STORE;
+            }
+            dir
+        }
+        None => workspace.join(SESSIONS_DIR),
+    };
     // Before the bridge reads any configuration, so `runtime.ready` reports
     // what this process will actually use.
     load_workspace_env(&workspace);
@@ -1812,8 +2027,9 @@ fn run() -> i32 {
             std::process::id()
         ),
     );
-    let bridge = Bridge::new(workspace.clone());
+    let bridge = Bridge::new(workspace.clone(), sessions_dir.clone());
     log(Level::Info, format!("workspace: {}", workspace.display()));
+    log(Level::Info, format!("sessions: {}", sessions_dir.display()));
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -1825,7 +2041,11 @@ fn run() -> i32 {
 
     // The conversation outlives any one prompt, and a turn runs off this thread
     // so the reader loop keeps answering while a model call is in flight.
-    let chat = Arc::new(Chat::new(workspace.clone(), bridge.cron.clone()));
+    let chat = Arc::new(Chat::new(
+        workspace.clone(),
+        sessions_dir,
+        bridge.cron.clone(),
+    ));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("rust-agent-turn")
@@ -1942,12 +2162,16 @@ mod tests {
     }
 
     fn bridge_at(dir: &std::path::Path) -> Bridge {
-        Bridge::new(dir.to_path_buf())
+        Bridge::new(dir.to_path_buf(), dir.join(SESSIONS_DIR))
     }
 
     /// The pieces `dispatch` needs, for the tests that go through it.
     fn fixture(dir: &std::path::Path) -> (Bridge, Arc<Chat>, tokio::runtime::Runtime) {
-        let chat = Arc::new(Chat::new(dir.to_path_buf(), CronScheduler::new(dir)));
+        let chat = Arc::new(Chat::new(
+            dir.to_path_buf(),
+            dir.join(SESSIONS_DIR),
+            CronScheduler::new(dir),
+        ));
         (
             bridge_at(dir),
             chat,
@@ -2084,7 +2308,11 @@ mod tests {
         let Parsed::Request(request) = parse_request(&request("r-7", "runtime.teleport")) else {
             panic!("expected a request");
         };
-        let chat = Arc::new(Chat::new(dir.path().to_path_buf(), bridge.cron.clone()));
+        let chat = Arc::new(Chat::new(
+            dir.path().to_path_buf(),
+            dir.path().join(SESSIONS_DIR),
+            bridge.cron.clone(),
+        ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&request, &bridge, &chat, runtime.handle());
         assert!(!turn.shutdown);
@@ -2105,7 +2333,11 @@ mod tests {
         let Parsed::Request(ping) = parse_request(&request("r-1", "runtime.ping")) else {
             panic!("expected a request");
         };
-        let chat = Arc::new(Chat::new(dir.path().to_path_buf(), bridge.cron.clone()));
+        let chat = Arc::new(Chat::new(
+            dir.path().to_path_buf(),
+            dir.path().join(SESSIONS_DIR),
+            bridge.cron.clone(),
+        ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&ping, &bridge, &chat, runtime.handle());
         assert!(answered(&turn).ok);
@@ -2519,15 +2751,15 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_workspace_resolves_against_the_current_directory() {
+    fn a_relative_path_resolves_against_the_current_directory() {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(
-            resolve_workspace(Path::new("nested")).unwrap(),
+            resolve_path(Path::new("nested")).unwrap(),
             cwd.join("nested")
         );
 
         let absolute = cwd.join("elsewhere");
-        assert_eq!(resolve_workspace(&absolute).unwrap(), absolute);
+        assert_eq!(resolve_path(&absolute).unwrap(), absolute);
     }
 
     /// A request with parameters, taken through the reader loop's parser.
@@ -2742,5 +2974,307 @@ mod tests {
                 "`{case}`"
             );
         }
+    }
+
+    /// A conversation this workspace already holds, written out the way a
+    /// previous run would have left it.
+    fn stored_session(dir: &std::path::Path, title: &str, message: &str) -> Session {
+        let store = SessionStore::new(dir);
+        let mut session = store.create(title);
+        session.messages.push(Message::user_text(message));
+        store.save(&mut session).unwrap();
+        session
+    }
+
+    #[test]
+    fn a_conversation_can_be_renamed_in_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let saved = stored_session(dir.path(), "an old name", "hello");
+
+        let turn = dispatch(
+            &request_with(
+                "r-1",
+                "sessions.rename",
+                json!({ "id": saved.id, "title": "  a new name  " }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        assert_eq!(
+            answered(&turn).result.clone().unwrap()["title"],
+            json!("a new name")
+        );
+
+        // The name is in the file, with the conversation still in it, and the
+        // list the page reads shows the new name rather than the old one.
+        let store = SessionStore::new(dir.path());
+        let reloaded = store.load(&saved.id).unwrap();
+        assert_eq!(reloaded.title, "a new name");
+        assert_eq!(reloaded.messages.len(), 1);
+
+        let listed = dispatch(
+            &request_with("r-2", "sessions.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let result = answered(&listed).result.clone().unwrap();
+        let entry = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == json!(saved.id))
+            .expect("the renamed conversation is still listed");
+        assert_eq!(entry["title"], json!("a new name"));
+    }
+
+    #[test]
+    fn the_conversation_in_hand_can_be_named_without_a_file_being_made_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let id = chat.session().id.clone();
+
+        let turn = dispatch(
+            &request_with(
+                "r-1",
+                "sessions.rename",
+                json!({ "id": id, "title": "mine" }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        assert_eq!(chat.session().title, "mine");
+
+        // Naming a conversation is not a turn worth keeping, so it still has no
+        // file -- and the name the page is told about is the new one.
+        let store = SessionStore::new(dir.path());
+        assert!(!store.dir().join(format!("{id}.json")).is_file());
+        let listed = dispatch(
+            &request_with("r-2", "sessions.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let result = answered(&listed).result.clone().unwrap();
+        assert_eq!(result["sessions"][0]["id"], json!(id));
+        assert_eq!(result["sessions"][0]["title"], json!("mine"));
+    }
+
+    #[test]
+    fn a_rename_that_names_nothing_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        for (case, params, code) in [
+            ("no id", json!({ "title": "x" }), INVALID_PARAMS),
+            (
+                "id is not a string",
+                json!({ "id": 7, "title": "x" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "id could name another file",
+                json!({ "id": "../escape", "title": "x" }),
+                INVALID_PARAMS,
+            ),
+            ("no title", json!({ "id": "s1-2-3" }), INVALID_PARAMS),
+            (
+                "title is not a string",
+                json!({ "id": "s1-2-3", "title": 7 }),
+                INVALID_PARAMS,
+            ),
+            (
+                "a name that is too long",
+                json!({ "id": "s1-2-3", "title": "e".repeat(MAX_SESSION_TITLE_CHARS + 1) }),
+                INVALID_PARAMS,
+            ),
+            (
+                "no such conversation",
+                json!({ "id": "s1-2-3", "title": "x" }),
+                SESSION_UNKNOWN,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "sessions.rename", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_conversation_removes_its_file_and_leaves_the_one_in_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let saved = stored_session(dir.path(), "older", "hello");
+        let in_hand = chat.session().id.clone();
+
+        let turn = dispatch(
+            &request_with("r-1", "sessions.delete", json!({ "id": saved.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        let result = answered(&turn).result.clone().unwrap();
+        assert_eq!(result["deleted"], json!(saved.id));
+        assert_eq!(result["current"], json!(in_hand));
+        assert_eq!(chat.session().id, in_hand);
+
+        let store = SessionStore::new(dir.path());
+        assert!(!store.dir().join(format!("{}.json", saved.id)).is_file());
+    }
+
+    #[test]
+    fn deleting_the_conversation_in_hand_continues_the_newest_one_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let first = stored_session(dir.path(), "first", "one");
+        // Written second, so it is the newest and the one left behind.
+        let second = stored_session(dir.path(), "second", "two");
+
+        let opened = dispatch(
+            &request_with("r-0", "sessions.open", json!({ "id": first.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&opened).ok);
+        assert_eq!(chat.session().id, first.id);
+
+        let turn = dispatch(
+            &request_with("r-1", "sessions.delete", json!({ "id": first.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        let result = answered(&turn).result.clone().unwrap();
+        assert_eq!(result["deleted"], json!(first.id));
+        assert_eq!(result["current"], json!(second.id));
+        assert_eq!(chat.session().id, second.id);
+        assert_eq!(chat.session().title, "second");
+        assert_eq!(chat.session().messages.len(), 1);
+
+        let store = SessionStore::new(dir.path());
+        assert!(!store.dir().join(format!("{}.json", first.id)).is_file());
+        assert!(store.dir().join(format!("{}.json", second.id)).is_file());
+    }
+
+    #[test]
+    fn deleting_the_last_conversation_leaves_somewhere_for_the_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let only = stored_session(dir.path(), "only", "hello");
+
+        let opened = dispatch(
+            &request_with("r-0", "sessions.open", json!({ "id": only.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&opened).ok);
+
+        let turn = dispatch(
+            &request_with("r-1", "sessions.delete", json!({ "id": only.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        let result = answered(&turn).result.clone().unwrap();
+        assert_eq!(result["deleted"], json!(only.id));
+        // A fresh conversation, not nothing: the slot a prompt goes in is not
+        // the store's to take away.
+        assert_ne!(result["current"], json!(only.id));
+        assert!(chat.session().messages.is_empty());
+        assert!(SessionStore::new(dir.path()).list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_conversation_that_is_not_there_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        for (case, params, code) in [
+            ("no id", json!({}), INVALID_PARAMS),
+            ("id is not a string", json!({ "id": 7 }), INVALID_PARAMS),
+            (
+                "id could name another file",
+                json!({ "id": "../escape" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "no such conversation",
+                json!({ "id": "s1-2-3" }),
+                SESSION_UNKNOWN,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "sessions.delete", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversation_cannot_be_changed_while_a_turn_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let id = chat.session().id.clone();
+        // A turn in flight holds the slot until it is done; `Busy` gives it back
+        // even if an assertion below fails.
+        chat.busy.store(true, Ordering::SeqCst);
+        let busy = Busy(&chat.busy);
+        assert!(chat.busy.load(Ordering::SeqCst));
+
+        for (method, params) in [
+            ("sessions.new", json!({})),
+            ("sessions.rename", json!({ "id": id, "title": "x" })),
+            ("sessions.delete", json!({ "id": id })),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", method, params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{method}` was accepted mid-turn");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(CHAT_BUSY),
+                "`{method}`"
+            );
+        }
+        // Nothing was changed, because nothing was allowed to be.
+        assert_eq!(chat.session().id, id);
+        drop(busy);
     }
 }

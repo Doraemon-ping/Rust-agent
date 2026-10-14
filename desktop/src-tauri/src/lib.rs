@@ -80,6 +80,8 @@ pub fn run() {
             commands::chat_sessions,
             commands::chat_new_session,
             commands::chat_open_session,
+            commands::chat_rename_session,
+            commands::chat_delete_session,
             commands::projects_list,
             commands::projects_pick,
             commands::projects_select,

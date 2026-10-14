@@ -96,7 +96,7 @@ it.)
 | `src/recovery.rs` | Model-call recovery (s15): classify 429/529, backoff, fallback model, escalation |
 | `src/workflow.rs` | Workflow runtime (s16): saved scripts, `agent`/`parallel`/`pipeline`, journal, resume |
 | `src/goal.rs` | Goal loop (s17): a session condition plus an independent, tool-free evaluator at the Stop boundary |
-| `src/session.rs` | Durable conversations: one JSON file per session under `.sessions/`, with the writer's own view kept verbatim |
+| `src/session.rs` | Durable conversations: one JSON file per session in a store directory (`<workspace>/.sessions` by default, `--sessions-dir` to put it elsewhere), with the writer's own view kept verbatim |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |
@@ -684,8 +684,11 @@ drives the same agent loop: it sends a prompt as `chat.send` and renders the
 turn the runtime streams back as `chat.*` events, re-reading them with
 `chat.history` when the window is reloaded, ending a turn early with
 `chat.cancel`, and moving between the conversations the runtime keeps on disk
-with `sessions.list`, `sessions.new`, and `sessions.open`. Protocol revision,
-layout, and platform status live in `desktop/README.md`.
+with `sessions.list`, `sessions.new`, `sessions.open`, `sessions.rename`, and
+`sessions.delete`. The shell keeps those conversations in its own storage under
+the per-user app data directory, one store per workspace, so a project folder is
+never also a folder the runtime writes into. Protocol revision, layout, and
+platform status live in `desktop/README.md`.
 
 ## Embedding
 
