@@ -1,27 +1,139 @@
 <script setup lang="ts">
-import { FolderOpen, LoaderCircle, MessageSquare, SendHorizontal } from '@lucide/vue'
-import { computed } from 'vue'
+import {
+  Ban,
+  CircleAlert,
+  LoaderCircle,
+  MessageSquare,
+  SendHorizontal,
+  Trash2,
+  Wrench,
+} from '@lucide/vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import { RouterLink } from 'vue-router'
 
+import Alert from '@/components/ui/Alert.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
+import type { ChatBlock, ChatTurn } from '@/lib/chat'
 import { shortenPath } from '@/lib/format'
 import { RUNTIME_STATE_LABEL, runtimeStateTone } from '@/lib/runtime/types'
+import { useChatStore } from '@/stores/chat'
 import { useProjectsStore } from '@/stores/projects'
 import { useRuntimeStore } from '@/stores/runtime'
 
 const projects = useProjectsStore()
 const runtime = useRuntimeStore()
+const chat = useChatStore()
+
+const draft = ref('')
+const scroller = ref<HTMLElement | null>(null)
+/** Whether the reader is at the bottom; scrolling up must not be yanked back. */
+let following = true
 
 const active = computed(() => projects.active)
 const stateTone = computed(() => runtimeStateTone(runtime.state))
 
 /**
- * What the runtime says it can do, straight off `runtime.status`.
+ * The project the runtime was started in.
  *
- * The chat is not built, and this list is the honest reason: the bridge answers
- * these three methods and nothing that takes a prompt.
+ * No project is not "no workspace": the host falls back to its own per-user
+ * directory, so the page shows which one the prompt would run in.
  */
-const methods = computed(() => runtime.snapshot?.methods ?? [])
+const workspace = computed(
+  () => active.value?.path ?? runtime.hostInfo?.workspace ?? runtime.snapshot?.workspace ?? '--',
+)
+
+/** The one honest reason the page cannot send, when there is one. */
+const issue = computed(() => {
+  if (!runtime.shell) return '当前页面不在桌面宿主中：没有 Runtime 通道可对话。'
+  if (runtime.state === 'error') {
+    return runtime.lastError
+      ? `${runtime.lastError.code}: ${runtime.lastError.message}`
+      : 'Runtime 处于错误状态，详情见设置。'
+  }
+  if (runtime.ready && !chat.supported) {
+    return '这个 Runtime 只上报自身状态，没有 chat.send 方法，因此收不下提示词。'
+  }
+  if (runtime.ready && runtime.snapshot?.config_error) {
+    return `模型还没有配置好：${runtime.snapshot.config_error}`
+  }
+  if (!chat.connected && runtime.shell) {
+    return chat.error ? `${chat.error.code}: ${chat.error.message}` : '还没有连上 Runtime 的事件通道。'
+  }
+  return null
+})
+
+const placeholder = computed(() => {
+  if (!runtime.shell) return '桌面宿主没有运行这个页面'
+  if (runtime.state === 'starting') return 'Runtime 正在启动…'
+  if (!runtime.ready) return 'Runtime 未运行：到设置里启动它'
+  if (!chat.supported) return '这个 Runtime 没有对话接口（需要 chat.send）'
+  if (chat.pending) return 'Runtime 正在回答上一个提示词…'
+  return '给 Runtime 一个任务，例如「列出 src 下的 Rust 文件」'
+})
+
+const hint = computed(() => {
+  if (chat.pending) return 'Runtime 一次只处理一个提示词；上一轮结束后就能继续。'
+  if (!active.value) return '未选择项目：提示词会在上面这个宿主工作目录里执行。'
+  return '回答、工具调用与权限拒绝都由 Runtime 上报，这一页只呈现，不编造。'
+})
+
+const canSubmit = computed(() => chat.canSend && draft.value.trim() !== '')
+
+/** A fingerprint of the transcript, so streaming text scrolls the view along. */
+const size = computed(() =>
+  chat.turns.reduce(
+    (total, turn) => total + turn.blocks.reduce((sum, block) => sum + blockSize(block), 0),
+    chat.turns.length,
+  ),
+)
+
+function blockSize(block: ChatBlock): number {
+  switch (block.kind) {
+    case 'text':
+      return block.text.length
+    case 'tool':
+      return (block.output ?? '').length + block.input.length + 1
+    default:
+      return 1
+  }
+}
+
+function onScroll(): void {
+  const element = scroller.value
+  if (!element) return
+  following = element.scrollHeight - element.scrollTop - element.clientHeight < 48
+}
+
+watch(size, async () => {
+  if (!following) return
+  await nextTick()
+  const element = scroller.value
+  if (element) element.scrollTop = element.scrollHeight
+})
+
+async function submit(): Promise<void> {
+  const text = draft.value
+  if (text.trim() === '' || !chat.canSend) return
+  following = true
+  if (await chat.send(text)) draft.value = ''
+}
+
+function suggest(text: string): void {
+  draft.value = text
+}
+
+const SUGGESTIONS = [
+  '这个项目是做什么的？看 README 和目录结构后告诉我。',
+  '找出仓库里最近的 5 个 commit，用一句话概括每个。',
+  '列出 src/ 下每个模块的职责，一行一个。',
+]
+
+function turnTone(turn: ChatTurn): string {
+  if (turn.status === 'failed') return 'border-danger/35'
+  if (turn.status === 'pending') return 'border-line'
+  return 'border-line/70'
+}
 </script>
 
 <template>
@@ -30,78 +142,153 @@ const methods = computed(() => runtime.snapshot?.methods ?? [])
       <div class="min-w-0">
         <p class="text-xs tracking-[0.18em] text-ink-faint uppercase">对话</p>
         <h1 class="mt-1 truncate text-lg font-semibold tracking-tight">
-          {{ active ? active.name : '未选择项目' }}
+          {{ active ? active.name : '宿主工作目录' }}
         </h1>
-        <p
-          class="mt-0.5 truncate font-mono text-xs text-ink-faint"
-          :title="active?.path ?? ''"
-        >
-          {{ active ? shortenPath(active.path, 72) : '在左侧「项目」栏添加或选择一个文件夹' }}
+        <p class="mt-0.5 truncate font-mono text-xs text-ink-faint" :title="workspace">
+          {{ shortenPath(workspace, 72) }}
         </p>
       </div>
-      <Badge :variant="stateTone">{{ RUNTIME_STATE_LABEL[runtime.state] }}</Badge>
+      <div class="flex shrink-0 items-center gap-2">
+        <Button
+          v-if="chat.turns.length"
+          variant="ghost"
+          size="sm"
+          title="只清空这一页；Runtime 自己的对话历史不受影响"
+          @click="chat.clear()"
+        >
+          <Trash2 class="size-3.5" />
+          清屏
+        </Button>
+        <Badge :variant="stateTone">{{ RUNTIME_STATE_LABEL[runtime.state] }}</Badge>
+      </div>
     </header>
 
-    <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 py-10">
-      <template v-if="!projects.loaded && !projects.error">
-        <LoaderCircle class="size-6 animate-spin text-ink-faint" />
-        <p class="text-xs text-ink-faint">正在从宿主读取项目列表…</p>
-      </template>
+    <Alert v-if="issue" tone="warn" class="mx-6 mt-4" title="现在还不能对话">
+      <p class="break-words">{{ issue }}</p>
+      <p v-if="runtime.ready" class="mt-1">
+        <RouterLink to="/settings" class="underline">到设置里配置模型</RouterLink>
+      </p>
+    </Alert>
 
-      <template v-else-if="!active">
-        <FolderOpen class="size-8 text-ink-faint" />
-        <h2 class="text-base font-semibold tracking-tight">还没有可对话的项目</h2>
-        <p
-          v-if="projects.error"
-          class="max-w-md text-center text-sm break-words text-danger"
+    <div
+      ref="scroller"
+      class="min-h-0 flex-1 overflow-y-auto px-6 py-5 scroll-slim"
+      @scroll="onScroll"
+    >
+      <div v-if="!chat.turns.length" class="mx-auto grid h-full max-w-3xl place-items-center">
+        <div class="space-y-4 text-center">
+          <MessageSquare class="mx-auto size-8 text-ink-faint" />
+          <h2 class="text-base font-semibold tracking-tight">和 Runtime 说点什么</h2>
+          <p class="mx-auto max-w-lg text-sm text-ink-muted">
+            提示词会交给 Runtime 里真实运行的 Agent：它自己决定调用哪些工具，回答、工具结果和权限拒绝都会
+            逐步显示在这里。
+          </p>
+          <ul class="flex flex-wrap justify-center gap-2">
+            <li v-for="text in SUGGESTIONS" :key="text">
+              <Button variant="outline" size="sm" :disabled="!chat.canSend" @click="suggest(text)">
+                {{ text }}
+              </Button>
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <ol v-else class="mx-auto flex max-w-3xl flex-col gap-6">
+        <li
+          v-for="turn in chat.turns"
+          :key="turn.localId"
+          class="space-y-3 border-l-2 pl-4"
+          :class="turnTone(turn)"
         >
-          项目列表没有读到（{{ projects.error.code }}）：{{ projects.error.message }}
-        </p>
-        <p v-else class="max-w-md text-center text-sm text-ink-muted">
-          在左侧「项目」栏点「添加项目」选一个文件夹。项目就是 runtime
-          的工作目录，选好之后这里会显示它。
-        </p>
-      </template>
+          <div class="flex justify-end">
+            <div class="max-w-[85%] rounded-xl border border-accent/30 bg-accent/10 px-3.5 py-2">
+              <p class="text-sm whitespace-pre-wrap text-ink">{{ turn.prompt }}</p>
+            </div>
+          </div>
 
-      <template v-else>
-        <MessageSquare class="size-8 text-ink-faint" />
-        <h2 class="text-base font-semibold tracking-tight">对话尚未接入</h2>
-        <p class="max-w-lg text-center text-sm text-ink-muted">
-          桌面外壳已经能启动 runtime，但协议 v1 只回答运行时自己的状态，没有接收提示词的方法。
-        </p>
-        <ul v-if="methods.length" class="flex flex-wrap justify-center gap-2">
-          <li
-            v-for="method in methods"
-            :key="method"
-            class="rounded-md border border-line px-2 py-1 font-mono text-[11px] text-ink-faint"
-          >
-            {{ method }}
-          </li>
-        </ul>
-        <p class="max-w-lg text-center text-xs leading-relaxed text-ink-faint">
-          <template v-if="methods.length">上面是 runtime 自己上报的方法。</template>
-          <template v-else>runtime 还没有上报方法列表。</template>
-          下一步是在 bridge 里加一个接收提示词、流式回答案的方法；在那之前，这一页不会显示任何伪造的回复。
-        </p>
-      </template>
+          <div v-for="(block, index) in turn.blocks" :key="index" class="space-y-2">
+            <p v-if="block.kind === 'text'" class="text-sm whitespace-pre-wrap text-ink">
+              {{ block.text }}
+            </p>
+
+            <div
+              v-else-if="block.kind === 'tool'"
+              class="overflow-hidden rounded-lg border border-line bg-surface/60"
+            >
+              <div class="flex items-center gap-2 border-b border-line/60 px-3 py-1.5">
+                <Wrench class="size-3.5 shrink-0 text-ink-faint" />
+                <span class="font-mono text-xs text-ink">{{ block.name }}</span>
+                <Badge v-if="block.source !== 'main'" class="px-1.5 py-0 text-[10px]">
+                  子智能体
+                </Badge>
+                <LoaderCircle
+                  v-if="block.output === null"
+                  class="size-3.5 animate-spin text-ink-faint"
+                />
+                <Badge v-else-if="block.isError" variant="danger" class="px-1.5 py-0 text-[10px]">
+                  失败
+                </Badge>
+              </div>
+              <p
+                v-if="block.input"
+                class="truncate border-b border-line/60 px-3 py-1.5 font-mono text-[11px] text-ink-faint"
+                :title="block.input"
+              >
+                {{ block.input }}
+              </p>
+              <pre
+                v-if="block.output !== null"
+                class="max-h-64 overflow-auto px-3 py-2 font-mono text-[11px] whitespace-pre-wrap text-ink-muted scroll-slim"
+              >{{ block.output }}</pre>
+            </div>
+
+            <p
+              v-else-if="block.kind === 'blocked'"
+              class="flex items-start gap-2 text-xs text-danger"
+            >
+              <Ban class="mt-px size-3.5 shrink-0" />
+              <span>{{ block.name }} 被权限策略拒绝：{{ block.reason }}</span>
+            </p>
+
+            <p v-else class="flex items-start gap-2 text-xs text-ink-faint">
+              <CircleAlert class="mt-px size-3.5 shrink-0" />
+              <span>{{ block.text }}</span>
+            </p>
+          </div>
+
+          <p v-if="turn.status === 'pending'" class="flex items-center gap-2 text-xs text-ink-faint">
+            <LoaderCircle class="size-3.5 animate-spin" />
+            Runtime 正在处理…
+          </p>
+          <p v-else-if="turn.status === 'failed'" class="flex items-start gap-2 text-xs text-danger">
+            <CircleAlert class="mt-px size-3.5 shrink-0" />
+            <span class="break-words">
+              {{ turn.error?.code }}：{{ turn.error?.message }}
+            </span>
+          </p>
+        </li>
+      </ol>
     </div>
 
     <footer class="border-t border-line px-6 py-4">
-      <div class="flex items-end gap-3">
+      <div class="mx-auto flex max-w-3xl items-end gap-3">
         <textarea
-          class="h-20 min-h-20 w-full resize-none rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-faint focus:outline-none disabled:opacity-60"
-          placeholder="对话接口尚未接入"
-          disabled
+          v-model="draft"
+          rows="3"
+          spellcheck="false"
+          class="max-h-40 min-h-20 w-full resize-none rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-faint focus:outline-none disabled:opacity-60"
+          :disabled="!chat.canSend"
+          :placeholder="placeholder"
+          @keydown.enter.exact.prevent="submit"
         />
-        <Button disabled>
+        <Button :disabled="!canSubmit" @click="submit">
           <SendHorizontal class="size-4" />
           发送
         </Button>
       </div>
-      <p class="mt-2 text-[11px] text-ink-faint">
-        这个输入框是禁用的，不是待发送内容：协议 v1 没有提示词方法，宿主也就不会伪造一条回复。
+      <p class="mx-auto mt-2 max-w-3xl text-[11px] text-ink-faint">
+        {{ hint }} Enter 发送，Shift+Enter 换行。
       </p>
     </footer>
   </div>
 </template>
-

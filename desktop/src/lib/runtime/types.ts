@@ -86,6 +86,8 @@ export interface RuntimeCommands {
   runtime_ping: () => Promise<RuntimePing>
   runtime_logs: (limit?: number) => Promise<RuntimeLogLine[]>
   runtime_host_info: () => Promise<HostInfo>
+  chat_send: (prompt: string) => Promise<{ accepted: boolean; turn: string }>
+  chat_history: () => Promise<{ turns: unknown[] }>
 }
 
 export const RUNTIME_STATE_LABEL: Record<RuntimeState, string> = {

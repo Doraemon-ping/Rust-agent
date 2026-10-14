@@ -23,6 +23,7 @@ import type {
 export const RUNTIME_EVENT = {
   status: 'runtime://status',
   message: 'runtime://message',
+  chat: 'runtime://chat',
   log: 'runtime://log',
 } as const
 

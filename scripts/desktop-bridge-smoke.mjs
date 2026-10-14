@@ -8,6 +8,7 @@
 
 import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import process from 'node:process'
@@ -31,7 +32,7 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
  * test can await a specific inbound message instead of sleeping.
  */
 class Harness {
-  constructor(workspace) {
+  constructor(workspace, options = {}) {
     this.stdout = []
     this.stderr = []
     this.exited = null
@@ -39,6 +40,9 @@ class Harness {
     this.child = spawn(bridgePath, ['--workspace', workspace], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      // The host decides this child's environment, so a check that depends on
+      // it must decide it too instead of inheriting the developer's shell.
+      env: options.env ?? process.env,
     })
     this.child.stdout.setEncoding('utf8')
     this.child.stderr.setEncoding('utf8')
@@ -156,7 +160,9 @@ async function main() {
     check('the bridge announces runtime.ready', ready !== undefined)
     check('runtime.ready carries the workspace', ready?.data?.workspace === workspace)
     check('runtime.ready reports protocol 1', ready?.data?.protocol_version === PROTOCOL_VERSION)
-    check('runtime.ready lists the three methods', ready?.data?.methods?.length === 3)
+    check('runtime.ready lists every method', ready?.data?.methods?.length === 5)
+    check('runtime.ready advertises chat.send', ready?.data?.methods?.includes('chat.send'))
+    check('runtime.ready advertises chat.history', ready?.data?.methods?.includes('chat.history'))
 
     bridge.request('r-1', 'runtime.ping')
     const ping = await bridge.waitFor((messages) => byId(messages, 'r-1'))
@@ -266,6 +272,257 @@ async function main() {
   } finally {
     await orphan.stop()
     rmSync(workspace, { recursive: true, force: true })
+  }
+
+  // --- a workspace ``.env`` configures the runtime, and an environment the
+  //     host sets still wins over it ---
+  const dotted = mkdtempSync(join(tmpdir(), 'bridge-dotenv-'))
+  const scrubbed = { ...process.env }
+  for (const name of [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_MODEL',
+    'MODEL_ID',
+    'FALLBACK_MODEL_ID',
+    'MAX_TOKENS',
+    // A proxy the developer happens to have exported must not stand between the
+    // checks below and the local stand-in endpoint.
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'ALL_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'all_proxy',
+    'no_proxy',
+  ]) {
+    delete scrubbed[name]
+  }
+  writeFileSync(
+    join(dotted, '.env'),
+    'ANTHROPIC_API_KEY=sk-ant-from-dotenv\nMODEL_ID=model-from-dotenv\n',
+  )
+
+  const fromDotenv = new Harness(dotted, { env: scrubbed })
+  try {
+    const ready = await fromDotenv.waitFor((messages) => named(messages, 'runtime.ready'))
+    check(
+      'a workspace .env supplies the model',
+      ready?.data?.model === 'model-from-dotenv',
+      ready?.data?.model,
+    )
+    check('a workspace .env clears the config error', ready?.data?.config_error === null)
+    check(
+      'loading the .env is reported on stderr',
+      fromDotenv.stderr.some((line) => line.includes('.env')),
+    )
+  } finally {
+    await fromDotenv.stop()
+  }
+
+  const fromHost = new Harness(dotted, {
+    env: { ...scrubbed, ANTHROPIC_API_KEY: 'sk-ant-from-host', MODEL_ID: 'model-from-host' },
+  })
+  try {
+    const ready = await fromHost.waitFor((messages) => named(messages, 'runtime.ready'))
+    check(
+      'an environment the host sets beats the workspace .env',
+      ready?.data?.model === 'model-from-host',
+      ready?.data?.model,
+    )
+  } finally {
+    await fromHost.stop()
+    rmSync(dotted, { recursive: true, force: true })
+  }
+
+  // --- chat: a prompt runs through the loop and the turn comes back as events ---
+  //
+  // A local stand-in for `/v1/messages` answers every turn, so a refused prompt
+  // and an answered one are both exercised without a network and without a
+  // token. A prompt that mentions `refuse` gets a 401; one that mentions `slow`
+  // has its first byte held back, so a second prompt lands mid-turn.
+  const model = createServer((request, response) => {
+    let body = ''
+    request.on('data', (chunk) => (body += chunk))
+    request.on('end', () => {
+      if (body.includes('refuse')) {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ type: 'error', error: { message: 'bad key' } }))
+        return
+      }
+      const frames = [
+        'data: {"type":"message_start","message":{"model":"mock","usage":{"input_tokens":3,"output_tokens":1}}}',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"from the mock"}}',
+        'data: {"type":"content_block_stop","index":0}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      ]
+      const answer = () => {
+        response.writeHead(200, { 'content-type': 'text/event-stream' })
+        for (const frame of frames) response.write(`${frame}\n\n`)
+        response.end()
+      }
+      if (body.includes('slow')) setTimeout(answer, 1500)
+      else answer()
+    })
+  })
+  await new Promise((listening) => model.listen(0, '127.0.0.1', listening))
+
+  const mock = mkdtempSync(join(tmpdir(), 'bridge-chat-'))
+  writeFileSync(
+    join(mock, '.env'),
+    `ANTHROPIC_BASE_URL=http://127.0.0.1:${model.address().port}\n` +
+      'ANTHROPIC_API_KEY=sk-ant-mock\nMODEL_ID=mock-model\nMAX_TOKENS=64\n',
+  )
+
+  // No `.env` and no environment: nothing to run a prompt with.
+  const bare = mkdtempSync(join(tmpdir(), 'bridge-bare-'))
+  const unrunnable = new Harness(bare, { env: scrubbed })
+  try {
+    await unrunnable.waitFor((messages) => named(messages, 'runtime.ready'))
+    unrunnable.request('c-1', 'chat.send', { params: { prompt: 'hello' } })
+    const refused = await unrunnable.waitFor((messages) => byId(messages, 'c-1'))
+    check('a prompt with no model configured is refused', refused?.ok === false)
+    check(
+      'the refusal says what to configure',
+      refused?.error?.code === 'chat_not_configured',
+      refused?.error?.code,
+    )
+    check('a refusal carries no result', refused?.result === undefined)
+  } finally {
+    await unrunnable.stop()
+    rmSync(bare, { recursive: true, force: true })
+  }
+
+  const chat = new Harness(mock, { env: scrubbed })
+  try {
+    await chat.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    // A bad prompt is a response, not an event: it never starts a turn.
+    // Nothing has run yet, so there is nothing to read back.
+    chat.request('c-0', 'chat.history')
+    const nothing = await chat.waitFor((messages) => byId(messages, 'c-0'))
+    check(
+      'a conversation that has not started reads back empty',
+      nothing?.result?.turns?.length === 0,
+    )
+
+    chat.request('c-2', 'chat.send', { params: { prompt: '   ' } })
+    const empty = await chat.waitFor((messages) => byId(messages, 'c-2'))
+    check(
+      'an empty prompt is refused',
+      empty?.ok === false && empty?.error?.code === 'invalid_params',
+    )
+
+    chat.request('c-3', 'chat.send', { params: { prompt: 'say hello' } })
+    const accepted = await chat.waitFor((messages) => byId(messages, 'c-3'))
+    check('a runnable prompt is accepted', accepted?.ok === true)
+    check('the accept names the turn its events carry', accepted?.result?.turn === 'turn-1')
+
+    // The reader loop must keep answering while the turn is in flight.
+    chat.request('c-4', 'runtime.ping')
+    const pong = await chat.waitFor((messages) => byId(messages, 'c-4'), 3000)
+    check('a turn does not block the request loop', pong?.result?.pong === true)
+
+    const done = await chat.waitFor(
+      (messages) => messages.find((message) => message.event === 'chat.done'),
+    )
+    check('the turn reports chat.done', done?.event === 'chat.done')
+    check('chat.done names its turn', done?.data?.turn === 'turn-1')
+    check('chat.done carries the answer', done?.data?.text === 'hello from the mock')
+    const streamed = chat
+      .messages()
+      .filter((message) => message.event === 'chat.delta' && message.data?.turn === 'turn-1')
+      .map((message) => message.data.text)
+      .join('')
+    check('the answer streamed as it was produced', streamed === 'hello from the mock', streamed)
+
+    // A rejected prompt is still a turn: the provider's status is classified.
+    chat.request('c-5', 'chat.send', { params: { prompt: 'refuse this' } })
+    const rejected = await chat.waitFor((messages) => byId(messages, 'c-5'))
+    check('a rejected prompt is accepted as a turn', rejected?.result?.turn === 'turn-2')
+    const failed = await chat.waitFor((messages) =>
+      messages.find(
+        (message) => message.event === 'chat.failed' && message.data?.turn === 'turn-2',
+      ),
+    )
+    check('a rejected turn reports chat.failed', failed?.event === 'chat.failed')
+    check(
+      'the failure keeps the code the page branches on',
+      failed?.data?.error?.code === 'chat_unauthorized',
+      failed?.data?.error?.code,
+    )
+    check(
+      'the failure quotes the provider',
+      (failed?.data?.error?.message ?? '').includes('bad key'),
+    )
+    check(
+      'a failed turn streams no answer',
+      chat
+        .messages()
+        .every((message) => message.event !== 'chat.delta' || message.data?.turn !== 'turn-2'),
+    )
+
+    // One turn at a time: a prompt that arrives mid-turn is refused, not queued.
+    chat.request('c-6', 'chat.send', { params: { prompt: 'slow please' } })
+    const slow = await chat.waitFor((messages) => byId(messages, 'c-6'))
+    check('a slow turn is accepted', slow?.result?.turn === 'turn-3')
+
+    chat.request('c-7', 'chat.send', { params: { prompt: 'and another' } })
+    const busy = await chat.waitFor((messages) => byId(messages, 'c-7'))
+    check(
+      'a prompt that arrives mid-turn is refused',
+      busy?.ok === false && busy?.error?.code === 'chat_busy',
+      busy?.error?.code,
+    )
+    const slowDone = await chat.waitFor(
+      (messages) =>
+        messages.find((message) => message.event === 'chat.done' && message.data?.turn === 'turn-3'),
+      8000,
+    )
+    check('the turn that was already running still finishes', slowDone?.data?.text === 'hello from the mock')
+
+    // A page that reloaded asks for the conversation instead of losing it.
+    chat.request('c-8', 'chat.history')
+    const history = await chat.waitFor((messages) => byId(messages, 'c-8'))
+    check('chat.history answers', history?.ok === true)
+    const turns = history?.result?.turns ?? []
+    check('chat.history keeps every turn', turns.length === 3, JSON.stringify(turns.map((turn) => turn.turn)))
+    check('a kept turn keeps the prompt that was typed', turns[0]?.prompt === 'say hello')
+    check('a kept turn keeps the events it arrived as', turns[0]?.events?.some((event) => event.event === 'chat.done'))
+    check('a finished turn reads back as done', turns[0]?.status === 'done')
+    check('a failed turn reads back as failed', turns[1]?.status === 'failed')
+    check(
+      'a failed turn keeps the code the page branches on',
+      turns[1]?.error?.code === 'chat_unauthorized',
+      turns[1]?.error?.code,
+    )
+
+    const lines = chat.stdout.filter((line) => line.trim() !== '')
+    check(
+      'chat output is protocol only',
+      lines.every((line) => ['request', 'response', 'event', 'error'].includes(JSON.parse(line).type)),
+    )
+    check(
+      'chat events never carry a request id',
+      chat
+        .messages()
+        .filter((message) => message.type === 'event')
+        .every((message) => message.request_id === undefined),
+    )
+    check(
+      'every chat event is an event and each names a turn',
+      chat
+        .messages()
+        .filter((message) => String(message.event ?? '').startsWith('chat.'))
+        .every((message) => message.type === 'event' && typeof message.data?.turn === 'string'),
+    )
+  } finally {
+    await chat.stop()
+    rmSync(mock, { recursive: true, force: true })
+    model.close()
   }
 
   console.log('')

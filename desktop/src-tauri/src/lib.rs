@@ -7,6 +7,7 @@
 mod commands;
 mod paths;
 mod projects;
+mod provider;
 mod protocol;
 mod runtime;
 mod state;
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Manager, RunEvent};
 
 use projects::ProjectsStore;
+use provider::ProviderStore;
 use runtime::RuntimeManager;
 
 /// Set once the exit cleanup has been scheduled, so a second close request
@@ -40,7 +42,17 @@ pub fn run() {
             })?;
             app.manage(projects.clone());
 
-            let manager = RuntimeManager::new(app.handle().clone(), projects);
+            // The runtime's environment comes from this store, so it is opened
+            // with the same care and before anything can start a child.
+            let provider = ProviderStore::new(app.handle()).map_err(|error| {
+                format!(
+                    "could not open the provider settings: {}: {}",
+                    error.code, error.message
+                )
+            })?;
+            app.manage(provider.clone());
+
+            let manager = RuntimeManager::new(app.handle().clone(), projects, provider);
             app.manage(manager.clone());
 
             // The host starts the runtime, not the page: the UI never names a
@@ -62,10 +74,14 @@ pub fn run() {
             commands::runtime_ping,
             commands::runtime_logs,
             commands::runtime_host_info,
+            commands::chat_send,
+            commands::chat_history,
             commands::projects_list,
             commands::projects_pick,
             commands::projects_select,
             commands::projects_remove,
+            commands::provider_get,
+            commands::provider_save,
         ])
         .build(tauri::generate_context!())
         .expect("could not build the desktop shell")

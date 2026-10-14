@@ -2,6 +2,7 @@
 import { Bot, ListChecks, Users } from '@lucide/vue'
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 
+import ProviderSettingsCard from '@/components/ProviderSettingsCard.vue'
 import RuntimeActions from '@/components/RuntimeActions.vue'
 import RuntimeLogPanel from '@/components/RuntimeLogPanel.vue'
 import RuntimeStatusCard from '@/components/RuntimeStatusCard.vue'
@@ -43,7 +44,7 @@ const LATER = [
       <h1 class="mt-1 text-xl font-semibold tracking-tight">运行时与宿主</h1>
       <p class="mt-1 max-w-2xl text-sm text-ink-muted">
         桌面外壳启动并托管 rust-agent Runtime 子进程，通过 JSON Lines 在 stdin/stdout
-        上通信。这里只展示宿主与 Runtime 真实上报的内容，不做任何推断。
+        上通信。这里展示宿主与 Runtime 真实上报的内容，改动也一律交给宿主执行，不做任何推断。
       </p>
       <p class="mt-2 font-mono text-xs text-ink-faint">
         平台 {{ runtime.hostInfo?.os ?? 'unknown' }} / {{ runtime.hostInfo?.arch ?? 'unknown' }}
@@ -51,6 +52,8 @@ const LATER = [
         <span v-if="runtime.hostInfo"> · 应用 v{{ runtime.hostInfo.appVersion }}</span>
       </p>
     </header>
+
+    <ProviderSettingsCard class="mb-5" />
 
     <div class="grid grid-cols-1 gap-5 xl:grid-cols-2">
       <div class="flex flex-col gap-5">

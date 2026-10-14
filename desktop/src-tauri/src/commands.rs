@@ -4,11 +4,13 @@
 //! paths or commands from the caller, and returns a coded error. If the
 //! frontend can reach a capability, it is here, and it is this short.
 
+use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::paths;
 use crate::projects::{ProjectList, ProjectsStore};
+use crate::provider::{ProviderInput, ProviderSettings, ProviderStore};
 use crate::runtime::RuntimeManager;
 use crate::state::{HostError, HostInfo, LogLine, Ping, Status, PROTOCOL_VERSION};
 
@@ -40,6 +42,29 @@ pub async fn runtime_restart(manager: State<'_, RuntimeManager>) -> Result<Statu
 #[tauri::command]
 pub async fn runtime_ping(manager: State<'_, RuntimeManager>) -> Result<Ping, HostError> {
     manager.ping().await
+}
+
+/// Send one prompt to the runtime.
+///
+/// The prompt is the only thing the page may choose here: the workspace, the
+/// model, and the credentials are all decided on this side. The answer streams
+/// back as `chat.*` events, so this returns as soon as the turn is accepted.
+#[tauri::command]
+pub async fn chat_send(
+    prompt: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_send(&prompt).await
+}
+
+/// The conversation the runtime is holding.
+///
+/// A page that reloaded asks for this instead of losing what it was only ever a
+/// view of. The page still names nothing: the turns come from the runtime this
+/// host started, in the workspace this host chose.
+#[tauri::command]
+pub async fn chat_history(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.chat_history().await
 }
 
 /// The most recent log lines, oldest first.
@@ -86,7 +111,7 @@ pub async fn projects_pick(
     })?;
 
     let list = projects.add(&path).await?;
-    resync_workspace(&manager).await;
+    resync_runtime(&manager).await;
     Ok(Some(list))
 }
 
@@ -98,7 +123,7 @@ pub async fn projects_select(
     manager: State<'_, RuntimeManager>,
 ) -> Result<ProjectList, HostError> {
     let list = projects.select(&id).await?;
-    resync_workspace(&manager).await;
+    resync_runtime(&manager).await;
     Ok(list)
 }
 
@@ -110,19 +135,40 @@ pub async fn projects_remove(
     manager: State<'_, RuntimeManager>,
 ) -> Result<ProjectList, HostError> {
     let list = projects.remove(&id).await?;
-    resync_workspace(&manager).await;
+    resync_runtime(&manager).await;
     Ok(list)
 }
 
-/// Point a live runtime at the newly active project.
+/// Point a live runtime at the change that was just made.
 ///
-/// A restart that fails is already recorded in the runtime status and pushed to
-/// the UI from there, and it does not undo the project change, so it is not an
-/// error here: the list the caller asked for is still valid.
-async fn resync_workspace(manager: &RuntimeManager) {
-    if let Err(error) = manager.apply_workspace_change().await {
+/// The workspace and the environment are both decided when the child is
+/// spawned, so a project or a credential only takes effect in a new process. A
+/// restart that fails is already recorded in the runtime status and pushed to
+/// the UI from there, and it does not undo the change, so it is not an error
+/// here: what the caller asked for is still stored and still valid.
+async fn resync_runtime(manager: &RuntimeManager) {
+    if let Err(error) = manager.apply_change().await {
         eprintln!("rust-agent-desktop: {}", error.message);
     }
+}
+
+/// The model settings the runtime will be started with.
+#[tauri::command]
+pub async fn provider_get(provider: State<'_, ProviderStore>) -> Result<ProviderSettings, HostError> {
+    Ok(provider.snapshot().await)
+}
+
+/// Store the settings the user saved. The API key is write-only: whatever is
+/// sent here is never sent back to the page.
+#[tauri::command]
+pub async fn provider_save(
+    settings: ProviderInput,
+    provider: State<'_, ProviderStore>,
+    manager: State<'_, RuntimeManager>,
+) -> Result<ProviderSettings, HostError> {
+    let saved = provider.save(settings).await?;
+    resync_runtime(&manager).await;
+    Ok(saved)
 }
 
 /// Facts about the shell: versions, platform, workspace, and where the runtime

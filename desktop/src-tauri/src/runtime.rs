@@ -23,11 +23,13 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::paths;
 use crate::projects::ProjectsStore;
 use crate::protocol::{self, Inbound};
+use crate::provider::ProviderStore;
 use crate::state::{self, HostError, LogLevel, LogLine, Ping, State, Status, PROTOCOL_VERSION};
 
 /// Event names the frontend subscribes to.
 pub const EVENT_STATUS: &str = "runtime://status";
 pub const EVENT_MESSAGE: &str = "runtime://message";
+pub const EVENT_CHAT: &str = "runtime://chat";
 pub const EVENT_LOG: &str = "runtime://log";
 
 /// Longest single line the host will buffer from the runtime.
@@ -35,6 +37,13 @@ const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// How long one request may take before the caller is told it failed.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the runtime may take to accept a prompt. It answers before the turn
+/// runs, so this only covers reading the settings and building the agent.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest prompt the host will send, in bytes.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// How long `runtime.ready` may take after the process starts.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,14 +96,17 @@ pub struct RuntimeManager {
     app: AppHandle,
     /// Where the workspace comes from, and what the runtime runs in.
     projects: ProjectsStore,
+    /// The environment the runtime is started with.
+    provider: ProviderStore,
     inner: Arc<Mutex<Core>>,
 }
 
 impl RuntimeManager {
-    pub fn new(app: AppHandle, projects: ProjectsStore) -> Self {
+    pub fn new(app: AppHandle, projects: ProjectsStore, provider: ProviderStore) -> Self {
         RuntimeManager {
             app,
             projects,
+            provider,
             inner: Arc::new(Mutex::new(Core {
                 child: None,
                 writer: None,
@@ -139,6 +151,10 @@ impl RuntimeManager {
     async fn try_start(&self) -> Result<Status, HostError> {
         let bridge = paths::resolve_bridge()?;
         let workspace = self.workspace().await?;
+        // Read once per start, before the lock, so the environment a child gets
+        // is one snapshot of the store rather than a value that moves underneath
+        // it.
+        let env = self.provider.env().await;
 
         let (pid, generation) = {
             let mut core = self.inner.lock().await;
@@ -159,11 +175,23 @@ impl RuntimeManager {
             command
                 .arg("--workspace")
                 .arg(&workspace)
+                // The runtime's working directory is the workspace it was given,
+                // so the system prompt it builds from the current directory, and
+                // any relative path inside a tool, agree with the project the UI
+                // shows as active.
+                .current_dir(&workspace)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 // Insurance against an orphan if this process dies abruptly.
                 .kill_on_drop(true);
+            // What the user saved in Settings becomes this child's environment.
+            // A variable the store has nothing for is not set at all, which
+            // leaves the runtime's own default and any `.env` in the workspace
+            // intact.
+            for (key, value) in &env {
+                command.env(key, value);
+            }
             #[cfg(windows)]
             {
                 // Do not flash a console window for a GUI-launched process.
@@ -351,6 +379,35 @@ impl RuntimeManager {
         self.start().await
     }
 
+    /// Hand one prompt to the runtime.
+    ///
+    /// The turn itself comes back as `chat.*` events on [`EVENT_CHAT`]; this
+    /// returns as soon as the runtime has accepted it, so the page can show the
+    /// prompt without waiting for an answer that may take minutes.
+    pub async fn chat_send(&self, prompt: &str) -> Result<Value, HostError> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(HostError::new("empty_prompt", "a prompt cannot be empty"));
+        }
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err(HostError::new(
+                "prompt_too_long",
+                format!("a prompt cannot be longer than {MAX_PROMPT_BYTES} bytes"),
+            ));
+        }
+        self.request("chat.send", json!({ "prompt": prompt }), CHAT_TIMEOUT)
+            .await
+    }
+
+    /// The turns the runtime has reported so far.
+    ///
+    /// A reloaded page asks for this instead of losing the conversation, which
+    /// it was only ever a view of: reloading the window does not restart the
+    /// runtime, so the turns are still there to be read.
+    pub async fn chat_history(&self) -> Result<Value, HostError> {
+        self.request("chat.history", json!({}), CHAT_TIMEOUT).await
+    }
+
     /// The folder the runtime is started in: the active project when the user
     /// has chosen one, otherwise the per-user workspace.
     ///
@@ -368,12 +425,13 @@ impl RuntimeManager {
         }
     }
 
-    /// Apply a change to the active project.
+    /// Apply a change the runtime can only see in a new process.
     ///
-    /// A live runtime is restarted so it picks up the new workspace; a stopped
-    /// one is left stopped, because choosing a project is not a request to
-    /// start a runtime. Returns the new status when a restart happened.
-    pub async fn apply_workspace_change(&self) -> Result<Option<Status>, HostError> {
+    /// The workspace and the environment are both decided at spawn, so a live
+    /// runtime is restarted to pick them up; a stopped one is left stopped,
+    /// because choosing a project or saving a setting is not a request to start
+    /// a runtime. Returns the new status when a restart happened.
+    pub async fn apply_change(&self) -> Result<Option<Status>, HostError> {
         let live = matches!(self.status().await.state, State::Starting | State::Ready);
         if !live {
             return Ok(None);
@@ -665,6 +723,7 @@ impl RuntimeManager {
         let mut statuses: Vec<Status> = Vec::new();
         let mut logs: Vec<LogLine> = Vec::new();
         let mut messages: Vec<Value> = Vec::new();
+        let mut chats: Vec<Value> = Vec::new();
 
         {
             let mut core = self.inner.lock().await;
@@ -708,6 +767,10 @@ impl RuntimeManager {
                     event, ts, data, ..
                 } => {
                     let ts = ts.unwrap_or_else(state::now);
+                    // A turn's progress is not runtime lifecycle: it goes on its
+                    // own channel so a streaming answer cannot push the status
+                    // panel's short event ring out from under it.
+                    let is_chat = event.starts_with("chat.");
                     match event.as_str() {
                         "runtime.ready" => {
                             if let Some(pid) = data.get("pid").and_then(Value::as_u64) {
@@ -727,7 +790,12 @@ impl RuntimeManager {
                         }
                         _ => {}
                     }
-                    messages.push(json!({ "event": event, "ts": ts, "data": data }));
+                    let payload = json!({ "event": event, "ts": ts, "data": data });
+                    if is_chat {
+                        chats.push(payload);
+                    } else {
+                        messages.push(payload);
+                    }
                 }
                 Inbound::Error { ts, error, .. } => {
                     logs.push(LogLine {
@@ -755,6 +823,9 @@ impl RuntimeManager {
         }
         for message in messages {
             let _ = self.app.emit(EVENT_MESSAGE, &message);
+        }
+        for message in chats {
+            let _ = self.app.emit(EVENT_CHAT, &message);
         }
     }
 }

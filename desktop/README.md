@@ -96,32 +96,103 @@ uses the per-user app data workspace as before.
   mutations refuse until the file is dealt with, so a parse bug cannot eat the
   list.
 
+## Model settings
+
+The Settings page is where the endpoint, the API key, and the model are entered
+(`src/components/ProviderSettingsCard.vue`, host side
+`src-tauri/src/provider.rs`). The runtime reads all of it from its process
+environment, so the shell owns the environment of the child it starts:
+
+- A save writes `provider.json` under the app data directory, and the next
+  spawn sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `MODEL_ID`,
+  `FALLBACK_MODEL_ID`, and `MAX_TOKENS` from it. A field left empty is not set
+  at all, so the runtime's own default applies instead of a frozen copy of it.
+- The key is write-only. The page can store one, clear one, and ask whether one
+  is stored; `provider_get` answers with `hasKey` and the last four characters,
+  never the value. On Unix the file is written `0600`.
+- Saving while the runtime is live restarts it, because the environment only
+  exists per process. Saving while it is stopped starts nothing: a settings
+  change, like choosing a project, is not a request to run anything.
+- A `provider.json` this build cannot read is reported and never rewritten,
+  exactly like the project list.
+- The runtime also reads a `.env` in its workspace, the way its other binaries
+  read one from their working directory. `dotenvy` never overwrites a variable
+  that is already set, so what Settings saved wins and a project's `.env` fills
+  in only what is still missing: a project cannot silently redirect a runtime
+  the UI believes it configured.
+
+## Chat
+
+The Chat page drives the same `Agent` loop the CLI does, through the bridge
+rather than around it (`ChatView.vue` -> `stores/chat.ts` -> `lib/chat`). One
+prompt is one turn: the store pushes a pending turn, the bridge accepts it and
+answers with the turn id, and the turn's `chat.*` events are folded back onto
+that turn as they arrive. The turn id can arrive after the first delta, so a
+turn the store cannot match by id falls back to the one prompt that is pending.
+
+The runtime is what holds the conversation, so the page only ever renders it. A
+reloaded window is a new page but not a new conversation: the page reads the
+turns back with `chat.history` and replays each through the folding the live
+events go through, so a reload in the middle of an answer picks it up where it
+was. An event that arrives before the turn it names is held rather than dropped,
+for the same reason. Restarting the runtime -- or choosing another project,
+which restarts it -- does end the conversation, and the page follows by reading
+an empty history rather than keeping a transcript of a runtime that is gone.
+
+- The agent is built on the first prompt, not at startup, so a runtime with no
+  model configured still starts and still answers for itself. A prompt sent
+  before one is configured is refused with `chat_not_configured`, before it
+  takes the one-turn slot, so a refusal never blocks a later prompt.
+- A turn is non-interactive. There is no terminal behind the window, so a call
+  the permission policy would have asked about is denied with a reason and
+  shown as `chat.blocked` rather than blocking on an approval nobody can give.
+- A failed turn is rolled back: the half exchange is dropped rather than left
+  for the next prompt to trip over. The failure carries a code the page branches
+  on and the provider's own words.
+- The loop keeps its history for the life of the runtime process, and a `task`
+  call's subagent reports its tool calls but not its prose -- that prose is the
+  `task` tool's result to the model, not an answer to the user.
+- Work the runtime does after the turn's answer (`memory.after_turn` and the
+  like) is not streamed: the turn is over by the time it runs. It still lands in
+  the workspace's own stores.
+
 ## How the pieces fit
 
 ```
-Vue view  ->  Pinia store  ->  lib/runtime + lib/projects (the two seams)
+Vue view  ->  Pinia store  ->  lib/runtime + lib/projects + lib/provider + lib/chat
           ->  Tauri command (commands.rs)
           ->  RuntimeManager (runtime.rs)  ->  child process stdin
 child stdout  ->  reader task  ->  status + events  ->  emit  ->  store  ->  view
 ```
 
-**Frontend services** (`src/lib/runtime/index.ts`, `src/lib/projects/index.ts`)
-are the only modules that import `@tauri-apps/api`, and `src/lib/shell.ts` holds
-the one guard they share. The runtime seam exposes `getRuntimeStatus`,
+**Frontend services** (`src/lib/runtime/index.ts`, `src/lib/projects/index.ts`,
+`src/lib/provider/index.ts`, `src/lib/chat/index.ts`) are the only modules that
+import `@tauri-apps/api`, and `src/lib/shell.ts` holds the one guard they
+share. The runtime seam exposes `getRuntimeStatus`,
 `startRuntime`, `stopRuntime`, `restartRuntime`, `pingRuntime`,
 `getRuntimeLogs`, `getHostInfo`, `subscribeRuntimeEvents`, and
 `unsubscribeRuntimeEvents`. The projects seam exposes `listProjects`,
-`pickProject`, `selectProject`, and `removeProject`.
+`pickProject`, `selectProject`, and `removeProject`. The provider seam exposes
+`getProviderSettings` and `saveProviderSettings`. The chat seam exposes
+`sendChatPrompt`, `subscribeChatEvents`, and `fetchChatHistory`; a prompt is the
+one thing the page chooses there, and the answer arrives on the events rather
+than the command.
 
 **Host commands** (`src-tauri/src/commands.rs`) are thin wrappers:
 `runtime_status`, `runtime_start`, `runtime_stop`, `runtime_restart`,
 `runtime_ping`, `runtime_logs`, `runtime_host_info`, `projects_list`,
-`projects_pick`, `projects_select`, `projects_remove`. None of them takes a
-path, a binary, or a command line from the caller, and the two projects commands
-that name a project take an id the host itself handed out.
+`projects_pick`, `projects_select`, `projects_remove`, `provider_get`,
+`provider_save`, `chat_send`, and `chat_history`. None of them takes a path, a
+binary, or a command line from the caller, and the projects commands that name a
+project take an id the host itself handed out. `provider_save` is the one
+command that takes a secret in -- and its answer still does not contain one.
+`chat_send` takes the prompt text and nothing else; the workspace, the model,
+and the credentials are all decided in the host.
 
-**Host events** are `runtime://status`, `runtime://message`, and `runtime://log`.
-Status is pushed on every state change; the page never polls and never infers.
+**Host events** are `runtime://status`, `runtime://message`, `runtime://log`,
+and `runtime://chat`. Status is pushed on every state change; the page never
+polls and never infers. A turn streams on `runtime://chat` alone, kept apart
+from the status ring so a long answer cannot flush a state change out of it.
 
 **Where the binary comes from** (`src-tauri/src/paths.rs`) is decided in exactly
 one place, in this order: `RUST_AGENT_BRIDGE` (debug builds only), the bundled
@@ -162,10 +233,46 @@ Unattributable failure, when there is no request to blame:
 {"protocol_version":1,"type":"error","ts":"...","error":{"code":"invalid_json","message":"..."}}
 ```
 
-Methods in phase 1: `runtime.status` (a full snapshot), `runtime.ping`, and
-`runtime.shutdown`. Error codes: `invalid_json`, `invalid_utf8`,
-`invalid_request`, `invalid_params`, `message_too_large`, `unknown_method`,
-`unsupported_protocol_version`.
+Methods: `runtime.status` (a full snapshot), `runtime.ping`, `runtime.shutdown`,
+`chat.send`, and `chat.history`. `chat.send` is the only one that takes
+parameters -- the others refuse any key at all, so a host that thinks it is
+talking to a newer bridge finds out at once. Its request carries the prompt and
+nothing else:
+
+```json
+{"protocol_version":1,"type":"request","request_id":"host-9","method":"chat.send","params":{"prompt":"summarise the workspace"}}
+```
+
+It answers as soon as the turn is accepted, naming the turn every event of that
+prompt will carry:
+
+```json
+{"protocol_version":1,"type":"response","request_id":"host-9","ok":true,"result":{"accepted":true,"turn":"turn-1"}}
+```
+
+The turn itself arrives as events, each tagged with its `turn` and its `source`
+(`main` for the conversation, `subagent` for a `task` call's own loop):
+`chat.delta` (the answer, as it is produced), `chat.tool_call`,
+`chat.tool_result`, `chat.blocked` (a permission-sensitive call refused because
+there is no terminal to approve it), `chat.notice` (progress that is not an
+answer -- compaction, memory, recovery, cron), and finally exactly one of
+`chat.done` (with the whole answer) or `chat.failed` (with an `error`).
+
+`chat.history` takes no parameters and answers with the turns reported so far,
+oldest first. Each one carries the prompt as it was typed, its status (`running`,
+`done` or `failed`), the code and the provider's words when it failed, and the
+very events it arrived as -- so a page can render a conversation it did not
+watch. The log is bounded: oldest turns go first once it outgrows 50 turns or
+4 MiB, and a turn that is still running is never dropped.
+
+Request error codes: `invalid_json`, `invalid_utf8`, `invalid_request`,
+`invalid_params`, `message_too_large`, `unknown_method`,
+`unsupported_protocol_version`. A turn that failed reports its own code on
+`chat.failed`, so the page can branch on it: `chat_busy`,
+`chat_not_configured`, `chat_unauthorized`, `chat_rate_limited`,
+`chat_api_error`, `chat_step_limit`, `chat_recovery_failed`, `chat_turn_failed`.
+Only one turn runs at a time: a second prompt sent while one is in flight is
+refused with `chat_busy` rather than queued.
 
 Framing rules the host enforces: a response with an unknown `request_id` is
 logged, not applied; every in-flight request fails with a reason when the child
@@ -202,10 +309,12 @@ cd desktop/src-tauri && cargo test --all-targets
 
 Measured on Windows 11, `x86_64-pc-windows-msvc`, 2026-10-14:
 
-- `cargo test --all-targets`: 191 passed / 0 failed, plus 15 for the bridge.
-- `desktop/src-tauri` `cargo test --all-targets`: 29 passed / 0 failed.
-- `node scripts/desktop-bridge-smoke.mjs`: 30 of 30 checks passed against the
-  built binary (framing, ids, errors, stdout purity, clean shutdown).
+- `cargo test --all-targets`: 191 passed / 0 failed, plus 28 for the bridge.
+- `desktop/src-tauri` `cargo test --all-targets`: 41 passed / 0 failed.
+- `node scripts/desktop-bridge-smoke.mjs`: 66 of 66 checks passed against the
+  built binary (framing, ids, errors, stdout purity, clean shutdown, the
+  workspace `.env` precedence, and a full chat turn driven against a local HTTP
+  stand-in for the model, read back afterwards through `chat.history`).
 - `pnpm typecheck` and `pnpm build`: clean.
 - `pnpm app:build`: builds both bundles, and leaves a runnable layout in
   `src-tauri/target/release/` -- the app next to its sidecar, so it can be run
@@ -230,6 +339,21 @@ exercised in a real window yet. What is covered: `projects.rs` unit tests,
 `cargo check --all-targets`, `pnpm typecheck`, and `pnpm build`. Still to check
 by hand: opening the picker, adding and removing a project, and watching a live
 runtime move workspace when another project is chosen.
+
+The Settings form came after that pass too. What is covered: `provider.rs` unit
+tests (the store, its validation, the write-only key, and the environment it
+produces), `pnpm typecheck`, `pnpm build`, and the smoke test for the workspace
+`.env` precedence. Still to check by hand: typing into the form, saving a key,
+clearing it, and watching a live runtime restart into the new environment.
+
+The Chat page and the `chat.send` method came after that pass as well. What is
+covered: the bridge's `chat.*` unit tests, a full turn in the smoke test against
+a local HTTP stand-in for the model (streamed deltas, a tool call, a failure
+with a code, a prompt refused mid-turn, and the same turn read back through
+`chat.history`), `pnpm typecheck`, and `pnpm build`. Still to check by hand:
+typing a prompt into a real window and watching it stream, reloading the window
+mid-answer and watching the transcript come back, and the Settings-key flow that
+makes a prompt runnable at all.
 
 ## Platform status
 
@@ -260,12 +384,13 @@ What is cross-platform by construction, and what is not:
 
 ## Not in this phase
 
-The chat page is a placeholder, and honestly so: protocol v1 answers
-`runtime.status`, `runtime.ping`, and `runtime.shutdown`, and nothing takes a
-prompt. So the page lists those methods -- read from the runtime's own snapshot,
-not hard-coded -- and shows a disabled composer instead of a fake conversation.
-A real chat is a bridge method that accepts a prompt and streams the model's
-answer back as events.
+The chat is real but not yet finished. It runs one turn at a time and has no way
+to cancel one: a prompt that is running will finish, and the page can only wait
+for `chat.done` or `chat.failed`. The conversation is held in memory for the
+life of the runtime process: a reloaded window reads it back, but a restart --
+or choosing another project, which restarts the runtime -- starts a new one,
+and nothing is written to disk. There is no session picker. A turn's after-work
+(the debounced memory pass) is not streamed back.
 
 Departments, agents, group chat, task claiming, delivery, and acceptance are
 next. `runtime.status` already reports skills, tasks, memory, and cron counts,

@@ -103,6 +103,7 @@ it.)
 | `src/config.rs` | Environment configuration |
 | `src/main.rs` | Interactive REPL |
 | `src/bin/tui.rs` | Experimental `ratatui` TUI front-end over the same agent |
+| `src/bin/desktop_bridge.rs` | JSON Lines bridge the Tauri desktop shell drives (`desktop/README.md`) |
 | `src/ui.rs` | Pure render helpers for the TUI (`Entry`, `Theme`, layout, wrapping) |
 
 ## Mapping to `learn-claude-code`
@@ -664,6 +665,24 @@ a finished background command starts its own turn -- which is how a deferred
 goal is judged as soon as its evidence arrives. `--demo` swaps in a scripted mock
 model (it answers the goal evaluator too), so the UI, the permission gate, and
 the goal loop can all be exercised without an API key.
+
+## Desktop shell
+
+```sh
+cd desktop
+pnpm install
+pnpm app:dev        # a Tauri 2 + Vue 3 window over this same runtime
+```
+
+`desktop/` hosts this crate as a child process over a JSON Lines bridge
+(`src/bin/desktop_bridge.rs`) rather than reimplementing the agent: it decides
+nothing the runtime already knows. The Settings page writes the endpoint, the
+API key, and the model into a host-owned `provider.json`, and the shell hands
+them to the runtime as environment variables when it spawns it. The Chat page
+drives the same agent loop: it sends a prompt as `chat.send` and renders the
+turn the runtime streams back as `chat.*` events, re-reading them with
+`chat.history` when the window is reloaded. Protocol revision, layout, and
+platform status live in `desktop/README.md`.
 
 ## Embedding
 

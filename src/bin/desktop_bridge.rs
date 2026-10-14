@@ -5,24 +5,34 @@
 //! nothing else -- every diagnostic goes to `stderr` as one JSON object per
 //! line, so a host can parse either stream without guessing.
 //!
-//! Phase 1 answers three methods -- `runtime.status`, `runtime.ping`, and
-//! `runtime.shutdown` -- and builds its snapshot from the runtime's own stores
-//! (`SkillLoader`, `TaskStore`, `CronScheduler`, `MemoryStore`). It never
-//! constructs an `Agent`, so it starts without model credentials and does not
-//! duplicate the agent loop.
+//! It answers three methods about itself -- `runtime.status`, `runtime.ping`,
+//! and `runtime.shutdown` -- building the snapshot from the runtime's own stores
+//! (`SkillLoader`, `TaskStore`, `CronScheduler`, `MemoryStore`), and two methods
+//! that do work: `chat.send` runs a prompt through the same `Agent` loop the CLI
+//! drives and reports the turn as `chat.*` events while it happens, and
+//! `chat.history` hands those turns back, so a page that reloaded reads the
+//! conversation it was only ever a view of instead of losing it.
+//!
+//! The agent is built on the first prompt, not at startup, so a workspace with
+//! no model credentials still starts and still answers for itself.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use rust_agent::agent::{AgentEvent, AgentObserver};
+use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
-    last_run, Config, CronScheduler, MemoryStore, SkillLoader, TaskStatus, TaskStore,
-    MAILBOXES_DIR, WORKFLOWS_DIR,
+    default_system_prompt, last_run, Agent, AnthropicClient, CompactConfig, Config, CronScheduler,
+    Error, LlmClient, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role, SkillLoader,
+    TaskStatus, TaskStore, ToolRegistry, CRON_PROMPT, MAILBOXES_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
 };
 
 /// Wire revision of the protocol. Bumped whenever a message shape changes.
@@ -32,7 +42,19 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Every method this build answers, in the order we advertise them.
-const METHODS: [&str; 3] = ["runtime.status", "runtime.ping", "runtime.shutdown"];
+const METHODS: [&str; 5] = [
+    "runtime.status",
+    "runtime.ping",
+    "runtime.shutdown",
+    "chat.send",
+    "chat.history",
+];
+
+/// The one method that takes parameters. Everything else refuses them, so a
+/// host that thinks it is talking to a newer bridge finds out at once.
+fn takes_params(method: &str) -> bool {
+    method == "chat.send"
+}
 
 /// Exit codes, so the host can tell a bad invocation from a broken pipe.
 const EXIT_OK: i32 = 0;
@@ -96,7 +118,7 @@ const UNKNOWN_METHOD: &str = "unknown_method";
 const UNSUPPORTED_PROTOCOL_VERSION: &str = "unsupported_protocol_version";
 
 /// A stable machine-readable failure, plus prose for a human log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ProtocolError {
     code: String,
     message: String,
@@ -215,15 +237,18 @@ fn parse_request(line: &str) -> Parsed {
         return reject(INVALID_PARAMS, "params must be a JSON object".to_string());
     }
 
-    // No phase-1 method takes arguments. Refusing unknown keys beats silently
-    // ignoring a host that thinks it is talking to a newer bridge.
-    if let Some(map) = params.as_object() {
-        if !map.is_empty() {
-            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
-            return reject(
-                INVALID_PARAMS,
-                format!("`{method}` takes no parameters; got {}", keys.join(", ")),
-            );
+    // Only `chat.send` takes arguments. Refusing unknown keys on every other
+    // method beats silently ignoring a host that thinks it is talking to a
+    // newer bridge.
+    if !takes_params(&method) {
+        if let Some(map) = params.as_object() {
+            if !map.is_empty() {
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                return reject(
+                    INVALID_PARAMS,
+                    format!("`{method}` takes no parameters; got {}", keys.join(", ")),
+                );
+            }
         }
     }
 
@@ -295,7 +320,7 @@ impl ErrorMessage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct EventMessage {
     protocol_version: u32,
     #[serde(rename = "type")]
@@ -320,6 +345,16 @@ fn write_message<W: Write, M: Serialize>(out: &mut W, message: &M) -> io::Result
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     out.flush()
+}
+
+/// Write one protocol message to stdout.
+///
+/// The lock is taken per message rather than once for the process, because the
+/// reader loop and whichever turn is running both report on stdout; holding it
+/// for the loop's lifetime would block every turn's first event. `Stdout::lock`
+/// is reentrant, so two threads can never interleave inside one line.
+fn send<M: Serialize>(message: &M) -> io::Result<()> {
+    write_message(&mut io::stdout().lock(), message)
 }
 // ---------------------------------------------------------------------------
 // The bridge itself
@@ -352,7 +387,8 @@ impl Bridge {
             Err(error) => warnings.push(format!("cron: {error}")),
         }
 
-        // The model is only reported, never used: phase 1 never calls out.
+        // Read once, at startup, so the snapshot and a later turn agree on what
+        // this process was configured with.
         let (model, config_error) = match Config::from_env() {
             Ok(config) => (Some(config.model), None),
             Err(error) => (None, Some(error.to_string())),
@@ -370,7 +406,7 @@ impl Bridge {
         if let Some(error) = &bridge.config_error {
             log(
                 Level::Warn,
-                format!("no model configured (phase 1 does not need one): {error}"),
+                format!("no model configured; `chat.send` will refuse until one is: {error}"),
             );
         }
         bridge
@@ -463,7 +499,12 @@ struct Turn {
     shutdown: bool,
 }
 
-fn dispatch(request: &Request, bridge: &Bridge) -> Turn {
+fn dispatch(
+    request: &Request,
+    bridge: &Bridge,
+    chat: &Arc<Chat>,
+    handle: &tokio::runtime::Handle,
+) -> Turn {
     match request.method.as_str() {
         "runtime.ping" => Turn {
             response: Response::ok(&request.request_id, bridge.ping()),
@@ -476,6 +517,11 @@ fn dispatch(request: &Request, bridge: &Bridge) -> Turn {
         "runtime.shutdown" => Turn {
             response: Response::ok(&request.request_id, json!({ "stopping": true })),
             shutdown: true,
+        },
+        "chat.send" => accept_chat(request, chat, handle),
+        "chat.history" => Turn {
+            response: Response::ok(&request.request_id, chat.log.snapshot()),
+            shutdown: false,
         },
         other => Turn {
             response: Response::failed(
@@ -497,6 +543,607 @@ fn dispatch(request: &Request, bridge: &Bridge) -> Turn {
 // stdin framing
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+/// Longest prompt the bridge accepts, in bytes.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
+
+/// Longest run of tool output echoed back to the host, in bytes. One `bash`
+/// call can print megabytes, and the host drops a line it cannot frame.
+const MAX_EVENT_TEXT_BYTES: usize = 8 * 1024;
+
+/// How much of the conversation is kept for a page that asks for it again.
+/// Oldest turns go first, and a turn that is still running is never dropped.
+const MAX_LOG_TURNS: usize = 50;
+const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+
+/// Codes this section adds to the protocol.
+const CHAT_BUSY: &str = "chat_busy";
+const CHAT_NOT_CONFIGURED: &str = "chat_not_configured";
+
+/// Which turn the shared observer should attribute its events to.
+///
+/// The loop is built once and keeps its history across prompts, so its observer
+/// outlives any one turn. This is the one value the observer reads when an event
+/// happens instead of when it is built. Only one turn runs at a time, so a plain
+/// mutex is enough.
+#[derive(Default)]
+struct TurnTag(Mutex<String>);
+
+impl TurnTag {
+    fn set(&self, turn: &str) {
+        let mut tag = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        *tag = turn.to_string();
+    }
+
+    fn get(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+/// What the bridge has told the host about each turn.
+///
+/// One turn is one prompt and everything reported about it. The events are
+/// recorded where they are sent rather than rebuilt from the loop's history, so
+/// a turn reads back exactly as it arrived the first time -- and a prompt the
+/// loop had augmented with cron or teammate mail still shows as the words the
+/// user typed. A page that reloaded asks for this instead of losing the
+/// conversation, which it only ever held a view of.
+struct TurnLog {
+    inner: Mutex<LogInner>,
+}
+
+#[derive(Default)]
+struct LogInner {
+    turns: Vec<LoggedTurn>,
+    /// Approximate size of everything above, so a long conversation is bounded
+    /// by bytes and not only by how many turns it has.
+    bytes: usize,
+}
+
+struct LoggedTurn {
+    turn: String,
+    prompt: String,
+    /// `running`, `done` or `failed`; the terminal events carry the detail.
+    status: &'static str,
+    error: Option<ProtocolError>,
+    events: Vec<EventMessage>,
+    weight: usize,
+}
+
+impl TurnLog {
+    fn new() -> Self {
+        TurnLog {
+            inner: Mutex::new(LogInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LogInner> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// A prompt the runtime has accepted; it is a turn from here on.
+    fn begin(&self, turn: &str, prompt: &str) {
+        let mut inner = self.lock();
+        let weight = prompt.len() + 64;
+        inner.bytes += weight;
+        inner.turns.push(LoggedTurn {
+            turn: turn.to_string(),
+            prompt: prompt.to_string(),
+            status: "running",
+            error: None,
+            events: Vec::new(),
+            weight,
+        });
+        prune(&mut inner);
+    }
+
+    /// Send one turn event and keep it, so a page that asks later gets the turn
+    /// as it arrived the first time.
+    fn emit(&self, message: EventMessage) {
+        self.record(&message);
+        let _ = send(&message);
+    }
+
+    fn record(&self, message: &EventMessage) {
+        let Some(turn_id) = message.data.get("turn").and_then(Value::as_str) else {
+            return;
+        };
+        let weight = message.event.len() + message.data.to_string().len() + 64;
+        let mut inner = self.lock();
+        let Some(index) = inner
+            .turns
+            .iter()
+            .position(|logged| logged.turn == turn_id)
+        else {
+            return;
+        };
+        let turn = &mut inner.turns[index];
+        match message.event.as_str() {
+            "chat.done" => turn.status = "done",
+            "chat.failed" => {
+                turn.status = "failed";
+                turn.error = message
+                    .data
+                    .get("error")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+            }
+            _ => {}
+        }
+        turn.weight += weight;
+        turn.events.push(message.clone());
+        inner.bytes += weight;
+        prune(&mut inner);
+    }
+
+    /// The conversation so far, oldest turn first.
+    fn snapshot(&self) -> Value {
+        let inner = self.lock();
+        let turns: Vec<Value> = inner
+            .turns
+            .iter()
+            .map(|turn| {
+                json!({
+                    "turn": turn.turn,
+                    "prompt": turn.prompt,
+                    "status": turn.status,
+                    "error": turn.error,
+                    "events": turn.events,
+                })
+            })
+            .collect();
+        json!({ "turns": turns })
+    }
+}
+
+/// Drop whole turns from the front until the log fits.
+fn prune(inner: &mut LogInner) {
+    while inner.turns.len() > MAX_LOG_TURNS
+        || (inner.bytes > MAX_LOG_BYTES && inner.turns.len() > 1)
+    {
+        let dropped = inner.turns.remove(0);
+        inner.bytes = inner.bytes.saturating_sub(dropped.weight);
+    }
+}
+
+/// Streams one turn's progress to the host on the protocol stream.
+struct ChatObserver {
+    tag: Arc<TurnTag>,
+    /// Where the events are also kept, for a page that asks again.
+    log: Arc<TurnLog>,
+    /// `main` for the conversation the user is having, `subagent` for a `task`
+    /// call's own loop, whose chatter would otherwise read as an answer.
+    source: &'static str,
+    /// Whether this observer's text is the answer the user asked for.
+    answers: bool,
+}
+
+impl ChatObserver {
+    /// The observer for the conversation itself.
+    fn conversation(tag: Arc<TurnTag>, log: Arc<TurnLog>) -> Self {
+        ChatObserver {
+            tag,
+            log,
+            source: "main",
+            answers: true,
+        }
+    }
+
+    /// The observer for a subagent: tool use is worth reporting, its prose is
+    /// not -- the `task` tool already returns that to the model as a result.
+    fn task(tag: Arc<TurnTag>, log: Arc<TurnLog>) -> Self {
+        ChatObserver {
+            tag,
+            log,
+            source: "subagent",
+            answers: false,
+        }
+    }
+}
+
+impl AgentObserver for ChatObserver {
+    fn on_event(&self, signal: AgentEvent<'_>) {
+        let Some((name, mut data)) = describe(&signal, self.answers) else {
+            return;
+        };
+        if let Some(fields) = data.as_object_mut() {
+            fields.insert("turn".to_string(), json!(self.tag.get()));
+            fields.insert("source".to_string(), json!(self.source));
+        }
+        self.log.emit(event(name, data));
+    }
+}
+
+/// Turn one loop event into the name and payload the host renders.
+///
+/// `None` means the event is not worth a line: a step marker, or a subagent's
+/// own answer text.
+fn describe(event: &AgentEvent<'_>, answers: bool) -> Option<(&'static str, Value)> {
+    let described = match event {
+        AgentEvent::Step(_) => return None,
+        AgentEvent::AssistantText(text) => {
+            if !answers {
+                return None;
+            }
+            ("chat.delta", json!({ "text": *text }))
+        }
+        AgentEvent::ToolCall { name, input } => (
+            "chat.tool_call",
+            json!({ "name": *name, "input": clamp(&input.to_string()) }),
+        ),
+        AgentEvent::ToolResult {
+            name,
+            output,
+            is_error,
+        } => (
+            "chat.tool_result",
+            json!({ "name": *name, "output": clamp(output), "is_error": *is_error }),
+        ),
+        AgentEvent::Blocked { name, reason } => (
+            "chat.blocked",
+            json!({ "name": *name, "reason": *reason }),
+        ),
+        AgentEvent::Compacted { kind, .. } => {
+            notice("compacted", format!("history compacted ({kind})"))
+        }
+        AgentEvent::MemoryRecalled { count } => {
+            notice("memory_recalled", format!("recalled {count} memory record(s)"))
+        }
+        AgentEvent::MemoryStored {
+            stored,
+            consolidated,
+        } => notice(
+            "memory_stored",
+            format!("stored {stored} memory record(s), consolidated {consolidated}"),
+        ),
+        AgentEvent::BackgroundStarted { task_id } => notice(
+            "background_started",
+            format!("background task {task_id} started"),
+        ),
+        AgentEvent::BackgroundCollected { count } => notice(
+            "background_collected",
+            format!("{count} background result(s) ready"),
+        ),
+        AgentEvent::CronDelivered { count } => notice(
+            "cron_delivered",
+            format!("{count} scheduled prompt(s) delivered"),
+        ),
+        AgentEvent::TeamEventDelivered { count } => notice(
+            "team_event",
+            format!("{count} teammate message(s) delivered"),
+        ),
+        AgentEvent::McpConnected { server, tools } => notice(
+            "mcp_connected",
+            format!("connected {server} ({tools} tool(s))"),
+        ),
+        AgentEvent::ModelRecovered {
+            kind,
+            attempt,
+            delay_ms,
+        } => notice(
+            "model_recovered",
+            format!("{kind} from the model; retrying (attempt {attempt}) in {delay_ms} ms"),
+        ),
+        AgentEvent::ModelFellBack { model } => {
+            notice("model_fallback", format!("switched to {model}"))
+        }
+        AgentEvent::MaxTokensEscalated { max_tokens } => notice(
+            "max_tokens",
+            format!("the answer was cut off; retrying with {max_tokens} tokens"),
+        ),
+        AgentEvent::ContinuationRequested { count } => {
+            notice("continuation", format!("asked the model to continue ({count})"))
+        }
+        AgentEvent::WorkflowReported {
+            run_id,
+            kind,
+            message,
+        } => notice("workflow", format!("{run_id} {kind}: {message}")),
+        AgentEvent::GoalReported {
+            kind,
+            reason,
+            iterations,
+            duration_ms,
+            ..
+        } => notice(
+            "goal",
+            format!("goal {kind}: {reason} ({iterations} iteration(s), {duration_ms} ms)"),
+        ),
+    };
+    Some(described)
+}
+
+/// A progress note: something the turn did that is not an answer.
+fn notice(kind: &str, text: String) -> (&'static str, Value) {
+    ("chat.notice", json!({ "kind": kind, "text": text }))
+}
+
+/// Shorten a field so one tool result cannot blow past the host's line cap.
+///
+/// Trimming happens on a character boundary, because a tool result is arbitrary
+/// UTF-8 and the protocol line has to stay valid JSON.
+fn clamp(text: &str) -> String {
+    if text.len() <= MAX_EVENT_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_EVENT_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n... [{} more bytes omitted]",
+        &text[..end],
+        text.len() - end
+    )
+}
+
+/// The conversation the shell is having, and the one turn that may be running.
+struct Chat {
+    workspace: PathBuf,
+    /// The same job table the snapshot reports, so a scheduled prompt fires in
+    /// the next turn rather than never.
+    cron: CronScheduler,
+    /// Built on the first prompt and reused, so the conversation keeps its
+    /// history. A build that failed is remembered with its reason: the answer
+    /// will not change until the runtime is restarted.
+    agent: Mutex<Option<Result<Arc<Agent>, ProtocolError>>>,
+    /// The live conversation, locked for the whole of one turn.
+    history: tokio::sync::Mutex<Vec<Message>>,
+    /// Set while a turn runs: the protocol takes one prompt at a time.
+    busy: AtomicBool,
+    /// Monotonic turn counter, so a host can match events to its prompt.
+    turns: AtomicU64,
+    tag: Arc<TurnTag>,
+    /// Every turn reported so far, for a page that asks for them again.
+    log: Arc<TurnLog>,
+}
+
+impl Chat {
+    fn new(workspace: PathBuf, cron: CronScheduler) -> Self {
+        Chat {
+            workspace,
+            cron,
+            agent: Mutex::new(None),
+            history: tokio::sync::Mutex::new(Vec::new()),
+            busy: AtomicBool::new(false),
+            turns: AtomicU64::new(0),
+            tag: Arc::new(TurnTag::default()),
+            log: Arc::new(TurnLog::new()),
+        }
+    }
+
+    /// The agent loop for this workspace, built once.
+    fn agent(&self) -> Result<Arc<Agent>, ProtocolError> {
+        let mut cached = self.agent.lock().unwrap_or_else(|error| error.into_inner());
+        let built = cached.get_or_insert_with(|| {
+            build_agent(
+                &self.workspace,
+                &self.cron,
+                Arc::clone(&self.tag),
+                Arc::clone(&self.log),
+            )
+        });
+        built.clone()
+    }
+
+    /// The next turn id. Only ever called with the busy slot held.
+    fn next_turn(&self) -> String {
+        format!("turn-{}", self.turns.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// Report a turn that produced no answer.
+    fn failed(&self, turn: &str, error: &ProtocolError) {
+        self.log.emit(event(
+            "chat.failed",
+            json!({
+                "turn": turn,
+                "ok": false,
+                "error": { "code": error.code, "message": error.message },
+            }),
+        ));
+    }
+}
+
+/// Frees the one-turn-at-a-time slot however the turn ends, a panic in the loop
+/// included.
+struct Busy<'a>(&'a AtomicBool);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Build the loop the shell talks to.
+///
+/// The same agent the CLI builds, with two differences that come from there
+/// being no terminal behind a prompt: the observer streams to the protocol
+/// stream instead of printing, and the turn is non-interactive, so a call the
+/// permission policy would have asked about is refused with a reason the
+/// transcript can show rather than blocking on an approval nobody can give.
+fn build_agent(
+    workspace: &Path,
+    cron: &CronScheduler,
+    tag: Arc<TurnTag>,
+    log: Arc<TurnLog>,
+) -> Result<Arc<Agent>, ProtocolError> {
+    let config = Config::from_env().map_err(|error| {
+        ProtocolError::new(
+            CHAT_NOT_CONFIGURED,
+            format!(
+                "{error}; set the model in Settings (or add a .env to the workspace), then \
+                 restart the runtime"
+            ),
+        )
+    })?;
+
+    let client: Arc<dyn LlmClient> = Arc::new(AnthropicClient::new(&config));
+
+    // The subagent: fresh context, base tools only, so it cannot delegate.
+    let subagent = Agent::builder()
+        .shared_client(Arc::clone(&client))
+        .tools(ToolRegistry::base())
+        .workspace(workspace.to_path_buf())
+        .max_tokens(config.max_tokens)
+        .max_steps(30)
+        .interactive(false)
+        .system_prompt(subagent_system_prompt())
+        .observer(ChatObserver::task(Arc::clone(&tag), Arc::clone(&log)))
+        .build();
+
+    let mut tools = ToolRegistry::with_tasks();
+    tools.register(TaskTool::new(subagent));
+
+    // s15: retry transient model failures, and fall back when one is configured.
+    let mut recovery = RecoveryConfig::default();
+    if let Some(model) = &config.fallback_model {
+        recovery = recovery.with_fallback_model(model.clone());
+    }
+
+    Ok(Arc::new(
+        Agent::builder()
+            .shared_client(client)
+            .tools(tools)
+            .workspace(workspace.to_path_buf())
+            .skills(SkillLoader::new(workspace.join("skills")))
+            .compaction(CompactConfig::default())
+            .memory(MemoryConfig::default())
+            .cron(cron.clone())
+            .recovery(recovery)
+            .interactive(false)
+            .max_tokens(config.max_tokens)
+            .system_prompt(format!(
+                "{} {} {}",
+                default_system_prompt(),
+                TASKS_PROMPT,
+                CRON_PROMPT
+            ))
+            .observer(ChatObserver::conversation(tag, log))
+            .build(),
+    ))
+}
+
+/// Accept one prompt, or explain why it cannot run.
+fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Handle) -> Turn {
+    let rejected = |error| Turn {
+        response: Response::failed(&request.request_id, error),
+        shutdown: false,
+    };
+
+    let Some(prompt) = request.params.get("prompt").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`chat.send` needs a `prompt` string",
+        ));
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`prompt` must not be empty",
+        ));
+    }
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`prompt` is longer than {MAX_PROMPT_BYTES} bytes"),
+        ));
+    }
+
+    // Built here rather than inside the turn, so a runtime with no model
+    // configured answers `ok: false` instead of accepting a prompt it is about
+    // to fail. It is built once, so this only costs anything on the first call.
+    if let Err(error) = chat.agent() {
+        return rejected(error);
+    }
+
+    if chat.busy.swap(true, Ordering::SeqCst) {
+        return rejected(ProtocolError::new(
+            CHAT_BUSY,
+            "a turn is already running; wait for `chat.done` before sending another prompt",
+        ));
+    }
+
+    let turn = chat.next_turn();
+    chat.log.begin(&turn, prompt);
+    let chat = Arc::clone(chat);
+    let prompt = prompt.to_string();
+    let running = turn.clone();
+    handle.spawn(async move {
+        let _busy = Busy(&chat.busy);
+        chat.tag.set(&running);
+        run_turn(&chat, &running, &prompt).await;
+    });
+
+    Turn {
+        response: Response::ok(
+            &request.request_id,
+            json!({ "accepted": true, "turn": turn }),
+        ),
+        shutdown: false,
+    }
+}
+
+/// Run one prompt and stream it back.
+///
+/// The history is locked for the whole turn: a second prompt is refused while
+/// this one runs rather than queued behind it, and a turn that failed is rolled
+/// back instead of leaving half an exchange for the model to trip over next time.
+async fn run_turn(chat: &Chat, turn: &str, prompt: &str) {
+    let agent = match chat.agent() {
+        Ok(agent) => agent,
+        Err(error) => {
+            chat.failed(turn, &error);
+            return;
+        }
+    };
+
+    let mut history = chat.history.lock().await;
+    let rollback = history.len();
+    history.push(Message::user_text(agent.prepare_prompt(prompt)));
+
+    match agent.run_turn(&mut history).await {
+        Ok(()) => {
+            let text = history
+                .last()
+                .filter(|message| message.role == Role::Assistant)
+                .map(Message::text)
+                .unwrap_or_default();
+            drop(history);
+            chat.log.emit(event(
+                "chat.done",
+                json!({ "turn": turn, "ok": true, "text": text }),
+            ));
+        }
+        Err(error) => {
+            history.truncate(rollback);
+            drop(history);
+            let error = turn_error(&error);
+            chat.failed(turn, &error);
+        }
+    }
+}
+
+/// A stable code and the model's own words for a turn that failed.
+fn turn_error(error: &Error) -> ProtocolError {
+    let code = match error {
+        Error::Api {
+            status: 401 | 403, ..
+        } => "chat_unauthorized",
+        Error::Api { status: 429, .. } => "chat_rate_limited",
+        Error::Api { .. } => "chat_api_error",
+        Error::Config(_) => CHAT_NOT_CONFIGURED,
+        Error::MaxIterations(_) => "chat_step_limit",
+        Error::Recovery(_) => "chat_recovery_failed",
+        _ => "chat_turn_failed",
+    };
+    ProtocolError::new(code, error.to_string())
+}
 /// One framed inbound line.
 #[derive(Debug, PartialEq, Eq)]
 enum Line {
@@ -609,6 +1256,26 @@ fn resolve_workspace(requested: &Path) -> io::Result<PathBuf> {
     Ok(std::env::current_dir()?.join(requested))
 }
 
+/// Read the workspace's own `.env`, the way the runtime's other binaries read
+/// one from their working directory.
+///
+/// `dotenvy` never overwrites a variable that is already set, and the host sets
+/// the ones the user saved in Settings before spawning this process. So what
+/// the user saved wins, and a `.env` in the project fills in only what is still
+/// missing -- it cannot silently redirect a runtime the UI believes it
+/// configured.
+fn load_workspace_env(workspace: &Path) {
+    let path = workspace.join(".env");
+    match dotenvy::from_path(&path) {
+        Ok(_) => log(Level::Info, format!("loaded {}", path.display())),
+        Err(error) if error.not_found() => {}
+        Err(error) => log(
+            Level::Warn,
+            format!("could not read {}: {error}", path.display()),
+        ),
+    }
+}
+
 fn run() -> i32 {
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(Some(options)) => options,
@@ -648,6 +1315,9 @@ fn run() -> i32 {
         );
         return EXIT_WORKSPACE;
     }
+    // Before the bridge reads any configuration, so `runtime.ready` reports
+    // what this process will actually use.
+    load_workspace_env(&workspace);
     log(
         Level::Info,
         format!(
@@ -661,13 +1331,30 @@ fn run() -> i32 {
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
 
-    if let Err(error) = write_message(&mut out, &event("runtime.ready", bridge.snapshot())) {
+    if let Err(error) = send(&event("runtime.ready", bridge.snapshot())) {
         log(Level::Error, format!("cannot write to stdout: {error}"));
         return EXIT_IO;
     }
+
+    // The conversation outlives any one prompt, and a turn runs off this thread
+    // so the reader loop keeps answering while a model call is in flight.
+    let chat = Arc::new(Chat::new(workspace.clone(), bridge.cron.clone()));
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("rust-agent-turn")
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            log(
+                Level::Error,
+                format!("could not start the turn runtime: {error}"),
+            );
+            return EXIT_IO;
+        }
+    };
+    let handle = runtime.handle().clone();
 
     let mut code = EXIT_OK;
     loop {
@@ -691,16 +1378,16 @@ fn run() -> i32 {
                     MESSAGE_TOO_LARGE,
                     format!("message exceeded {MAX_LINE_BYTES} bytes and was discarded"),
                 );
-                let _ = write_message(&mut out, &ErrorMessage::new(error));
+                let _ = send(&ErrorMessage::new(error));
                 continue;
             }
             Line::InvalidUtf8 => {
                 let error = ProtocolError::new(INVALID_UTF8, "message was not valid UTF-8");
-                let _ = write_message(&mut out, &ErrorMessage::new(error));
+                let _ = send(&ErrorMessage::new(error));
                 continue;
             }
             Line::Text(text) => match parse_request(&text) {
-                Parsed::Request(request) => dispatch(&request, &bridge),
+                Parsed::Request(request) => dispatch(&request, &bridge, &chat, &handle),
                 // We know which request failed, so answer in the response shape
                 // the host is already waiting on.
                 Parsed::Rejected {
@@ -714,13 +1401,13 @@ fn run() -> i32 {
                     request_id: None,
                     error,
                 } => {
-                    let _ = write_message(&mut out, &ErrorMessage::new(error));
+                    let _ = send(&ErrorMessage::new(error));
                     continue;
                 }
             },
         };
 
-        if let Err(error) = write_message(&mut out, &turn.response) {
+        if let Err(error) = send(&turn.response) {
             log(Level::Error, format!("cannot write to stdout: {error}"));
             code = EXIT_IO;
             break;
@@ -728,15 +1415,15 @@ fn run() -> i32 {
 
         if turn.shutdown {
             log(Level::Info, "shutdown requested; stopping");
-            let _ = write_message(
-                &mut out,
-                &event("runtime.stopping", json!({ "reason": "requested" })),
-            );
+            let _ = send(&event("runtime.stopping", json!({ "reason": "requested" })));
             break;
         }
     }
 
     log(Level::Info, format!("bridge stopped (exit {code})"));
+    // A turn that is mid-call must not hold up the exit the host asked for;
+    // `main` ends the process as soon as this returns.
+    runtime.shutdown_background();
     code
 }
 
@@ -766,6 +1453,12 @@ mod tests {
 
     fn bridge_at(dir: &std::path::Path) -> Bridge {
         Bridge::new(dir.to_path_buf())
+    }
+
+    /// The pieces `dispatch` needs, for the tests that go through it.
+    fn fixture(dir: &std::path::Path) -> (Bridge, Arc<Chat>, tokio::runtime::Runtime) {
+        let chat = Arc::new(Chat::new(dir.to_path_buf(), CronScheduler::new(dir)));
+        (bridge_at(dir), chat, tokio::runtime::Runtime::new().unwrap())
     }
 
     #[test]
@@ -889,7 +1582,9 @@ mod tests {
         let Parsed::Request(request) = parse_request(&request("r-7", "runtime.teleport")) else {
             panic!("expected a request");
         };
-        let turn = dispatch(&request, &bridge);
+        let chat = Arc::new(Chat::new(dir.path().to_path_buf(), bridge.cron.clone()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let turn = dispatch(&request, &bridge, &chat, runtime.handle());
         assert!(!turn.shutdown);
         assert_eq!(turn.response.request_id, "r-7");
         assert!(!turn.response.ok);
@@ -910,7 +1605,9 @@ mod tests {
         let Parsed::Request(ping) = parse_request(&request("r-1", "runtime.ping")) else {
             panic!("expected a request");
         };
-        let turn = dispatch(&ping, &bridge);
+        let chat = Arc::new(Chat::new(dir.path().to_path_buf(), bridge.cron.clone()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let turn = dispatch(&ping, &bridge, &chat, runtime.handle());
         assert!(turn.response.ok);
         assert!(!turn.shutdown);
         assert_eq!(turn.response.result.unwrap()["pong"], json!(true));
@@ -918,10 +1615,291 @@ mod tests {
         let Parsed::Request(shutdown) = parse_request(&request("r-2", "runtime.shutdown")) else {
             panic!("expected a request");
         };
-        let turn = dispatch(&shutdown, &bridge);
+        let turn = dispatch(&shutdown, &bridge, &chat, runtime.handle());
         assert!(turn.response.ok);
         assert!(turn.shutdown);
     }
+
+    #[test]
+    fn chat_send_is_advertised_and_is_the_method_that_takes_parameters() {
+        assert!(METHODS.contains(&"chat.send"));
+
+        let line = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "r-1",
+            "method": "chat.send",
+            "params": { "prompt": "hello" },
+        })
+        .to_string();
+        match parse_request(&line) {
+            Parsed::Request(request) => {
+                assert_eq!(request.params["prompt"], json!("hello"));
+            }
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_turn_reads_back_the_way_it_arrived() {
+        let log = TurnLog::new();
+        log.begin("turn-1", "总结一下这个工作区");
+        log.record(&event(
+            "chat.tool_call",
+            json!({ "turn": "turn-1", "name": "bash", "input": "{}" }),
+        ));
+        log.record(&event(
+            "chat.delta",
+            json!({ "turn": "turn-1", "text": "好的" }),
+        ));
+        log.record(&event(
+            "chat.done",
+            json!({ "turn": "turn-1", "ok": true, "text": "好的" }),
+        ));
+
+        let snapshot = log.snapshot();
+        let turns = snapshot["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["turn"], json!("turn-1"));
+        assert_eq!(turns[0]["prompt"], json!("总结一下这个工作区"));
+        assert_eq!(turns[0]["status"], json!("done"));
+        assert_eq!(turns[0]["error"], json!(null));
+        let names: Vec<&str> = turns[0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["chat.tool_call", "chat.delta", "chat.done"]);
+    }
+
+    #[test]
+    fn a_turn_that_is_still_running_reads_back_unfinished() {
+        let log = TurnLog::new();
+        log.begin("turn-1", "hi");
+        log.record(&event(
+            "chat.delta",
+            json!({ "turn": "turn-1", "text": "答" }),
+        ));
+
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot["turns"][0]["status"], json!("running"));
+        assert_eq!(snapshot["turns"][0]["error"], json!(null));
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_code_the_page_branches_on() {
+        let log = TurnLog::new();
+        log.begin("turn-1", "hi");
+        log.record(&event(
+            "chat.failed",
+            json!({
+                "turn": "turn-1",
+                "ok": false,
+                "error": { "code": "chat_unauthorized", "message": "the key is wrong" },
+            }),
+        ));
+
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot["turns"][0]["status"], json!("failed"));
+        assert_eq!(
+            snapshot["turns"][0]["error"]["code"],
+            json!("chat_unauthorized")
+        );
+    }
+
+    #[test]
+    fn the_log_drops_the_oldest_turns_and_keeps_the_one_that_is_running() {
+        let log = TurnLog::new();
+        for index in 0..MAX_LOG_TURNS + 5 {
+            let turn = format!("turn-{index}");
+            log.begin(&turn, "hi");
+            log.record(&event(
+                "chat.done",
+                json!({ "turn": turn, "ok": true, "text": "" }),
+            ));
+        }
+
+        let snapshot = log.snapshot();
+        let turns = snapshot["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), MAX_LOG_TURNS);
+        assert_eq!(turns[0]["turn"], json!("turn-5"));
+        assert_eq!(turns[turns.len() - 1]["turn"], json!(format!("turn-{}", MAX_LOG_TURNS + 4)));
+    }
+
+    #[test]
+    fn an_event_for_a_turn_that_never_started_is_not_recorded() {
+        let log = TurnLog::new();
+        log.record(&event(
+            "chat.delta",
+            json!({ "turn": "turn-9", "text": "orphan" }),
+        ));
+        log.record(&event("chat.delta", json!({ "text": "no turn at all" })));
+
+        assert!(log.snapshot()["turns"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_history_answers_with_the_turns_the_bridge_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        chat.log.begin("turn-1", "hi");
+        chat.log.record(&event(
+            "chat.done",
+            json!({ "turn": "turn-1", "ok": true, "text": "hello" }),
+        ));
+
+        let Parsed::Request(history) = parse_request(&request("r-1", "chat.history")) else {
+            panic!("expected a request");
+        };
+        let turn = dispatch(&history, &bridge, &chat, runtime.handle());
+        assert!(turn.response.ok);
+        assert!(!turn.shutdown);
+
+        let result = turn.response.result.unwrap();
+        assert_eq!(result["turns"][0]["prompt"], json!("hi"));
+        assert_eq!(result["turns"][0]["status"], json!("done"));
+    }
+
+    #[test]
+    fn chat_history_is_advertised_and_takes_no_parameters() {
+        assert!(METHODS.contains(&"chat.history"));
+        assert!(!takes_params("chat.history"));
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_run_is_refused_before_anything_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        for (case, params) in [
+            ("missing", json!({})),
+            ("not a string", json!({ "prompt": 7 })),
+            ("empty", json!({ "prompt": "   " })),
+            (
+                "too long",
+                json!({ "prompt": "x".repeat(MAX_PROMPT_BYTES + 1) }),
+            ),
+        ] {
+            let line = json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": "r-1",
+                "method": "chat.send",
+                "params": params,
+            })
+            .to_string();
+            let Parsed::Request(request) = parse_request(&line) else {
+                panic!("expected a request");
+            };
+            let turn = dispatch(&request, &bridge, &chat, runtime.handle());
+            assert!(!turn.shutdown);
+            assert!(!turn.response.ok, "`{case}` was accepted");
+            assert_eq!(
+                turn.response.error.as_ref().map(|error| error.code.as_str()),
+                Some(INVALID_PARAMS),
+                "`{case}`"
+            );
+        }
+
+        // Nothing was started, so the one-turn-at-a-time slot is still free.
+        assert!(!chat.busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_failed_turn_carries_a_code_the_page_can_branch_on() {
+        let status = |status: u16| Error::Api {
+            status,
+            message: "no".to_string(),
+        };
+        assert_eq!(turn_error(&status(401)).code, "chat_unauthorized");
+        assert_eq!(turn_error(&status(403)).code, "chat_unauthorized");
+        assert_eq!(turn_error(&status(429)).code, "chat_rate_limited");
+        assert_eq!(turn_error(&status(500)).code, "chat_api_error");
+        assert_eq!(
+            turn_error(&Error::Config("no key".to_string())).code,
+            CHAT_NOT_CONFIGURED
+        );
+        assert_eq!(turn_error(&Error::MaxIterations(64)).code, "chat_step_limit");
+        assert_eq!(
+            turn_error(&Error::Stream("cut off".to_string())).code,
+            "chat_turn_failed"
+        );
+    }
+
+    #[test]
+    fn a_long_tool_result_is_clamped_on_a_character_boundary() {
+        assert_eq!(clamp("ok"), "ok");
+
+        // The cap lands inside a multi-byte character, so the cut has to back up
+        // to the boundary instead of splitting one.
+        let text = format!("{}{}", "a".repeat(MAX_EVENT_TEXT_BYTES - 1), "é".repeat(100));
+        let clamped = clamp(&text);
+        assert!(clamped.len() < text.len());
+        assert!(clamped.ends_with("more bytes omitted]"));
+        assert_eq!(
+            clamped.lines().next().unwrap().len(),
+            MAX_EVENT_TEXT_BYTES - 1
+        );
+    }
+
+    #[test]
+    fn only_the_conversation_observers_prose_is_an_answer() {
+        let input = json!({ "command": "ls" });
+        let events = [
+            AgentEvent::Step(0),
+            AgentEvent::AssistantText("hello"),
+            AgentEvent::ToolCall {
+                name: "bash",
+                input: &input,
+            },
+            AgentEvent::ToolResult {
+                name: "bash",
+                output: "a\nb",
+                is_error: false,
+            },
+            AgentEvent::Blocked {
+                name: "write_file",
+                reason: "denied",
+            },
+        ];
+
+        let names: Vec<Option<&str>> = events
+            .iter()
+            .map(|event| describe(event, true).map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                None,
+                Some("chat.delta"),
+                Some("chat.tool_call"),
+                Some("chat.tool_result"),
+                Some("chat.blocked"),
+            ]
+        );
+
+        // A subagent's prose is not the user's answer; its tool use still is.
+        assert!(describe(&events[1], false).is_none());
+        assert_eq!(
+            describe(&events[2], false).map(|(name, _)| name),
+            Some("chat.tool_call")
+        );
+    }
+
+    #[test]
+    fn a_turn_is_attributed_to_the_tag_the_runner_set() {
+        let tag = TurnTag::default();
+        assert_eq!(tag.get(), "");
+        tag.set("turn-2");
+        assert_eq!(tag.get(), "turn-2");
+
+        let observer = ChatObserver::conversation(Arc::new(tag), Arc::new(TurnLog::new()));
+        assert!(observer.answers);
+        assert_eq!(observer.source, "main");
+        assert!(
+            !ChatObserver::task(Arc::new(TurnTag::default()), Arc::new(TurnLog::new())).answers
+        );
+    }
+
     #[test]
     fn status_reports_real_workspace_facts() {
         let dir = tempfile::tempdir().unwrap();
