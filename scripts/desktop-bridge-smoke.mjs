@@ -160,9 +160,15 @@ async function main() {
     check('the bridge announces runtime.ready', ready !== undefined)
     check('runtime.ready carries the workspace', ready?.data?.workspace === workspace)
     check('runtime.ready reports protocol 1', ready?.data?.protocol_version === PROTOCOL_VERSION)
-    check('runtime.ready lists every method', ready?.data?.methods?.length === 5)
+    check('runtime.ready lists every method', ready?.data?.methods?.length === 9)
     check('runtime.ready advertises chat.send', ready?.data?.methods?.includes('chat.send'))
+    check('runtime.ready advertises chat.cancel', ready?.data?.methods?.includes('chat.cancel'))
     check('runtime.ready advertises chat.history', ready?.data?.methods?.includes('chat.history'))
+    check('runtime.ready advertises the session methods', [
+      'sessions.list',
+      'sessions.new',
+      'sessions.open',
+    ].every((method) => ready?.data?.methods?.includes(method)))
 
     bridge.request('r-1', 'runtime.ping')
     const ping = await bridge.waitFor((messages) => byId(messages, 'r-1'))
@@ -343,6 +349,10 @@ async function main() {
   // token. A prompt that mentions `refuse` gets a 401; one that mentions `slow`
   // has its first byte held back, so a second prompt lands mid-turn.
   const model = createServer((request, response) => {
+    // A turn the user stops drops the connection mid-answer, so the stand-in
+    // must not treat a dead socket as its own failure.
+    request.on('error', () => {})
+    response.on('error', () => {})
     let body = ''
     request.on('data', (chunk) => (body += chunk))
     request.on('end', () => {
@@ -499,6 +509,136 @@ async function main() {
       turns[1]?.error?.code === 'chat_unauthorized',
       turns[1]?.error?.code,
     )
+
+    // --- sessions: the conversation is written down, and stays stoppable ---
+    //
+    // A stop is a request about a turn, not a guess: with nothing running it
+    // says so, and with a turn in flight it ends that turn where it stands.
+    chat.request('c-10', 'chat.cancel')
+    const idleStop = await chat.waitFor((messages) => byId(messages, 'c-10'))
+    check(
+      'a stop with no turn running says nothing was stopped',
+      idleStop?.result?.cancelled === false,
+      JSON.stringify(idleStop?.result),
+    )
+
+    chat.request('c-11', 'sessions.list')
+    const listed = await chat.waitFor((messages) => byId(messages, 'c-11'))
+    const current = listed?.result?.current
+    const summaries = listed?.result?.sessions ?? []
+    check(
+      'sessions.list names the conversation being continued',
+      typeof current === 'string' && current !== '',
+    )
+    const stored = summaries.find((session) => session.id === current)
+    check('sessions.list holds the conversation that just ran', stored !== undefined)
+    check(
+      'the stored conversation is named after the first prompt',
+      stored?.title === 'say hello',
+      stored?.title,
+    )
+    check(
+      'the session file is where the runtime says it is',
+      existsSync(join(mock, '.sessions', `${current}.json`)),
+    )
+
+    chat.request('c-12', 'chat.send', { params: { prompt: 'slow and stoppable' } })
+    const running = await chat.waitFor((messages) => byId(messages, 'c-12'))
+    check('a turn that can be stopped is accepted', running?.result?.turn === 'turn-4')
+    chat.request('c-13', 'chat.cancel')
+    const stopped = await chat.waitFor((messages) => byId(messages, 'c-13'))
+    check('a stop reaches the turn that is running', stopped?.result?.cancelled === true)
+    const cancelled = await chat.waitFor((messages) =>
+      messages.find((message) => message.event === 'chat.cancelled'),
+    )
+    check('the stopped turn reports chat.cancelled', cancelled?.data?.turn === 'turn-4')
+
+    // The stop freed the one-turn slot, so the loop is not stuck with it.
+    chat.request('c-14', 'chat.send', { params: { prompt: 'keep going' } })
+    const next = await chat.waitFor((messages) => byId(messages, 'c-14'))
+    check('a stop frees the slot for the next prompt', next?.result?.turn === 'turn-5')
+    const nextDone = await chat.waitFor((messages) =>
+      messages.find((message) => message.event === 'chat.done' && message.data?.turn === 'turn-5'),
+    )
+    check('the turn after a stop still answers', nextDone?.data?.text === 'hello from the mock')
+
+    // A stopped turn is not fed back to the model: the next prompt starts from
+    // the same place the stopped one did.
+    check(
+      'a stopped turn is not written into the conversation',
+      chat
+        .messages()
+        .every((message) => message.event !== 'chat.delta' || message.data?.turn !== 'turn-4'),
+    )
+
+    // --- a new process continues the conversation the old one wrote ---
+    await chat.stop()
+    const resumed = new Harness(mock, { env: scrubbed })
+    try {
+      const ready = await resumed.waitFor((messages) => named(messages, 'runtime.ready'))
+      check('the restarted bridge is ready', ready !== undefined)
+
+      resumed.request('c-20', 'chat.history')
+      const readback = await resumed.waitFor((messages) => byId(messages, 'c-20'))
+      const kept = readback?.result?.turns ?? []
+      check(
+        'the conversation outlived the process',
+        kept.length === 5,
+        JSON.stringify(kept.map((turn) => turn.turn)),
+      )
+      check('a kept turn still reads back as done', kept[0]?.status === 'done')
+      check('a kept failure still carries its code', kept[1]?.error?.code === 'chat_unauthorized')
+      check('a stopped turn reads back as stopped', kept[3]?.status === 'cancelled', kept[3]?.status)
+
+      resumed.request('c-21', 'sessions.list')
+      const remembered = await resumed.waitFor((messages) => byId(messages, 'c-21'))
+      check(
+        'the restarted bridge continues the same conversation',
+        remembered?.result?.current === current,
+      )
+
+      resumed.request('c-22', 'sessions.new')
+      const fresh = await resumed.waitFor((messages) => byId(messages, 'c-22'))
+      const freshId = fresh?.result?.session
+      check('a new conversation gets an id of its own', typeof freshId === 'string' && freshId !== current)
+      resumed.request('c-23', 'chat.history')
+      const empty = await resumed.waitFor((messages) => byId(messages, 'c-23'))
+      check('a new conversation starts empty', (empty?.result?.turns ?? []).length === 0)
+
+      resumed.request('c-24', 'sessions.open', { params: { id: current } })
+      const opened = await resumed.waitFor((messages) => byId(messages, 'c-24'))
+      check('the conversation that was left behind opens again', opened?.result?.session === current)
+      resumed.request('c-25', 'chat.history')
+      const reopened = await resumed.waitFor((messages) => byId(messages, 'c-25'))
+      check('opening it brings its turns back', (reopened?.result?.turns ?? []).length === 5)
+
+      // A session id is a file name, so the shape is checked before the disk is
+      // touched, and a well-formed id that is not there is a different answer.
+      resumed.request('c-26', 'sessions.open', { params: { id: 'not/a/session' } })
+      const malformed = await resumed.waitFor((messages) => byId(messages, 'c-26'))
+      check(
+        'an id that could name another file is refused',
+        malformed?.error?.code === 'invalid_params',
+        malformed?.error?.code,
+      )
+      resumed.request('c-28', 'sessions.open', { params: { id: 's1-2-3' } })
+      const missing = await resumed.waitFor((messages) => byId(messages, 'c-28'))
+      check(
+        'a conversation this workspace does not hold is refused',
+        missing?.error?.code === 'session_unknown',
+        missing?.error?.code,
+      )
+
+      resumed.request('c-27', 'chat.send', { params: { prompt: 'after a resume' } })
+      const numbered = await resumed.waitFor((messages) => byId(messages, 'c-27'))
+      check(
+        'the next turn continues the numbering',
+        numbered?.result?.turn === 'turn-6',
+        numbered?.result?.turn,
+      )
+    } finally {
+      await resumed.stop()
+    }
 
     const lines = chat.stdout.filter((line) => line.trim() !== '')
     check(

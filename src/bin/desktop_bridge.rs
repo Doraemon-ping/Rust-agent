@@ -7,11 +7,17 @@
 //!
 //! It answers three methods about itself -- `runtime.status`, `runtime.ping`,
 //! and `runtime.shutdown` -- building the snapshot from the runtime's own stores
-//! (`SkillLoader`, `TaskStore`, `CronScheduler`, `MemoryStore`), and two methods
+//! (`SkillLoader`, `TaskStore`, `CronScheduler`, `MemoryStore`), and the methods
 //! that do work: `chat.send` runs a prompt through the same `Agent` loop the CLI
-//! drives and reports the turn as `chat.*` events while it happens, and
-//! `chat.history` hands those turns back, so a page that reloaded reads the
-//! conversation it was only ever a view of instead of losing it.
+//! drives and reports the turn as `chat.*` events while it happens, `chat.cancel`
+//! stops that turn, `chat.history` hands the reported turns back to a page that
+//! reloaded, and `sessions.list` / `sessions.new` / `sessions.open` decide which
+//! conversation is being continued.
+//!
+//! Conversations are written to `<workspace>/.sessions` through the runtime's own
+//! `SessionStore`, so they outlive the process: a restart -- and choosing another
+//! project restarts the runtime -- resumes the conversation the user was reading
+//! instead of starting an empty one.
 //!
 //! The agent is built on the first prompt, not at startup, so a workspace with
 //! no model credentials still starts and still answers for itself.
@@ -30,9 +36,10 @@ use serde_json::{json, Value};
 use rust_agent::agent::{AgentEvent, AgentObserver};
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
-    default_system_prompt, last_run, Agent, AnthropicClient, CompactConfig, Config, CronScheduler,
-    Error, LlmClient, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role, SkillLoader,
-    TaskStatus, TaskStore, ToolRegistry, CRON_PROMPT, MAILBOXES_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
+    default_system_prompt, is_session_id, last_run, Agent, AnthropicClient, CompactConfig, Config,
+    CronScheduler, Error, LlmClient, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role,
+    Session, SessionStore, SkillLoader, TaskStatus, TaskStore, ToolRegistry, CRON_PROMPT,
+    MAILBOXES_DIR, SESSIONS_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
 };
 
 /// Wire revision of the protocol. Bumped whenever a message shape changes.
@@ -42,18 +49,22 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Every method this build answers, in the order we advertise them.
-const METHODS: [&str; 5] = [
+const METHODS: [&str; 9] = [
     "runtime.status",
     "runtime.ping",
     "runtime.shutdown",
     "chat.send",
+    "chat.cancel",
     "chat.history",
+    "sessions.list",
+    "sessions.new",
+    "sessions.open",
 ];
 
-/// The one method that takes parameters. Everything else refuses them, so a
-/// host that thinks it is talking to a newer bridge finds out at once.
+/// The methods that take parameters. Everything else refuses them, so a host
+/// that thinks it is talking to a newer bridge finds out at once.
 fn takes_params(method: &str) -> bool {
-    method == "chat.send"
+    matches!(method, "chat.send" | "sessions.open")
 }
 
 /// Exit codes, so the host can tell a bad invocation from a broken pipe.
@@ -237,8 +248,8 @@ fn parse_request(line: &str) -> Parsed {
         return reject(INVALID_PARAMS, "params must be a JSON object".to_string());
     }
 
-    // Only `chat.send` takes arguments. Refusing unknown keys on every other
-    // method beats silently ignoring a host that thinks it is talking to a
+    // Only `takes_params` methods take arguments. Refusing unknown keys on every
+    // other method beats silently ignoring a host that thinks it is talking to a
     // newer bridge.
     if !takes_params(&method) {
         if let Some(map) = params.as_object() {
@@ -320,11 +331,11 @@ impl ErrorMessage {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventMessage {
     protocol_version: u32,
     #[serde(rename = "type")]
-    kind: &'static str,
+    kind: String,
     event: String,
     ts: String,
     data: Value,
@@ -333,7 +344,7 @@ struct EventMessage {
 fn event(name: &str, data: Value) -> EventMessage {
     EventMessage {
         protocol_version: PROTOCOL_VERSION,
-        kind: "event",
+        kind: "event".to_string(),
         event: name.to_string(),
         ts: Utc::now().to_rfc3339(),
         data,
@@ -486,6 +497,7 @@ impl Bridge {
                 "skills": skills.dir().display().to_string(),
                 "tasks": tasks.root().display().to_string(),
                 "memory": memories.dir().display().to_string(),
+                "sessions": self.workspace.join(SESSIONS_DIR).display().to_string(),
                 "mailboxes": self.workspace.join(MAILBOXES_DIR).display().to_string(),
                 "workflow": self.workspace.join(WORKFLOWS_DIR).display().to_string(),
             },
@@ -519,10 +531,23 @@ fn dispatch(
             shutdown: true,
         },
         "chat.send" => accept_chat(request, chat, handle),
+        "chat.cancel" => Turn {
+            response: Response::ok(
+                &request.request_id,
+                json!({ "cancelled": chat.cancel.stop() }),
+            ),
+            shutdown: false,
+        },
         "chat.history" => Turn {
             response: Response::ok(&request.request_id, chat.log.snapshot()),
             shutdown: false,
         },
+        "sessions.list" => Turn {
+            response: Response::ok(&request.request_id, chat.sessions_snapshot()),
+            shutdown: false,
+        },
+        "sessions.new" => accept_new_session(request, chat),
+        "sessions.open" => accept_open_session(request, chat),
         other => Turn {
             response: Response::failed(
                 &request.request_id,
@@ -562,6 +587,8 @@ const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Codes this section adds to the protocol.
 const CHAT_BUSY: &str = "chat_busy";
 const CHAT_NOT_CONFIGURED: &str = "chat_not_configured";
+/// Asked for a conversation this workspace does not hold.
+const SESSION_UNKNOWN: &str = "session_unknown";
 
 /// Which turn the shared observer should attribute its events to.
 ///
@@ -609,11 +636,27 @@ struct LogInner {
 struct LoggedTurn {
     turn: String,
     prompt: String,
-    /// `running`, `done` or `failed`; the terminal events carry the detail.
+    /// `running`, `done`, `failed` or `cancelled`; the terminal event carries
+    /// the detail.
     status: &'static str,
     error: Option<ProtocolError>,
     events: Vec<EventMessage>,
     weight: usize,
+}
+
+/// One turn as it is stored in a session file.
+///
+/// Deliberately the same shape `chat.history` answers with, so what is written
+/// to disk is exactly what a page reads back, on the day as on the restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredTurn {
+    turn: String,
+    prompt: String,
+    status: String,
+    #[serde(default)]
+    error: Option<ProtocolError>,
+    #[serde(default)]
+    events: Vec<EventMessage>,
 }
 
 impl TurnLog {
@@ -656,16 +699,13 @@ impl TurnLog {
         };
         let weight = message.event.len() + message.data.to_string().len() + 64;
         let mut inner = self.lock();
-        let Some(index) = inner
-            .turns
-            .iter()
-            .position(|logged| logged.turn == turn_id)
-        else {
+        let Some(index) = inner.turns.iter().position(|logged| logged.turn == turn_id) else {
             return;
         };
         let turn = &mut inner.turns[index];
         match message.event.as_str() {
             "chat.done" => turn.status = "done",
+            "chat.cancelled" => turn.status = "cancelled",
             "chat.failed" => {
                 turn.status = "failed";
                 turn.error = message
@@ -684,20 +724,79 @@ impl TurnLog {
     /// The conversation so far, oldest turn first.
     fn snapshot(&self) -> Value {
         let inner = self.lock();
-        let turns: Vec<Value> = inner
+        let turns: Vec<StoredTurn> = inner
             .turns
             .iter()
-            .map(|turn| {
-                json!({
-                    "turn": turn.turn,
-                    "prompt": turn.prompt,
-                    "status": turn.status,
-                    "error": turn.error,
-                    "events": turn.events,
-                })
+            .map(|turn| StoredTurn {
+                turn: turn.turn.clone(),
+                prompt: turn.prompt.clone(),
+                status: turn.status.to_string(),
+                error: turn.error.clone(),
+                events: turn.events.clone(),
             })
             .collect();
         json!({ "turns": turns })
+    }
+
+    /// A conversation read back from a session file.
+    ///
+    /// A turn that was still running when the file was written is reported as
+    /// failed instead: whatever was going to finish it is gone, and a spinner
+    /// that never stops is worse than saying so.
+    fn from_snapshot(view: &Value) -> TurnLog {
+        let stored: Vec<StoredTurn> =
+            serde_json::from_value(view.get("turns").cloned().unwrap_or(Value::Null))
+                .unwrap_or_default();
+        let mut inner = LogInner::default();
+        for turn in stored {
+            let (status, error) = match turn.status.as_str() {
+                "running" => (
+                    "failed",
+                    Some(ProtocolError::new(
+                        "chat_interrupted",
+                        "the runtime stopped before this turn finished",
+                    )),
+                ),
+                "failed" => ("failed", turn.error),
+                "cancelled" => ("cancelled", turn.error),
+                _ => ("done", turn.error),
+            };
+            let mut weight = turn.prompt.len() + 64;
+            for event in &turn.events {
+                weight += event.event.len() + event.data.to_string().len() + 64;
+            }
+            inner.bytes += weight;
+            inner.turns.push(LoggedTurn {
+                turn: turn.turn,
+                prompt: turn.prompt,
+                status,
+                error,
+                events: turn.events,
+                weight,
+            });
+        }
+        prune(&mut inner);
+        TurnLog {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    /// The highest turn number reported, so the next id continues the count
+    /// instead of naming a turn the conversation already holds.
+    fn last_number(&self) -> u64 {
+        self.lock()
+            .turns
+            .iter()
+            .filter_map(|turn| turn.turn.strip_prefix("turn-")?.parse().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Replace the turns with another conversation's.
+    fn adopt(&self, view: &Value) {
+        let replacement = TurnLog::from_snapshot(view);
+        let inner = std::mem::take(&mut *replacement.lock());
+        *self.lock() = inner;
     }
 }
 
@@ -784,16 +883,16 @@ fn describe(event: &AgentEvent<'_>, answers: bool) -> Option<(&'static str, Valu
             "chat.tool_result",
             json!({ "name": *name, "output": clamp(output), "is_error": *is_error }),
         ),
-        AgentEvent::Blocked { name, reason } => (
-            "chat.blocked",
-            json!({ "name": *name, "reason": *reason }),
-        ),
+        AgentEvent::Blocked { name, reason } => {
+            ("chat.blocked", json!({ "name": *name, "reason": *reason }))
+        }
         AgentEvent::Compacted { kind, .. } => {
             notice("compacted", format!("history compacted ({kind})"))
         }
-        AgentEvent::MemoryRecalled { count } => {
-            notice("memory_recalled", format!("recalled {count} memory record(s)"))
-        }
+        AgentEvent::MemoryRecalled { count } => notice(
+            "memory_recalled",
+            format!("recalled {count} memory record(s)"),
+        ),
         AgentEvent::MemoryStored {
             stored,
             consolidated,
@@ -836,9 +935,10 @@ fn describe(event: &AgentEvent<'_>, answers: bool) -> Option<(&'static str, Valu
             "max_tokens",
             format!("the answer was cut off; retrying with {max_tokens} tokens"),
         ),
-        AgentEvent::ContinuationRequested { count } => {
-            notice("continuation", format!("asked the model to continue ({count})"))
-        }
+        AgentEvent::ContinuationRequested { count } => notice(
+            "continuation",
+            format!("asked the model to continue ({count})"),
+        ),
         AgentEvent::WorkflowReported {
             run_id,
             kind,
@@ -892,8 +992,15 @@ struct Chat {
     /// history. A build that failed is remembered with its reason: the answer
     /// will not change until the runtime is restarted.
     agent: Mutex<Option<Result<Arc<Agent>, ProtocolError>>>,
-    /// The live conversation, locked for the whole of one turn.
-    history: tokio::sync::Mutex<Vec<Message>>,
+    /// The conversation being continued: the messages the model has seen, the
+    /// view the page reads back, and the file both are written to. A turn takes
+    /// the messages out for its length instead of holding the lock, so the
+    /// reader loop keeps answering while the model thinks.
+    session: Mutex<Session>,
+    /// Where conversations live: `<workspace>/.sessions`.
+    sessions: SessionStore,
+    /// The way out of the turn that is running.
+    cancel: TurnCancel,
     /// Set while a turn runs: the protocol takes one prompt at a time.
     busy: AtomicBool,
     /// Monotonic turn counter, so a host can match events to its prompt.
@@ -905,16 +1012,126 @@ struct Chat {
 
 impl Chat {
     fn new(workspace: PathBuf, cron: CronScheduler) -> Self {
+        let sessions = SessionStore::new(&workspace);
+        // Pick up where the last run left off. A store this build cannot read is
+        // reported and stepped over: history is not worth refusing to start a
+        // conversation over.
+        let resumed = match sessions.latest() {
+            Ok(session) => session,
+            Err(error) => {
+                log(
+                    Level::Warn,
+                    format!("could not read the saved conversations: {error}"),
+                );
+                None
+            }
+        };
+        let (session, log) = match resumed {
+            Some(session) => {
+                log(
+                    Level::Info,
+                    format!(
+                        "continuing session {} ({} messages)",
+                        session.id,
+                        session.messages.len()
+                    ),
+                );
+                let log = Arc::new(TurnLog::from_snapshot(&session.view));
+                (session, log)
+            }
+            None => (sessions.create(""), Arc::new(TurnLog::new())),
+        };
+        let turns = log.last_number();
         Chat {
             workspace,
             cron,
             agent: Mutex::new(None),
-            history: tokio::sync::Mutex::new(Vec::new()),
+            session: Mutex::new(session),
+            sessions,
+            cancel: TurnCancel::default(),
             busy: AtomicBool::new(false),
-            turns: AtomicU64::new(0),
+            turns: AtomicU64::new(turns),
             tag: Arc::new(TurnTag::default()),
-            log: Arc::new(TurnLog::new()),
+            log,
         }
+    }
+
+    /// The conversation being continued, as it stands right now.
+    fn session(&self) -> Session {
+        let guard = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.clone()
+    }
+
+    /// Keep what a turn produced, and write the conversation to disk.
+    ///
+    /// Called once per turn, after the terminal event, so the file holds a
+    /// finished turn and never a running one: a load can then tell a turn that
+    /// was interrupted from one that is still going.
+    ///
+    /// `Some` replaces the conversation's messages; `None` writes it as it
+    /// stands, which is what a prompt that never reached the model leaves.
+    fn commit(&self, messages: Option<Vec<Message>>) {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(messages) = messages {
+            guard.messages = messages;
+        }
+        guard.view = self.log.snapshot();
+        if let Err(error) = self.sessions.save(&mut guard) {
+            log(
+                Level::Warn,
+                format!("could not write the conversation to disk: {error}"),
+            );
+        }
+    }
+
+    /// Continue `session` instead of the one in hand.
+    ///
+    /// Only ever called with the busy slot free, so no turn is writing to the
+    /// conversation being left behind.
+    fn adopt(&self, session: Session) {
+        self.log.adopt(&session.view);
+        self.turns.store(self.log.last_number(), Ordering::SeqCst);
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *guard = session;
+    }
+
+    /// Name the conversation after its first prompt, once.
+    ///
+    /// A conversation that has a title keeps it: an old one may have been
+    /// opened, and a later prompt is not a better name for it than the first.
+    fn name_session(&self, prompt: &str) {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.title.is_empty() {
+            guard.title = session_title(prompt);
+        }
+    }
+
+    /// Every conversation this workspace holds, and the one being continued.
+    fn sessions_snapshot(&self) -> Value {
+        let current = self.session().id;
+        let sessions = match self.sessions.list() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                log(
+                    Level::Warn,
+                    format!("could not list the saved conversations: {error}"),
+                );
+                Vec::new()
+            }
+        };
+        json!({ "current": current, "sessions": sessions })
     }
 
     /// The agent loop for this workspace, built once.
@@ -935,18 +1152,6 @@ impl Chat {
     fn next_turn(&self) -> String {
         format!("turn-{}", self.turns.fetch_add(1, Ordering::SeqCst) + 1)
     }
-
-    /// Report a turn that produced no answer.
-    fn failed(&self, turn: &str, error: &ProtocolError) {
-        self.log.emit(event(
-            "chat.failed",
-            json!({
-                "turn": turn,
-                "ok": false,
-                "error": { "code": error.code, "message": error.message },
-            }),
-        ));
-    }
 }
 
 /// Frees the one-turn-at-a-time slot however the turn ends, a panic in the loop
@@ -957,6 +1162,62 @@ impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// The way out of the turn that is running.
+///
+/// One turn runs at a time, so one slot is enough: `chat.send` puts the sender
+/// for its own turn here and hands the receiver to the turn, and `chat.cancel`
+/// takes the sender and flips it. A turn that has already stopped is not
+/// cancelled late: `disarm` empties the slot when the turn is over, so a stop
+/// aimed at nothing answers that nothing was running.
+#[derive(Default)]
+struct TurnCancel(Mutex<Option<tokio::sync::watch::Sender<bool>>>);
+
+impl TurnCancel {
+    /// A channel for a turn that is about to start.
+    fn arm(&self) -> tokio::sync::watch::Receiver<bool> {
+        let (send, recv) = tokio::sync::watch::channel(false);
+        let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        *slot = Some(send);
+        recv
+    }
+
+    /// Ask the running turn to stop. `false` when nothing was running.
+    fn stop(&self) -> bool {
+        let taken = {
+            let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            slot.take()
+        };
+        match taken {
+            Some(send) => send.send(true).is_ok(),
+            None => false,
+        }
+    }
+
+    /// The turn is over; its channel must not outlive it.
+    fn disarm(&self) {
+        let mut slot = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        *slot = None;
+    }
+}
+
+/// The label a conversation list shows for a prompt: its first line, collapsed
+/// to one line and cut to something a list can hold.
+fn session_title(prompt: &str) -> String {
+    /// Longest title kept, in characters.
+    const MAX_TITLE_CHARS: usize = 48;
+
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut title: String = line.chars().take(MAX_TITLE_CHARS).collect();
+    if line.chars().count() > MAX_TITLE_CHARS {
+        title.push('…');
+    }
+    title
 }
 
 /// Build the loop the shell talks to.
@@ -1071,13 +1332,18 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
 
     let turn = chat.next_turn();
     chat.log.begin(&turn, prompt);
+    chat.name_session(prompt);
+    // Armed before the turn starts, so a stop that arrives while the first model
+    // call is still being set up is not lost.
+    let stop = chat.cancel.arm();
     let chat = Arc::clone(chat);
     let prompt = prompt.to_string();
     let running = turn.clone();
     handle.spawn(async move {
         let _busy = Busy(&chat.busy);
         chat.tag.set(&running);
-        run_turn(&chat, &running, &prompt).await;
+        run_turn(&chat, &running, &prompt, stop).await;
+        chat.cancel.disarm();
     });
 
     Turn {
@@ -1089,44 +1355,166 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
     }
 }
 
+/// Start a fresh conversation, leaving the one in hand where it is.
+///
+/// Nothing is dropped: every finished turn of the old conversation is on disk
+/// already, and the new one is written the moment it has a turn worth keeping.
+fn accept_new_session(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn {
+        response: Response::failed(&request.request_id, error),
+        shutdown: false,
+    };
+    if chat.busy.load(Ordering::SeqCst) {
+        return rejected(ProtocolError::new(
+            CHAT_BUSY,
+            "a turn is running; stop it or wait for it before starting another conversation",
+        ));
+    }
+
+    let session = chat.sessions.create("");
+    let id = session.id.clone();
+    chat.adopt(session);
+    log(Level::Info, format!("started session {id}"));
+    Turn {
+        response: Response::ok(&request.request_id, json!({ "session": id, "turns": 0 })),
+        shutdown: false,
+    }
+}
+
+/// Continue a conversation this workspace already holds.
+fn accept_open_session(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn {
+        response: Response::failed(&request.request_id, error),
+        shutdown: false,
+    };
+    if chat.busy.load(Ordering::SeqCst) {
+        return rejected(ProtocolError::new(
+            CHAT_BUSY,
+            "a turn is running; stop it or wait for it before opening another conversation",
+        ));
+    }
+
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`sessions.open` needs an `id` string",
+        ));
+    };
+    // A session id is a file name, so it is checked here rather than left to the
+    // store: what the host asked for is wrong, not what the store holds.
+    if !is_session_id(id) {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a session id"),
+        ));
+    }
+    let session = match chat.sessions.load(id) {
+        Ok(session) => session,
+        Err(error) => return rejected(ProtocolError::new(SESSION_UNKNOWN, error.to_string())),
+    };
+
+    let turns = session
+        .view
+        .get("turns")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let id = session.id.clone();
+    chat.adopt(session);
+    log(
+        Level::Info,
+        format!("continuing session {id} ({turns} turns)"),
+    );
+    Turn {
+        response: Response::ok(
+            &request.request_id,
+            json!({ "session": id, "turns": turns }),
+        ),
+        shutdown: false,
+    }
+}
+
 /// Run one prompt and stream it back.
 ///
-/// The history is locked for the whole turn: a second prompt is refused while
-/// this one runs rather than queued behind it, and a turn that failed is rolled
-/// back instead of leaving half an exchange for the model to trip over next time.
-async fn run_turn(chat: &Chat, turn: &str, prompt: &str) {
+/// A second prompt is refused while this one runs rather than queued behind it,
+/// and a turn that failed -- or was stopped -- is rolled back instead of leaving
+/// half an exchange for the model to trip over next time.
+async fn run_turn(chat: &Chat, turn: &str, prompt: &str, stop: tokio::sync::watch::Receiver<bool>) {
     let agent = match chat.agent() {
         Ok(agent) => agent,
         Err(error) => {
-            chat.failed(turn, &error);
+            let failed = failed_event(turn, &error);
+            chat.log.record(&failed);
+            chat.commit(None);
+            let _ = send(&failed);
             return;
         }
     };
 
-    let mut history = chat.history.lock().await;
+    // The messages are taken out for the turn rather than locked for it, so a
+    // page asking what the conversation holds is not made to wait for the model.
+    let mut history = chat.session().messages;
     let rollback = history.len();
     history.push(Message::user_text(agent.prepare_prompt(prompt)));
 
-    match agent.run_turn(&mut history).await {
-        Ok(()) => {
+    let mut stop = stop;
+    let outcome = tokio::select! {
+        // The turn finishing beats a stop that arrives with it: there is an
+        // answer, and it is not thrown away for a button pressed too late.
+        biased;
+        result = agent.run_turn(&mut history) => Some(result),
+        _ = stop.changed() => None,
+    };
+
+    match outcome {
+        Some(Ok(())) => {
             let text = history
                 .last()
                 .filter(|message| message.role == Role::Assistant)
                 .map(Message::text)
                 .unwrap_or_default();
-            drop(history);
-            chat.log.emit(event(
+            let done = event(
                 "chat.done",
                 json!({ "turn": turn, "ok": true, "text": text }),
-            ));
+            );
+            // Written down before it is announced. `chat.done` is the page's
+            // signal that the turn is over, so by the time it arrives the
+            // conversation on disk agrees -- and a prompt that follows it is
+            // refused only if a turn really is still running, never because a
+            // file is still being written.
+            chat.log.record(&done);
+            chat.commit(Some(history));
+            let _ = send(&done);
         }
-        Err(error) => {
+        Some(Err(error)) => {
             history.truncate(rollback);
-            drop(history);
-            let error = turn_error(&error);
-            chat.failed(turn, &error);
+            let failed = failed_event(turn, &turn_error(&error));
+            chat.log.record(&failed);
+            chat.commit(Some(history));
+            let _ = send(&failed);
+        }
+        None => {
+            // Stopped on request. Whatever the model streamed stays on the page,
+            // but the attempt is not fed back to it: the loop would otherwise
+            // have to reason about an answer that was never finished.
+            history.truncate(rollback);
+            let cancelled = event("chat.cancelled", json!({ "turn": turn }));
+            chat.log.record(&cancelled);
+            chat.commit(Some(history));
+            let _ = send(&cancelled);
         }
     }
+}
+
+/// The event for a turn that produced no answer.
+fn failed_event(turn: &str, error: &ProtocolError) -> EventMessage {
+    event(
+        "chat.failed",
+        json!({
+            "turn": turn,
+            "ok": false,
+            "error": { "code": error.code, "message": error.message },
+        }),
+    )
 }
 
 /// A stable code and the model's own words for a turn that failed.
@@ -1458,7 +1846,11 @@ mod tests {
     /// The pieces `dispatch` needs, for the tests that go through it.
     fn fixture(dir: &std::path::Path) -> (Bridge, Arc<Chat>, tokio::runtime::Runtime) {
         let chat = Arc::new(Chat::new(dir.to_path_buf(), CronScheduler::new(dir)));
-        (bridge_at(dir), chat, tokio::runtime::Runtime::new().unwrap())
+        (
+            bridge_at(dir),
+            chat,
+            tokio::runtime::Runtime::new().unwrap(),
+        )
     }
 
     #[test]
@@ -1723,7 +2115,10 @@ mod tests {
         let turns = snapshot["turns"].as_array().unwrap();
         assert_eq!(turns.len(), MAX_LOG_TURNS);
         assert_eq!(turns[0]["turn"], json!("turn-5"));
-        assert_eq!(turns[turns.len() - 1]["turn"], json!(format!("turn-{}", MAX_LOG_TURNS + 4)));
+        assert_eq!(
+            turns[turns.len() - 1]["turn"],
+            json!(format!("turn-{}", MAX_LOG_TURNS + 4))
+        );
     }
 
     #[test]
@@ -1794,7 +2189,10 @@ mod tests {
             assert!(!turn.shutdown);
             assert!(!turn.response.ok, "`{case}` was accepted");
             assert_eq!(
-                turn.response.error.as_ref().map(|error| error.code.as_str()),
+                turn.response
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
                 Some(INVALID_PARAMS),
                 "`{case}`"
             );
@@ -1818,7 +2216,10 @@ mod tests {
             turn_error(&Error::Config("no key".to_string())).code,
             CHAT_NOT_CONFIGURED
         );
-        assert_eq!(turn_error(&Error::MaxIterations(64)).code, "chat_step_limit");
+        assert_eq!(
+            turn_error(&Error::MaxIterations(64)).code,
+            "chat_step_limit"
+        );
         assert_eq!(
             turn_error(&Error::Stream("cut off".to_string())).code,
             "chat_turn_failed"
@@ -1831,7 +2232,11 @@ mod tests {
 
         // The cap lands inside a multi-byte character, so the cut has to back up
         // to the boundary instead of splitting one.
-        let text = format!("{}{}", "a".repeat(MAX_EVENT_TEXT_BYTES - 1), "é".repeat(100));
+        let text = format!(
+            "{}{}",
+            "a".repeat(MAX_EVENT_TEXT_BYTES - 1),
+            "é".repeat(100)
+        );
         let clamped = clamp(&text);
         assert!(clamped.len() < text.len());
         assert!(clamped.ends_with("more bytes omitted]"));
@@ -2015,5 +2420,201 @@ mod tests {
 
         let absolute = cwd.join("elsewhere");
         assert_eq!(resolve_workspace(&absolute).unwrap(), absolute);
+    }
+
+    /// A request with parameters, taken through the reader loop's parser.
+    fn request_with(id: &str, method: &str, params: Value) -> Request {
+        let line = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": id,
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        match parse_request(&line) {
+            Parsed::Request(request) => request,
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stop_aimed_at_nothing_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let turn = dispatch(
+            &request_with("r-1", "chat.cancel", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(turn.response.ok);
+        assert_eq!(turn.response.result, Some(json!({ "cancelled": false })));
+    }
+
+    #[test]
+    fn a_stop_reaches_the_turn_that_armed_it() {
+        let cancel = TurnCancel::default();
+        let mut armed = cancel.arm();
+        assert!(cancel.stop());
+        // The turn learns about it, and reads the value a stop sets. The sender
+        // is gone by then: a receiver that has an unseen version resolves
+        // `changed` before it ever looks at whether the sender still exists,
+        // which is what lets the stop arrive and the slot empty at once.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            assert!(armed.changed().await.is_ok());
+            assert!(*armed.borrow_and_update());
+        });
+
+        // The slot is emptied by the stop itself: a second one finds nothing.
+        assert!(!cancel.stop());
+
+        // A turn that is over takes its channel with it.
+        let _armed_again = cancel.arm();
+        cancel.disarm();
+        assert!(!cancel.stop());
+    }
+
+    #[test]
+    fn a_conversation_that_was_written_out_reads_back_whole() {
+        let log = TurnLog::new();
+        log.begin("turn-1", "first");
+        log.record(&event(
+            "chat.delta",
+            json!({ "turn": "turn-1", "text": "hi" }),
+        ));
+        log.record(&event(
+            "chat.done",
+            json!({ "turn": "turn-1", "ok": true, "text": "hi" }),
+        ));
+
+        let view = log.snapshot();
+        let read = TurnLog::from_snapshot(&view);
+        assert_eq!(read.snapshot(), view);
+        assert_eq!(read.last_number(), 1);
+
+        // A turn the file caught mid-flight is reported as failed rather than
+        // left spinning: whatever was going to finish it is gone.
+        let mut interrupted = view.clone();
+        interrupted["turns"][0]["status"] = json!("running");
+        let turn = &TurnLog::from_snapshot(&interrupted).snapshot()["turns"][0];
+        assert_eq!(turn["status"], json!("failed"));
+        assert_eq!(turn["error"]["code"], json!("chat_interrupted"));
+    }
+
+    #[test]
+    fn a_conversation_is_named_after_its_first_line() {
+        assert_eq!(session_title("first line\nsecond line"), "first line");
+        assert_eq!(session_title("  \n  spaced  "), "spaced");
+
+        let title = session_title(&"é".repeat(60));
+        assert_eq!(title.chars().count(), 49);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn the_conversation_list_names_the_one_being_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let turn = dispatch(
+            &request_with("r-1", "sessions.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(turn.response.ok);
+        let result = turn.response.result.unwrap();
+        assert_eq!(result["current"], json!(chat.session().id));
+        assert_eq!(result["sessions"], json!([]));
+    }
+
+    #[test]
+    fn another_conversation_can_be_started_and_opened_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        // A conversation this workspace already holds, written out the way a
+        // previous run would have left it.
+        let store = SessionStore::new(dir.path());
+        let mut saved = store.create("an older conversation");
+        saved.messages.push(Message::user_text("hello"));
+        let log = TurnLog::new();
+        log.begin("turn-1", "hello");
+        log.record(&event(
+            "chat.done",
+            json!({ "turn": "turn-1", "ok": true, "text": "hi" }),
+        ));
+        saved.view = log.snapshot();
+        assert!(store.save(&mut saved).unwrap().is_file());
+
+        let started = dispatch(
+            &request_with("r-1", "sessions.new", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(started.response.ok);
+        assert_ne!(chat.session().id, saved.id);
+        assert!(chat.session().messages.is_empty());
+
+        let listed = dispatch(
+            &request_with("r-2", "sessions.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let result = listed.response.result.unwrap();
+        assert_eq!(result["sessions"][0]["id"], json!(saved.id));
+        assert_eq!(
+            result["sessions"][0]["title"],
+            json!("an older conversation")
+        );
+        assert_eq!(result["sessions"][0]["messages"], json!(1));
+
+        // Opening it brings the messages and the turns back, and the next turn
+        // continues the numbering instead of naming a turn that already exists.
+        let opened = dispatch(
+            &request_with("r-3", "sessions.open", json!({ "id": saved.id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(opened.response.ok);
+        assert_eq!(chat.session().id, saved.id);
+        assert_eq!(chat.session().messages.len(), 1);
+        assert_eq!(chat.log.snapshot(), log.snapshot());
+        assert_eq!(chat.next_turn(), "turn-2");
+    }
+
+    #[test]
+    fn opening_a_conversation_that_is_not_there_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        for (case, params, code) in [
+            ("missing id", json!({}), INVALID_PARAMS),
+            ("not a string", json!({ "id": 7 }), INVALID_PARAMS),
+            ("not an id", json!({ "id": "../escape" }), INVALID_PARAMS),
+            (
+                "no such session",
+                json!({ "id": "s1-2-3" }),
+                SESSION_UNKNOWN,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "sessions.open", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!turn.response.ok, "`{case}` was accepted");
+            assert_eq!(
+                turn.response
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
     }
 }
