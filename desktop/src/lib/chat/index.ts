@@ -17,7 +17,9 @@ import type {
   ChatCancelResult,
   ChatEvent,
   ChatHistory,
+  ChatSessionDeleted,
   ChatSessionOpened,
+  ChatSessionRenamed,
   ChatSessions,
 } from './types'
 
@@ -72,6 +74,23 @@ export async function openChatSession(id: string): Promise<ChatSessionOpened> {
   return invoke<ChatSessionOpened>('chat_open_session', { id })
 }
 
+/**
+ * Give a conversation a name of its own.
+ *
+ * The name is the page's to choose and the id is not: it is one the runtime
+ * itself listed, and it is checked on the other side before anything is written.
+ */
+export async function renameChatSession(id: string, title: string): Promise<ChatSessionRenamed> {
+  requireShell()
+  return invoke<ChatSessionRenamed>('chat_rename_session', { id, title })
+}
+
+/** Forget a conversation. The answer names the one being continued now. */
+export async function deleteChatSession(id: string): Promise<ChatSessionDeleted> {
+  requireShell()
+  return invoke<ChatSessionDeleted>('chat_delete_session', { id })
+}
+
 /** Subscribe to the runtime's turn events. Returns the way to stop listening. */
 export async function subscribeChatEvents(
   onEvent: (event: ChatEvent) => void,
@@ -91,7 +110,9 @@ export type {
   ChatEventData,
   ChatHistory,
   ChatHistoryTurn,
+  ChatSessionDeleted,
   ChatSessionOpened,
+  ChatSessionRenamed,
   ChatSessionSummary,
   ChatSessions,
   ChatStatus,

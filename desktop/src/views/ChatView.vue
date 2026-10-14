@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import {
   Ban,
+  Check,
   ChevronDown,
   CircleAlert,
   History,
   LoaderCircle,
   MessageSquare,
+  Pencil,
   Plus,
   SendHorizontal,
   Square,
   Trash2,
   Wrench,
+  X,
 } from '@lucide/vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
@@ -33,8 +36,16 @@ const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
 /** The session menu, so choosing from it closes it. */
 const menu = ref<HTMLDetailsElement | null>(null)
+/** The conversation the menu is renaming, and the name typed so far. */
+const renaming = ref('')
+const renameDraft = ref('')
+/** The conversation the menu is asking about before it deletes it. */
+const deleting = ref('')
 /** Whether the reader is at the bottom; scrolling up must not be yanked back. */
 let following = true
+
+/** Longest conversation name the runtime takes, in characters. */
+const MAX_TITLE_CHARS = 120
 
 const active = computed(() => projects.active)
 const stateTone = computed(() => runtimeStateTone(runtime.state))
@@ -139,6 +150,46 @@ function pick(load: () => Promise<void>): void {
   void load()
 }
 
+/** Open the name field on a conversation and put the cursor in it. */
+function startRename(id: string, title: string): void {
+  deleting.value = ''
+  renaming.value = id
+  renameDraft.value = title
+}
+
+/** Put the cursor in the name field the moment it appears. */
+function focusRename(element: unknown): void {
+  if (element instanceof HTMLInputElement) {
+    element.focus()
+    element.select()
+  }
+}
+
+/**
+ * Keep the name that was typed.
+ *
+ * An empty name closes the field instead of saving one: the list already has a
+ * word for a conversation nobody named.
+ */
+async function commitRename(id: string): Promise<void> {
+  const title = renameDraft.value.trim()
+  if (title === '') {
+    renaming.value = ''
+    return
+  }
+  if (await chat.renameSession(id, title)) renaming.value = ''
+}
+
+/** Ask before deleting: a conversation is not something to lose by misclick. */
+function askDelete(id: string): void {
+  renaming.value = ''
+  deleting.value = id
+}
+
+async function confirmDelete(id: string): Promise<void> {
+  if (await chat.deleteSession(id)) deleting.value = ''
+}
+
 const SUGGESTIONS = [
   '这个项目是做什么的？看 README 和目录结构后告诉我。',
   '找出仓库里最近的 5 个 commit，用一句话概括每个。',
@@ -169,7 +220,7 @@ function turnTone(turn: ChatTurn): string {
         <details v-if="chat.sessionsSupported" ref="menu" class="relative">
           <summary
             class="flex max-w-[16rem] cursor-pointer list-none items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-xs text-ink-muted hover:text-ink"
-            title="这一页正在继续的会话；每一轮结束都会写到 Runtime 的工作目录里"
+            title="这一页正在继续的会话；每一轮结束都会写进应用自己的存储目录，而不是项目目录"
           >
             <History class="size-3.5 shrink-0" />
             <span class="truncate">{{ chat.currentTitle || '未命名会话' }}</span>
@@ -191,27 +242,100 @@ function turnTone(turn: ChatTurn): string {
             <p v-if="!chat.sessions.length" class="px-3 py-2 text-xs text-ink-faint">
               还没有写过任何会话：第一条提示词之后，它会出现在这里。
             </p>
-            <button
+            <div
               v-for="session in chat.sessions"
               :key="session.id"
-              type="button"
-              class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-canvas disabled:opacity-50"
-              :disabled="!chat.canSwitchSessions || session.id === chat.current"
-              :title="session.id"
-              @click="pick(() => chat.openSession(session.id))"
+              class="flex items-center gap-1 px-2 py-1.5 hover:bg-canvas"
             >
-              <span class="flex items-center gap-2">
-                <span class="truncate text-xs text-ink-muted">
-                  {{ session.title || '未命名会话' }}
+              <template v-if="renaming === session.id">
+                <input
+                  :ref="focusRename"
+                  v-model="renameDraft"
+                  type="text"
+                  class="min-w-0 flex-1 rounded border border-line bg-canvas px-2 py-1 text-xs text-ink outline-none"
+                  :maxlength="MAX_TITLE_CHARS"
+                  :placeholder="session.title || '未命名会话'"
+                  @keydown.enter.prevent="commitRename(session.id)"
+                  @keydown.esc.prevent="renaming = ''"
+                />
+                <button
+                  type="button"
+                  class="shrink-0 rounded p-1 text-ink-muted hover:text-ink"
+                  title="保存名字"
+                  @click="commitRename(session.id)"
+                >
+                  <Check class="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  class="shrink-0 rounded p-1 text-ink-muted hover:text-ink"
+                  title="放弃这次改名"
+                  @click="renaming = ''"
+                >
+                  <X class="size-3.5" />
+                </button>
+              </template>
+              <template v-else-if="deleting === session.id">
+                <span class="min-w-0 flex-1 truncate text-xs text-danger">
+                  删除「{{ session.title || '未命名会话' }}」？
                 </span>
-                <Badge v-if="session.id === chat.current" class="px-1.5 py-0 text-[10px]">
-                  当前
-                </Badge>
-              </span>
-              <span class="text-[10px] text-ink-faint">
-                {{ session.messages }} 条消息 · {{ formatRelative(session.updated_at) }}
-              </span>
-            </button>
+                <button
+                  type="button"
+                  class="shrink-0 rounded px-2 py-1 text-xs text-danger hover:bg-danger/10 disabled:opacity-50"
+                  :disabled="!chat.canSwitchSessions"
+                  title="删掉这条会话，它的文件会一起消失"
+                  @click="confirmDelete(session.id)"
+                >
+                  删除
+                </button>
+                <button
+                  type="button"
+                  class="shrink-0 rounded px-2 py-1 text-xs text-ink-muted hover:text-ink"
+                  @click="deleting = ''"
+                >
+                  取消
+                </button>
+              </template>
+              <template v-else>
+                <button
+                  type="button"
+                  class="flex min-w-0 flex-1 flex-col gap-0.5 text-left hover:text-ink disabled:opacity-50"
+                  :disabled="!chat.canSwitchSessions || session.id === chat.current"
+                  :title="session.id"
+                  @click="pick(() => chat.openSession(session.id))"
+                >
+                  <span class="flex items-center gap-2">
+                    <span class="truncate text-xs text-ink-muted">
+                      {{ session.title || '未命名会话' }}
+                    </span>
+                    <Badge v-if="session.id === chat.current" class="px-1.5 py-0 text-[10px]">
+                      当前
+                    </Badge>
+                  </span>
+                  <span class="text-[10px] text-ink-faint">
+                    {{ session.messages }} 条消息 · {{ formatRelative(session.updated_at) }}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="shrink-0 rounded p-1 text-ink-faint hover:text-ink disabled:opacity-30"
+                  title="给这条会话改名"
+                  :disabled="!chat.canSwitchSessions"
+                  @click="startRename(session.id, session.title)"
+                >
+                  <Pencil class="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  class="shrink-0 rounded p-1 text-ink-faint hover:text-danger disabled:opacity-30"
+                  title="删掉这条会话"
+                  :disabled="!chat.canSwitchSessions"
+                  @click="askDelete(session.id)"
+                >
+                  <Trash2 class="size-3.5" />
+                </button>
+              </template>
+            </div>
             <p v-if="chat.sessionError" class="px-3 py-2 text-[11px] text-danger">
               {{ chat.sessionError.code }}：{{ chat.sessionError.message }}
             </p>

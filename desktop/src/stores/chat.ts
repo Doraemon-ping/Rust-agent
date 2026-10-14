@@ -3,10 +3,12 @@ import { computed, ref, watch } from 'vue'
 
 import {
   cancelChatTurn,
+  deleteChatSession,
   fetchChatHistory,
   fetchChatSessions,
   newChatSession,
   openChatSession,
+  renameChatSession,
   sendChatPrompt,
   subscribeChatEvents,
 } from '@/lib/chat'
@@ -50,7 +52,7 @@ export const useChatStore = defineStore('chat', () => {
   const sessions = ref<ChatSessionSummary[]>([])
   /** Which of them is being continued. */
   const current = ref('')
-  /** Why the conversation list is not readable, when it is not. */
+  /** Why the conversation list -- or the last change to it -- failed. */
   const sessionError = ref<RuntimeError | null>(null)
   let unsubscribe: (() => void) | null = null
   let sequence = 0
@@ -341,6 +343,51 @@ export const useChatStore = defineStore('chat', () => {
     return switchTo(() => openChatSession(id))
   }
 
+  /**
+   * Give a conversation a name of its own.
+   *
+   * The page stays where it is: a name is not a turn, and the runtime keeps
+   * continuing the same conversation. A conversation that has no file yet is
+   * named anyway, so naming one before its first prompt works rather than being
+   * thrown away when it is written.
+   */
+  async function renameSession(id: string, title: string): Promise<boolean> {
+    if (!canSwitchSessions.value) return false
+    sessionError.value = null
+    try {
+      await renameChatSession(id, title)
+    } catch (failure) {
+      sessionError.value = toRuntimeError(failure)
+      return false
+    }
+    await refreshSessions()
+    return true
+  }
+
+  /**
+   * Forget a conversation.
+   *
+   * The one on screen can go too: the runtime continues whatever is left, or
+   * starts an empty conversation, and this page reads that back instead of
+   * keeping a transcript of something that is no longer there.
+   */
+  async function deleteSession(id: string): Promise<boolean> {
+    if (!canSwitchSessions.value) return false
+    sessionError.value = null
+    try {
+      const answer = await deleteChatSession(id)
+      current.value = answer.current
+      turns.value = []
+      deferred = []
+      await readAgain()
+    } catch (failure) {
+      sessionError.value = toRuntimeError(failure)
+      return false
+    }
+    await refreshSessions()
+    return true
+  }
+
   function disconnect(): void {
     unsubscribe?.()
     unsubscribe = null
@@ -435,6 +482,8 @@ export const useChatStore = defineStore('chat', () => {
     refreshSessions,
     startSession,
     openSession,
+    renameSession,
+    deleteSession,
     cancel,
     connect,
     disconnect,

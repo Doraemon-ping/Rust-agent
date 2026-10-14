@@ -92,6 +92,8 @@ export interface RuntimeCommands {
   chat_sessions: () => Promise<{ current?: string; sessions?: unknown[] }>
   chat_new_session: () => Promise<{ session: string; turns: number }>
   chat_open_session: (id: string) => Promise<{ session: string; turns: number }>
+  chat_rename_session: (id: string, title: string) => Promise<{ session: string; title: string }>
+  chat_delete_session: (id: string) => Promise<{ deleted: string; current: string }>
 }
 
 export const RUNTIME_STATE_LABEL: Record<RuntimeState, string> = {

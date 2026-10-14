@@ -119,6 +119,26 @@ export interface ChatSessionOpened {
   turns: number
 }
 
+/**
+ * What `sessions.rename` answers with: the conversation, and the name it now has.
+ */
+export interface ChatSessionRenamed {
+  session: string
+  title: string
+}
+
+/**
+ * What `sessions.delete` answers with.
+ *
+ * `current` is the conversation the runtime is continuing now, which may be a
+ * different one: deleting the conversation in hand moves the runtime on rather
+ * than leaving it with nowhere to put the next prompt.
+ */
+export interface ChatSessionDeleted {
+  deleted: string
+  current: string
+}
+
 /** What `chat.cancel` answers with: whether there was a turn to stop. */
 export interface ChatCancelResult {
   cancelled: boolean
