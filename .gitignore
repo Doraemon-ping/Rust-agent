@@ -17,3 +17,6 @@
 # agent teams (s13)
 /.mailboxes
 /.worktrees
+
+# durable conversations
+/.sessions
