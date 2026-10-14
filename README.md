@@ -96,6 +96,7 @@ it.)
 | `src/recovery.rs` | Model-call recovery (s15): classify 429/529, backoff, fallback model, escalation |
 | `src/workflow.rs` | Workflow runtime (s16): saved scripts, `agent`/`parallel`/`pipeline`, journal, resume |
 | `src/goal.rs` | Goal loop (s17): a session condition plus an independent, tool-free evaluator at the Stop boundary |
+| `src/session.rs` | Durable conversations: one JSON file per session under `.sessions/`, with the writer's own view kept verbatim |
 | `src/permission.rs` | Three-gate pipeline: deny list, rules, approval |
 | `src/hooks.rs` | `Hook` trait + `Hooks` registry: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` |
 | `src/subagent.rs` | `task` tool: nested agent loop with fresh context (s06) |

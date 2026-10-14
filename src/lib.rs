@@ -32,6 +32,7 @@ pub mod memory;
 pub mod message;
 pub mod permission;
 pub mod recovery;
+pub mod session;
 pub mod skills;
 pub mod subagent;
 pub mod team;
@@ -83,6 +84,9 @@ pub use permission::{
 };
 pub use recovery::{
     classify, is_retryable, ErrorClass, RecoveryConfig, RecoveryState, CONTINUATION_PROMPT,
+};
+pub use session::{
+    is_session_id, new_session_id, Session, SessionStore, SessionSummary, SESSIONS_DIR,
 };
 pub use skills::{parse_frontmatter, Skill, SkillLoader, SKILL_MANIFEST};
 pub use subagent::{subagent_system_prompt, TaskTool, TASK_TOOL_NAME};

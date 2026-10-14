@@ -79,4 +79,8 @@ pub enum Error {
     /// The goal controller rejected a condition, or the evaluator failed (s17).
     #[error("goal error: {0}")]
     Goal(String),
+
+    /// The session store rejected a conversation, or an id that is not one.
+    #[error("session error: {0}")]
+    Session(String),
 }
