@@ -29,8 +29,13 @@ export type ChatBlock =
 /** A tool call, once the template has narrowed a block down to one. */
 export type ChatToolBlock = Extract<ChatBlock, { kind: 'tool' }>
 
-/** Where a turn got to. A failed turn keeps the reason it failed. */
-export type ChatStatus = 'pending' | 'done' | 'failed'
+/**
+ * Where a turn got to.
+ *
+ * A failed turn keeps the reason it failed; a cancelled one was stopped at the
+ * user's request, which is not a failure and has nothing to explain.
+ */
+export type ChatStatus = 'pending' | 'done' | 'failed' | 'cancelled'
 
 export interface ChatTurn {
   /** The runtime's turn id, once the accept has named it; empty until then. */
@@ -80,7 +85,7 @@ export interface ChatAccepted {
 export interface ChatHistoryTurn {
   turn: string
   prompt: string
-  status: 'running' | 'done' | 'failed'
+  status: 'running' | 'done' | 'failed' | 'cancelled'
   error?: RuntimeError | null
   /** The turn's `chat.*` events, in the order they were sent. */
   events?: ChatEvent[]
@@ -89,4 +94,32 @@ export interface ChatHistoryTurn {
 /** What `chat.history` answers with: the turns so far, oldest first. */
 export interface ChatHistory {
   turns?: ChatHistoryTurn[]
+}
+
+/** One conversation in the runtime's workspace, without its turns. */
+export interface ChatSessionSummary {
+  id: string
+  /** Empty until the conversation has a first prompt to be named after. */
+  title: string
+  created_at: string
+  updated_at: string
+  /** How many messages the model has seen. */
+  messages: number
+}
+
+/** What `sessions.list` answers with: the conversations, and the current one. */
+export interface ChatSessions {
+  current?: string
+  sessions?: ChatSessionSummary[]
+}
+
+/** What `sessions.new` and `sessions.open` answer with. */
+export interface ChatSessionOpened {
+  session: string
+  turns: number
+}
+
+/** What `chat.cancel` answers with: whether there was a turn to stop. */
+export interface ChatCancelResult {
+  cancelled: boolean
 }

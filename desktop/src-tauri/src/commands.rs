@@ -67,6 +67,40 @@ pub async fn chat_history(manager: State<'_, RuntimeManager>) -> Result<Value, H
     manager.chat_history().await
 }
 
+/// Stop the turn that is running.
+///
+/// Nothing about the turn is chosen here: the runtime stops the one turn it is
+/// running, and says whether there was one.
+#[tauri::command]
+pub async fn chat_cancel(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.chat_cancel().await
+}
+
+/// The conversations this workspace holds, and the one being continued.
+#[tauri::command]
+pub async fn chat_sessions(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.chat_sessions().await
+}
+
+/// Start a fresh conversation in the runtime's workspace.
+#[tauri::command]
+pub async fn chat_new_session(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.chat_new_session().await
+}
+
+/// Continue a conversation this workspace already holds.
+///
+/// The page may name a session here, and that is deliberate: a session is one
+/// the runtime itself listed, and the id is checked against the workspace on
+/// the other side before anything is read.
+#[tauri::command]
+pub async fn chat_open_session(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_open_session(&id).await
+}
+
 /// The most recent log lines, oldest first.
 #[tauri::command]
 pub async fn runtime_logs(

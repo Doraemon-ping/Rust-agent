@@ -12,7 +12,14 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 import { RUNTIME_EVENT } from '@/lib/runtime'
 import { requireShell } from '@/lib/shell'
-import type { ChatAccepted, ChatEvent, ChatHistory } from './types'
+import type {
+  ChatAccepted,
+  ChatCancelResult,
+  ChatEvent,
+  ChatHistory,
+  ChatSessionOpened,
+  ChatSessions,
+} from './types'
 
 /**
  * Accept one prompt.
@@ -36,6 +43,35 @@ export async function fetchChatHistory(): Promise<ChatHistory> {
   return invoke<ChatHistory>('chat_history')
 }
 
+/**
+ * Stop the turn that is running.
+ *
+ * The runtime answers whether there was one to stop: the page asked, and the
+ * page is told what happened rather than what it hoped for.
+ */
+export async function cancelChatTurn(): Promise<ChatCancelResult> {
+  requireShell()
+  return invoke<ChatCancelResult>('chat_cancel')
+}
+
+/** The conversations the runtime holds for this workspace. */
+export async function fetchChatSessions(): Promise<ChatSessions> {
+  requireShell()
+  return invoke<ChatSessions>('chat_sessions')
+}
+
+/** Start a fresh conversation. The old one stays on disk. */
+export async function newChatSession(): Promise<ChatSessionOpened> {
+  requireShell()
+  return invoke<ChatSessionOpened>('chat_new_session')
+}
+
+/** Continue one the workspace already holds. */
+export async function openChatSession(id: string): Promise<ChatSessionOpened> {
+  requireShell()
+  return invoke<ChatSessionOpened>('chat_open_session', { id })
+}
+
 /** Subscribe to the runtime's turn events. Returns the way to stop listening. */
 export async function subscribeChatEvents(
   onEvent: (event: ChatEvent) => void,
@@ -50,10 +86,14 @@ export async function subscribeChatEvents(
 export type {
   ChatAccepted,
   ChatBlock,
+  ChatCancelResult,
   ChatEvent,
   ChatEventData,
   ChatHistory,
   ChatHistoryTurn,
+  ChatSessionOpened,
+  ChatSessionSummary,
+  ChatSessions,
   ChatStatus,
   ChatToolBlock,
   ChatTurn,

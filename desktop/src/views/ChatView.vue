@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import {
   Ban,
+  ChevronDown,
   CircleAlert,
+  History,
   LoaderCircle,
   MessageSquare,
+  Plus,
   SendHorizontal,
+  Square,
   Trash2,
   Wrench,
 } from '@lucide/vue'
@@ -15,7 +19,7 @@ import Alert from '@/components/ui/Alert.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
 import type { ChatBlock, ChatTurn } from '@/lib/chat'
-import { shortenPath } from '@/lib/format'
+import { formatRelative, shortenPath } from '@/lib/format'
 import { RUNTIME_STATE_LABEL, runtimeStateTone } from '@/lib/runtime/types'
 import { useChatStore } from '@/stores/chat'
 import { useProjectsStore } from '@/stores/projects'
@@ -27,6 +31,8 @@ const chat = useChatStore()
 
 const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
+/** The session menu, so choosing from it closes it. */
+const menu = ref<HTMLDetailsElement | null>(null)
 /** Whether the reader is at the bottom; scrolling up must not be yanked back. */
 let following = true
 
@@ -73,7 +79,11 @@ const placeholder = computed(() => {
 })
 
 const hint = computed(() => {
-  if (chat.pending) return 'Runtime 一次只处理一个提示词；上一轮结束后就能继续。'
+  if (chat.pending) {
+    return chat.canCancel
+      ? '这一轮正在运行：可以停止它，或者等它结束；停下来的一轮不会进入上下文。'
+      : 'Runtime 一次只处理一个提示词；上一轮结束后就能继续。'
+  }
   if (!active.value) return '未选择项目：提示词会在上面这个宿主工作目录里执行。'
   return '回答、工具调用与权限拒绝都由 Runtime 上报，这一页只呈现，不编造。'
 })
@@ -123,6 +133,12 @@ function suggest(text: string): void {
   draft.value = text
 }
 
+/** Run a session action and close the menu behind it. */
+function pick(load: () => Promise<void>): void {
+  menu.value?.removeAttribute('open')
+  void load()
+}
+
 const SUGGESTIONS = [
   '这个项目是做什么的？看 README 和目录结构后告诉我。',
   '找出仓库里最近的 5 个 commit，用一句话概括每个。',
@@ -131,6 +147,7 @@ const SUGGESTIONS = [
 
 function turnTone(turn: ChatTurn): string {
   if (turn.status === 'failed') return 'border-danger/35'
+  if (turn.status === 'cancelled') return 'border-line/50'
   if (turn.status === 'pending') return 'border-line'
   return 'border-line/70'
 }
@@ -149,6 +166,57 @@ function turnTone(turn: ChatTurn): string {
         </p>
       </div>
       <div class="flex shrink-0 items-center gap-2">
+        <details v-if="chat.sessionsSupported" ref="menu" class="relative">
+          <summary
+            class="flex max-w-[16rem] cursor-pointer list-none items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-xs text-ink-muted hover:text-ink"
+            title="这一页正在继续的会话；每一轮结束都会写到 Runtime 的工作目录里"
+          >
+            <History class="size-3.5 shrink-0" />
+            <span class="truncate">{{ chat.currentTitle || '未命名会话' }}</span>
+            <ChevronDown class="size-3.5 shrink-0" />
+          </summary>
+          <div
+            class="absolute right-0 z-20 mt-2 w-80 overflow-hidden rounded-lg border border-line bg-surface shadow-lg"
+          >
+            <button
+              type="button"
+              class="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-ink hover:bg-canvas disabled:opacity-50"
+              :disabled="!chat.canSwitchSessions"
+              @click="pick(chat.startSession)"
+            >
+              <Plus class="size-3.5 shrink-0 text-ink-faint" />
+              新会话
+            </button>
+            <div v-if="chat.sessions.length" class="h-px bg-line/60" />
+            <p v-if="!chat.sessions.length" class="px-3 py-2 text-xs text-ink-faint">
+              还没有写过任何会话：第一条提示词之后，它会出现在这里。
+            </p>
+            <button
+              v-for="session in chat.sessions"
+              :key="session.id"
+              type="button"
+              class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-canvas disabled:opacity-50"
+              :disabled="!chat.canSwitchSessions || session.id === chat.current"
+              :title="session.id"
+              @click="pick(() => chat.openSession(session.id))"
+            >
+              <span class="flex items-center gap-2">
+                <span class="truncate text-xs text-ink-muted">
+                  {{ session.title || '未命名会话' }}
+                </span>
+                <Badge v-if="session.id === chat.current" class="px-1.5 py-0 text-[10px]">
+                  当前
+                </Badge>
+              </span>
+              <span class="text-[10px] text-ink-faint">
+                {{ session.messages }} 条消息 · {{ formatRelative(session.updated_at) }}
+              </span>
+            </button>
+            <p v-if="chat.sessionError" class="px-3 py-2 text-[11px] text-danger">
+              {{ chat.sessionError.code }}：{{ chat.sessionError.message }}
+            </p>
+          </div>
+        </details>
         <Button
           v-if="chat.turns.length"
           variant="ghost"
@@ -266,6 +334,13 @@ function turnTone(turn: ChatTurn): string {
               {{ turn.error?.code }}：{{ turn.error?.message }}
             </span>
           </p>
+          <p
+            v-else-if="turn.status === 'cancelled'"
+            class="flex items-start gap-2 text-xs text-ink-faint"
+          >
+            <Square class="mt-0.5 size-3 shrink-0" />
+            <span>这一轮被停止了；Runtime 不会把它记进上下文。</span>
+          </p>
         </li>
       </ol>
     </div>
@@ -281,7 +356,11 @@ function turnTone(turn: ChatTurn): string {
           :placeholder="placeholder"
           @keydown.enter.exact.prevent="submit"
         />
-        <Button :disabled="!canSubmit" @click="submit">
+        <Button v-if="chat.pending" variant="outline" :disabled="!chat.canCancel" @click="chat.cancel()">
+          <Square class="size-3.5" />
+          停止
+        </Button>
+        <Button v-else :disabled="!canSubmit" @click="submit">
           <SendHorizontal class="size-4" />
           发送
         </Button>

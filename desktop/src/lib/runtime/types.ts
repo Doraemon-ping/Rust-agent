@@ -87,7 +87,11 @@ export interface RuntimeCommands {
   runtime_logs: (limit?: number) => Promise<RuntimeLogLine[]>
   runtime_host_info: () => Promise<HostInfo>
   chat_send: (prompt: string) => Promise<{ accepted: boolean; turn: string }>
+  chat_cancel: () => Promise<{ cancelled: boolean }>
   chat_history: () => Promise<{ turns: unknown[] }>
+  chat_sessions: () => Promise<{ current?: string; sessions?: unknown[] }>
+  chat_new_session: () => Promise<{ session: string; turns: number }>
+  chat_open_session: (id: string) => Promise<{ session: string; turns: number }>
 }
 
 export const RUNTIME_STATE_LABEL: Record<RuntimeState, string> = {

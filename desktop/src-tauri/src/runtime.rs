@@ -408,6 +408,40 @@ impl RuntimeManager {
         self.request("chat.history", json!({}), CHAT_TIMEOUT).await
     }
 
+    /// Stop the turn that is running, if one is.
+    ///
+    /// The runtime answers whether it stopped anything, so a page that asks
+    /// with nothing running is told so instead of being handed a guess.
+    pub async fn chat_cancel(&self) -> Result<Value, HostError> {
+        self.request("chat.cancel", json!({}), CHAT_TIMEOUT).await
+    }
+
+    /// The conversations this workspace holds, and the one being continued.
+    pub async fn chat_sessions(&self) -> Result<Value, HostError> {
+        self.request("sessions.list", json!({}), CHAT_TIMEOUT).await
+    }
+
+    /// Start a fresh conversation in this workspace.
+    ///
+    /// The conversation in hand is not lost: the runtime writes every finished
+    /// turn down as it happens.
+    pub async fn chat_new_session(&self) -> Result<Value, HostError> {
+        self.request("sessions.new", json!({}), CHAT_TIMEOUT).await
+    }
+
+    /// Continue a conversation this workspace already holds.
+    pub async fn chat_open_session(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_session",
+                "a session id cannot be empty",
+            ));
+        }
+        self.request("sessions.open", json!({ "id": id }), CHAT_TIMEOUT)
+            .await
+    }
+
     /// The folder the runtime is started in: the active project when the user
     /// has chosen one, otherwise the per-user workspace.
     ///

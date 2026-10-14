@@ -1,8 +1,23 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 
-import { fetchChatHistory, sendChatPrompt, subscribeChatEvents } from '@/lib/chat'
-import type { ChatEvent, ChatEventData, ChatToolBlock, ChatTurn } from '@/lib/chat'
+import {
+  cancelChatTurn,
+  fetchChatHistory,
+  fetchChatSessions,
+  newChatSession,
+  openChatSession,
+  sendChatPrompt,
+  subscribeChatEvents,
+} from '@/lib/chat'
+import type {
+  ChatEvent,
+  ChatEventData,
+  ChatSessionOpened,
+  ChatSessionSummary,
+  ChatToolBlock,
+  ChatTurn,
+} from '@/lib/chat'
 import { toRuntimeError } from '@/lib/runtime/errors'
 import type { RuntimeError } from '@/lib/runtime/types'
 import { useRuntimeStore } from '@/stores/runtime'
@@ -31,6 +46,12 @@ export const useChatStore = defineStore('chat', () => {
   const turns = ref<ChatTurn[]>([])
   const error = ref<RuntimeError | null>(null)
   const connected = ref(false)
+  /** The conversations this workspace holds, newest first. */
+  const sessions = ref<ChatSessionSummary[]>([])
+  /** Which of them is being continued. */
+  const current = ref('')
+  /** Why the conversation list is not readable, when it is not. */
+  const sessionError = ref<RuntimeError | null>(null)
   let unsubscribe: (() => void) | null = null
   let sequence = 0
   /** Events that arrived before the turn they name was known. */
@@ -42,10 +63,24 @@ export const useChatStore = defineStore('chat', () => {
   const historySupported = computed(() =>
     (runtime.snapshot?.methods ?? []).includes('chat.history'),
   )
+  /** Whether it can stop the turn that is running. */
+  const cancelSupported = computed(() => (runtime.snapshot?.methods ?? []).includes('chat.cancel'))
+  /** Whether it can say which conversations it holds. */
+  const sessionsSupported = computed(() =>
+    (runtime.snapshot?.methods ?? []).includes('sessions.list'),
+  )
   /** A turn is in flight; the runtime takes one prompt at a time. */
   const pending = computed(() => turns.value.some((turn) => turn.status === 'pending'))
   /** Whether the composer may send. */
   const canSend = computed(() => runtime.ready && supported.value && !pending.value)
+  /** Whether the stop button is worth offering right now. */
+  const canCancel = computed(() => runtime.ready && cancelSupported.value && pending.value)
+  /** Whether another conversation may be chosen: not mid-turn. */
+  const canSwitchSessions = computed(() => runtime.ready && sessionsSupported.value && !pending.value)
+  /** The name of the conversation being continued, when it has one. */
+  const currentTitle = computed(
+    () => sessions.value.find((session) => session.id === current.value)?.title ?? '',
+  )
 
   /**
    * The turn an event belongs to.
@@ -152,6 +187,13 @@ export const useChatStore = defineStore('chat', () => {
         }
         break
 
+      case 'chat.cancelled':
+        // Stopped, not broken: the runtime rolled the attempt back, so there is
+        // nothing to explain and nothing to keep in the conversation.
+        turn.status = 'cancelled'
+        turn.error = null
+        break
+
       default:
         break
     }
@@ -177,6 +219,7 @@ export const useChatStore = defineStore('chat', () => {
     }
     // This window may be a reload of one that was already in conversation.
     await restore()
+    await refreshSessions()
   }
 
   /** The re-read that is in flight, if any. */
@@ -227,6 +270,75 @@ export const useChatStore = defineStore('chat', () => {
     const waiting = deferred
     deferred = []
     for (const event of waiting) apply(event)
+  }
+
+  /** Read the conversation back again, after the runtime switched to another. */
+  async function readAgain(): Promise<void> {
+    const inFlight = restoring
+    if (inFlight) await inFlight
+    restoring = null
+    await restore()
+  }
+
+  /**
+   * Which conversations this workspace holds.
+   *
+   * The runtime owns the list -- it is the one that writes the files -- so the
+   * page asks rather than keeping its own idea of what was said when.
+   */
+  async function refreshSessions(): Promise<void> {
+    if (!runtime.ready || !sessionsSupported.value) return
+    try {
+      const answer = await fetchChatSessions()
+      sessions.value = answer.sessions ?? []
+      current.value = answer.current ?? ''
+      sessionError.value = null
+    } catch (failure) {
+      sessionError.value = toRuntimeError(failure)
+    }
+  }
+
+  /**
+   * Stop the turn that is running.
+   *
+   * The turn ends as `chat.cancelled`, not here: the runtime may be in the
+   * middle of a tool call, and only it knows when the turn has actually
+   * stopped. `false` means there was nothing to stop.
+   */
+  async function cancel(): Promise<boolean> {
+    if (!canCancel.value) return false
+    try {
+      return (await cancelChatTurn()).cancelled
+    } catch (failure) {
+      error.value = toRuntimeError(failure)
+      return false
+    }
+  }
+
+  /** Switch conversations, then show the one the runtime switched to. */
+  async function switchTo(load: () => Promise<ChatSessionOpened>): Promise<void> {
+    if (!canSwitchSessions.value) return
+    error.value = null
+    try {
+      const opened = await load()
+      current.value = opened.session
+      turns.value = []
+      deferred = []
+      await readAgain()
+    } catch (failure) {
+      error.value = toRuntimeError(failure)
+    }
+    await refreshSessions()
+  }
+
+  /** Start a fresh conversation. The one in hand stays on disk. */
+  function startSession(): Promise<void> {
+    return switchTo(newChatSession)
+  }
+
+  /** Continue a conversation this workspace already holds. */
+  function openSession(id: string): Promise<void> {
+    return switchTo(() => openChatSession(id))
   }
 
   function disconnect(): void {
@@ -280,6 +392,7 @@ export const useChatStore = defineStore('chat', () => {
         // have moved to another project, so the page re-reads instead of
         // keeping a transcript of a runtime that is gone.
         void restore()
+        void refreshSessions()
         return
       }
       for (const turn of turns.value) {
@@ -297,6 +410,13 @@ export const useChatStore = defineStore('chat', () => {
     },
   )
 
+  // A turn that just ended may have named the conversation it belongs to -- the
+  // first prompt is what a conversation is called -- or changed how much it
+  // holds, so the list is re-read once per turn rather than left stale.
+  watch(pending, (running, wasRunning) => {
+    if (wasRunning && !running) void refreshSessions()
+  })
+
   return {
     turns,
     error,
@@ -304,6 +424,18 @@ export const useChatStore = defineStore('chat', () => {
     supported,
     pending,
     canSend,
+    sessions,
+    sessionError,
+    current,
+    currentTitle,
+    cancelSupported,
+    sessionsSupported,
+    canCancel,
+    canSwitchSessions,
+    refreshSessions,
+    startSession,
+    openSession,
+    cancel,
     connect,
     disconnect,
     send,

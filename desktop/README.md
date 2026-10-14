@@ -135,9 +135,15 @@ reloaded window is a new page but not a new conversation: the page reads the
 turns back with `chat.history` and replays each through the folding the live
 events go through, so a reload in the middle of an answer picks it up where it
 was. An event that arrives before the turn it names is held rather than dropped,
-for the same reason. Restarting the runtime -- or choosing another project,
-which restarts it -- does end the conversation, and the page follows by reading
-an empty history rather than keeping a transcript of a runtime that is gone.
+for the same reason.
+
+The conversation is also written down as it goes, under `<workspace>/.sessions`,
+so it outlives the process that held it. Restarting the runtime -- or choosing
+another project, which restarts it -- does not end it: the runtime continues the
+conversation it was last holding, and a page that reloads reads it back the way
+it reads back a reload. The conversation picker on the chat page lists what this
+workspace holds, marks the one being continued, and can start a fresh one or
+pick up an older one.
 
 - The agent is built on the first prompt, not at startup, so a runtime with no
   model configured still starts and still answers for itself. A prompt sent
@@ -149,6 +155,15 @@ an empty history rather than keeping a transcript of a runtime that is gone.
 - A failed turn is rolled back: the half exchange is dropped rather than left
   for the next prompt to trip over. The failure carries a code the page branches
   on and the provider's own words.
+- A running turn can be stopped. 发送 becomes 停止 while a turn is in flight; a
+  stop ends the turn where it stands, so whatever streamed stays on the page,
+  `chat.cancelled` names the turn that stopped, and the half exchange is dropped
+  rather than fed back to the model. The stop is answered only once the turn is
+  really over, so the prompt sent straight after pressing it is accepted instead
+  of being refused as a turn still running.
+- Switching conversations is refused while a turn is running, and the page says
+  so rather than dropping the turn: the one-turn slot is the runtime's, not the
+  page's, and a conversation cannot be swapped out from under it.
 - The loop keeps its history for the life of the runtime process, and a `task`
   call's subagent reports its tool calls but not its prose -- that prose is the
   `task` tool's result to the model, not an answer to the user.
@@ -174,7 +189,8 @@ share. The runtime seam exposes `getRuntimeStatus`,
 `unsubscribeRuntimeEvents`. The projects seam exposes `listProjects`,
 `pickProject`, `selectProject`, and `removeProject`. The provider seam exposes
 `getProviderSettings` and `saveProviderSettings`. The chat seam exposes
-`sendChatPrompt`, `subscribeChatEvents`, and `fetchChatHistory`; a prompt is the
+`sendChatPrompt`, `cancelChatTurn`, `fetchChatHistory`, `fetchChatSessions`,
+`newChatSession`, `openChatSession`, and `subscribeChatEvents`; a prompt is the
 one thing the page chooses there, and the answer arrives on the events rather
 than the command.
 
@@ -182,12 +198,16 @@ than the command.
 `runtime_status`, `runtime_start`, `runtime_stop`, `runtime_restart`,
 `runtime_ping`, `runtime_logs`, `runtime_host_info`, `projects_list`,
 `projects_pick`, `projects_select`, `projects_remove`, `provider_get`,
-`provider_save`, `chat_send`, and `chat_history`. None of them takes a path, a
-binary, or a command line from the caller, and the projects commands that name a
-project take an id the host itself handed out. `provider_save` is the one
-command that takes a secret in -- and its answer still does not contain one.
-`chat_send` takes the prompt text and nothing else; the workspace, the model,
-and the credentials are all decided in the host.
+`provider_save`, `chat_send`, `chat_cancel`, `chat_history`, `chat_sessions`,
+`chat_new_session`, and `chat_open_session`. None of them takes a path, a
+binary, or a command line from the caller, and the commands that name something
+the runtime holds -- a project, a conversation -- take an id the runtime itself
+handed out. `provider_save` is the one command that takes a secret in -- and its
+answer still does not contain one. `chat_send` takes the prompt text and nothing
+else; the workspace, the model, and the credentials are all decided in the host.
+`chat_open_session` takes a session id, and only one this workspace holds: the
+runtime checks its shape before it touches the disk, and answers
+`session_unknown` for an id that is well formed but not there.
 
 **Host events** are `runtime://status`, `runtime://message`, `runtime://log`,
 and `runtime://chat`. Status is pushed on every state change; the page never
@@ -234,10 +254,11 @@ Unattributable failure, when there is no request to blame:
 ```
 
 Methods: `runtime.status` (a full snapshot), `runtime.ping`, `runtime.shutdown`,
-`chat.send`, and `chat.history`. `chat.send` is the only one that takes
-parameters -- the others refuse any key at all, so a host that thinks it is
-talking to a newer bridge finds out at once. Its request carries the prompt and
-nothing else:
+`chat.send`, `chat.cancel`, `chat.history`, `sessions.list`, `sessions.new`, and
+`sessions.open`. Only `chat.send` and `sessions.open` take parameters -- the
+others refuse any key at all, so a host that thinks it is talking to a newer
+bridge finds out at once. `chat.send`'s request carries the prompt and nothing
+else:
 
 ```json
 {"protocol_version":1,"type":"request","request_id":"host-9","method":"chat.send","params":{"prompt":"summarise the workspace"}}
@@ -256,23 +277,47 @@ The turn itself arrives as events, each tagged with its `turn` and its `source`
 `chat.tool_result`, `chat.blocked` (a permission-sensitive call refused because
 there is no terminal to approve it), `chat.notice` (progress that is not an
 answer -- compaction, memory, recovery, cron), and finally exactly one of
-`chat.done` (with the whole answer) or `chat.failed` (with an `error`).
+`chat.done` (with the whole answer), `chat.failed` (with an `error`), or
+`chat.cancelled` (the turn was stopped).
 
 `chat.history` takes no parameters and answers with the turns reported so far,
 oldest first. Each one carries the prompt as it was typed, its status (`running`,
-`done` or `failed`), the code and the provider's words when it failed, and the
-very events it arrived as -- so a page can render a conversation it did not
-watch. The log is bounded: oldest turns go first once it outgrows 50 turns or
-4 MiB, and a turn that is still running is never dropped.
+`done`, `failed` or `cancelled`), the code and the provider's words when it
+failed, and the very events it arrived as -- so a page can render a conversation
+it did not watch. The log is bounded: oldest turns go first once it outgrows 50
+turns or 4 MiB, and a turn that is still running is never dropped.
+
+`chat.cancel` takes no parameters and answers with whether a turn was stopped. A
+stop that finds nothing running answers `{"cancelled":false}` on the spot; a stop
+that reaches a turn is answered by that turn, once it has stopped and the slot it
+held is free. That is what makes the two usable in sequence: the prompt the page
+sends on the back of the answer is taken, rather than refused as a turn still
+running.
+
+Conversations are written to `<workspace>/.sessions/<id>.json`, and the runtime
+continues the newest one it finds when it starts. `sessions.list` takes no
+parameters and answers with what this workspace holds, newest first, plus the id
+being continued:
+
+```json
+{"protocol_version":1,"type":"response","request_id":"host-11","ok":true,"result":{"current":"s1750000000000-4821-0","sessions":[{"id":"s1750000000000-4821-0","title":"say hello","created_at":"2026-10-14T05:12:00.123456700+00:00","updated_at":"2026-10-14T05:14:31.765432100+00:00","messages":6}]}}
+```
+
+`sessions.new` takes no parameters and starts a fresh conversation, leaving the
+old one on disk; `sessions.open` takes the id of one this workspace holds and
+continues it, numbering its turns after the ones it already has. Both refuse
+while a turn is running. A turn the file caught mid-flight -- the process was
+killed, not stopped -- reads back as `failed` with `chat_interrupted` rather than
+left spinning, because whatever was going to finish it is gone.
 
 Request error codes: `invalid_json`, `invalid_utf8`, `invalid_request`,
-`invalid_params`, `message_too_large`, `unknown_method`,
+`invalid_params`, `message_too_large`, `unknown_method`, `session_unknown`,
 `unsupported_protocol_version`. A turn that failed reports its own code on
 `chat.failed`, so the page can branch on it: `chat_busy`,
 `chat_not_configured`, `chat_unauthorized`, `chat_rate_limited`,
-`chat_api_error`, `chat_step_limit`, `chat_recovery_failed`, `chat_turn_failed`.
-Only one turn runs at a time: a second prompt sent while one is in flight is
-refused with `chat_busy` rather than queued.
+`chat_api_error`, `chat_step_limit`, `chat_recovery_failed`, `chat_turn_failed`,
+`chat_interrupted`. Only one turn runs at a time: a second prompt sent while one
+is in flight is refused with `chat_busy` rather than queued.
 
 Framing rules the host enforces: a response with an unknown `request_id` is
 logged, not applied; every in-flight request fails with a reason when the child
@@ -309,12 +354,14 @@ cd desktop/src-tauri && cargo test --all-targets
 
 Measured on Windows 11, `x86_64-pc-windows-msvc`, 2026-10-14:
 
-- `cargo test --all-targets`: 191 passed / 0 failed, plus 28 for the bridge.
+- `cargo test --all-targets`: 201 passed / 0 failed, plus 35 for the bridge.
 - `desktop/src-tauri` `cargo test --all-targets`: 41 passed / 0 failed.
-- `node scripts/desktop-bridge-smoke.mjs`: 66 of 66 checks passed against the
+- `node scripts/desktop-bridge-smoke.mjs`: 92 of 92 checks passed against the
   built binary (framing, ids, errors, stdout purity, clean shutdown, the
   workspace `.env` precedence, and a full chat turn driven against a local HTTP
-  stand-in for the model, read back afterwards through `chat.history`).
+  stand-in for the model, read back afterwards through `chat.history`; a turn
+  stopped mid-flight and the prompt that follows it; and a conversation left on
+  disk and picked up by a second process).
 - `pnpm typecheck` and `pnpm build`: clean.
 - `pnpm app:build`: builds both bundles, and leaves a runnable layout in
   `src-tauri/target/release/` -- the app next to its sidecar, so it can be run
@@ -355,6 +402,15 @@ typing a prompt into a real window and watching it stream, reloading the window
 mid-answer and watching the transcript come back, and the Settings-key flow that
 makes a prompt runnable at all.
 
+Stopping a turn and keeping conversations on disk came after that pass as well.
+What is covered: the bridge's `TurnCancel` and session unit tests, a stop driven
+through the smoke test against the local HTTP stand-in (a stop aimed at nothing,
+a stop that reaches a turn, the prompt that follows it, and the stopped turn read
+back as `cancelled`), the same conversation re-opened by a second process,
+`pnpm typecheck`, and `pnpm build`. Still to check by hand: pressing 停止 in a
+real window, watching 新会话 and the conversation picker swap transcripts, and
+seeing a reload come back to a conversation a restart no longer loses.
+
 ## Platform status
 
 | platform | build | runtime round trip |
@@ -384,13 +440,12 @@ What is cross-platform by construction, and what is not:
 
 ## Not in this phase
 
-The chat is real but not yet finished. It runs one turn at a time and has no way
-to cancel one: a prompt that is running will finish, and the page can only wait
-for `chat.done` or `chat.failed`. The conversation is held in memory for the
-life of the runtime process: a reloaded window reads it back, but a restart --
-or choosing another project, which restarts the runtime -- starts a new one,
-and nothing is written to disk. There is no session picker. A turn's after-work
-(the debounced memory pass) is not streamed back.
+The chat runs one turn at a time, and what it does not do is deliberate: a prompt
+sent while another is running is refused rather than queued (only stopping frees
+the slot), a conversation cannot be renamed or deleted from the page, and a
+turn's after-work (the debounced memory pass) is not streamed back. A stopped
+turn leaves nothing behind on disk, because half an exchange is not a turn
+anybody had.
 
 Departments, agents, group chat, task claiming, delivery, and acceptance are
 next. `runtime.status` already reports skills, tasks, memory, and cron counts,

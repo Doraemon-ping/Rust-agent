@@ -682,8 +682,10 @@ API key, and the model into a host-owned `provider.json`, and the shell hands
 them to the runtime as environment variables when it spawns it. The Chat page
 drives the same agent loop: it sends a prompt as `chat.send` and renders the
 turn the runtime streams back as `chat.*` events, re-reading them with
-`chat.history` when the window is reloaded. Protocol revision, layout, and
-platform status live in `desktop/README.md`.
+`chat.history` when the window is reloaded, ending a turn early with
+`chat.cancel`, and moving between the conversations the runtime keeps on disk
+with `sessions.list`, `sessions.new`, and `sessions.open`. Protocol revision,
+layout, and platform status live in `desktop/README.md`.
 
 ## Embedding
 
