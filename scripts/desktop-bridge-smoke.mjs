@@ -601,6 +601,16 @@ async function main() {
       const fresh = await resumed.waitFor((messages) => byId(messages, 'c-22'))
       const freshId = fresh?.result?.session
       check('a new conversation gets an id of its own', typeof freshId === 'string' && freshId !== current)
+      // A conversation that has not run a turn yet has nothing to write, but it
+      // is still the one being continued: a list that leaves it out reads as
+      // though the workspace only ever holds one conversation.
+      resumed.request('c-29', 'sessions.list')
+      const started = await resumed.waitFor((messages) => byId(messages, 'c-29'))
+      check('a new conversation is the one being continued', started?.result?.current === freshId)
+      check(
+        'and it is listed before it has a turn to write',
+        (started?.result?.sessions ?? []).some((session) => session.id === freshId),
+      )
       resumed.request('c-23', 'chat.history')
       const empty = await resumed.waitFor((messages) => byId(messages, 'c-23'))
       check('a new conversation starts empty', (empty?.result?.turns ?? []).length === 0)

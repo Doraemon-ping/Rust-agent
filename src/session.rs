@@ -102,7 +102,8 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
-    fn of(session: &Session) -> Self {
+    /// This conversation as a list entry.
+    pub fn of(session: &Session) -> Self {
         SessionSummary {
             id: session.id.clone(),
             title: session.title.clone(),

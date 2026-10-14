@@ -38,8 +38,8 @@ use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
     default_system_prompt, is_session_id, last_run, Agent, AnthropicClient, CompactConfig, Config,
     CronScheduler, Error, LlmClient, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role,
-    Session, SessionStore, SkillLoader, TaskStatus, TaskStore, ToolRegistry, CRON_PROMPT,
-    MAILBOXES_DIR, SESSIONS_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
+    Session, SessionStore, SessionSummary, SkillLoader, TaskStatus, TaskStore, ToolRegistry,
+    CRON_PROMPT, MAILBOXES_DIR, SESSIONS_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
 };
 
 /// Wire revision of the protocol. Bumped whenever a message shape changes.
@@ -1125,8 +1125,8 @@ impl Chat {
 
     /// Every conversation this workspace holds, and the one being continued.
     fn sessions_snapshot(&self) -> Value {
-        let current = self.session().id;
-        let sessions = match self.sessions.list() {
+        let current = self.session();
+        let mut sessions = match self.sessions.list() {
             Ok(sessions) => sessions,
             Err(error) => {
                 log(
@@ -1136,7 +1136,13 @@ impl Chat {
                 Vec::new()
             }
         };
-        json!({ "current": current, "sessions": sessions })
+        // The conversation in hand is listed even before it has a turn worth
+        // writing to disk. A new one has no file yet, and a list that leaves it
+        // out reads as though the workspace only ever holds one conversation.
+        if !sessions.iter().any(|session| session.id == current.id) {
+            sessions.insert(0, SessionSummary::of(&current));
+        }
+        json!({ "current": current.id, "sessions": sessions })
     }
 
     /// The agent loop for this workspace, built once.
@@ -2636,7 +2642,11 @@ mod tests {
         assert!(answered(&turn).ok);
         let result = answered(&turn).result.clone().unwrap();
         assert_eq!(result["current"], json!(chat.session().id));
-        assert_eq!(result["sessions"], json!([]));
+        // The conversation in hand is listed even though it has no turn yet and
+        // so no file: the page has to see the one a fresh start handed it, or
+        // the list reads as though the workspace holds nothing at all.
+        assert_eq!(result["sessions"][0]["id"], json!(chat.session().id));
+        assert_eq!(result["sessions"][0]["messages"], json!(0));
     }
 
     #[test]
@@ -2675,12 +2685,17 @@ mod tests {
             runtime.handle(),
         );
         let result = answered(&listed).result.clone().unwrap();
-        assert_eq!(result["sessions"][0]["id"], json!(saved.id));
-        assert_eq!(
-            result["sessions"][0]["title"],
-            json!("an older conversation")
-        );
-        assert_eq!(result["sessions"][0]["messages"], json!(1));
+        // Both are listed: the new one, which is the one being continued and has
+        // nothing written yet, and the one it was started beside.
+        let entries = result["sessions"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], json!(chat.session().id));
+        let stored = entries
+            .iter()
+            .find(|session| session["id"] == json!(saved.id))
+            .expect("the conversation that was left behind is still listed");
+        assert_eq!(stored["title"], json!("an older conversation"));
+        assert_eq!(stored["messages"], json!(1));
 
         // Opening it brings the messages and the turns back, and the next turn
         // continues the numbering instead of naming a turn that already exists.

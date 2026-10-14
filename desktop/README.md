@@ -303,6 +303,13 @@ being continued:
 {"protocol_version":1,"type":"response","request_id":"host-11","ok":true,"result":{"current":"s1750000000000-4821-0","sessions":[{"id":"s1750000000000-4821-0","title":"say hello","created_at":"2026-10-14T05:12:00.123456700+00:00","updated_at":"2026-10-14T05:14:31.765432100+00:00","messages":6}]}}
 ```
 
+The conversation in hand is listed even when it has no file yet -- a 新会话 that
+has not run a turn -- so the page can always see which conversation it is in,
+and the id in `current` is always one of the entries. A conversation is only
+written once it has a turn worth keeping: an empty one is not a file, and a
+window that never sent a prompt leaves nothing behind. It does, therefore, not
+survive a restart until its first turn has finished.
+
 `sessions.new` takes no parameters and starts a fresh conversation, leaving the
 old one on disk; `sessions.open` takes the id of one this workspace holds and
 continues it, numbering its turns after the ones it already has. Both refuse
@@ -356,12 +363,13 @@ Measured on Windows 11, `x86_64-pc-windows-msvc`, 2026-10-14:
 
 - `cargo test --all-targets`: 201 passed / 0 failed, plus 35 for the bridge.
 - `desktop/src-tauri` `cargo test --all-targets`: 41 passed / 0 failed.
-- `node scripts/desktop-bridge-smoke.mjs`: 92 of 92 checks passed against the
+- `node scripts/desktop-bridge-smoke.mjs`: 94 of 94 checks passed against the
   built binary (framing, ids, errors, stdout purity, clean shutdown, the
   workspace `.env` precedence, and a full chat turn driven against a local HTTP
   stand-in for the model, read back afterwards through `chat.history`; a turn
   stopped mid-flight and the prompt that follows it; and a conversation left on
-  disk and picked up by a second process).
+  disk and picked up by a second process, with a 新会话 listed as the one being
+  continued before it has anything to write).
 - `pnpm typecheck` and `pnpm build`: clean.
 - `pnpm app:build`: builds both bundles, and leaves a runnable layout in
   `src-tauri/target/release/` -- the app next to its sidecar, so it can be run
