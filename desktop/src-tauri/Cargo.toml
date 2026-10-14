@@ -1,0 +1,32 @@
+[package]
+name = "rust-agent-desktop"
+version = "0.1.0"
+description = "Desktop workbench that hosts the rust-agent runtime"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+
+[lib]
+# Named apart from the binary on purpose: cargo derives artifact names from the
+# crate name, so a library called rust_agent_desktop collides with the
+# rust-agent-desktop binary (a warning here, a real clash on the mobile
+# static/dynamic library targets).
+name = "rust_agent_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

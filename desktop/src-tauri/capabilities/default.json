@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Phase 1 shell. The page may listen for host events and call this app's own commands; no shell, filesystem, or network permissions are granted.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

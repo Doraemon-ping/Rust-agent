@@ -1,0 +1,38 @@
+{
+  "name": "rust-agent-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Desktop workbench for the rust-agent runtime (Tauri 2 + Vue 3).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc -b",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "bridge:build": "node scripts/build-bridge.mjs",
+    "icons": "tauri icon app-icon.png"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.55.0",
+    "@tauri-apps/api": "^2.12.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "pinia": "^4.0.3",
+    "tailwind-merge": "^3.7.0",
+    "vue": "^3.5.43",
+    "vue-router": "^5.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.12.2",
+    "@types/node": "^26.6.5",
+    "@vitejs/plugin-vue": "^6.0.10",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4",
+    "vue-tsc": "^3.3.13"
+  }
+}
