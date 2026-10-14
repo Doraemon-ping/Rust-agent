@@ -96,6 +96,25 @@ export const RUNTIME_STATE_LABEL: Record<RuntimeState, string> = {
   error: 'Error',
 }
 
+/**
+ * One tone per lifecycle state, so every surface that tints it agrees.
+ *
+ * `neutral` is the honest default: `stopped` is not a problem.
+ */
+export function runtimeStateTone(state: RuntimeState): 'ok' | 'warn' | 'danger' | 'neutral' {
+  switch (state) {
+    case 'ready':
+      return 'ok'
+    case 'error':
+      return 'danger'
+    case 'starting':
+    case 'stopping':
+      return 'warn'
+    default:
+      return 'neutral'
+  }
+}
+
 /** Facts about the desktop shell itself, not the runtime. */
 export interface HostInfo {
   appVersion: string

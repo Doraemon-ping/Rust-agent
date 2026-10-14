@@ -9,6 +9,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
+import { requireShell } from '@/lib/shell'
 import type {
   HostInfo,
   RuntimeEvent,
@@ -25,19 +26,8 @@ export const RUNTIME_EVENT = {
   log: 'runtime://log',
 } as const
 
-/** Tauri injects this; its absence means we are in a plain browser. */
-export function isRunningInShell(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-}
-
-function requireShell(): void {
-  if (!isRunningInShell()) {
-    throw new Error(
-      'The desktop shell is not running this page. Start it with `pnpm app:dev` ' +
-        'instead of opening the Vite URL in a browser.',
-    )
-  }
-}
+/** Re-exported so consumers of this seam do not need a second import. */
+export { isRunningInShell } from '@/lib/shell'
 
 /** Current host-side runtime status. Never throws for a stopped runtime. */
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {

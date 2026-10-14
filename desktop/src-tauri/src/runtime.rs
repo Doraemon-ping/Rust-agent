@@ -8,6 +8,7 @@
 //! reason instead of hanging.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::paths;
+use crate::projects::ProjectsStore;
 use crate::protocol::{self, Inbound};
 use crate::state::{self, HostError, LogLevel, LogLine, Ping, State, Status, PROTOCOL_VERSION};
 
@@ -83,13 +85,16 @@ struct Core {
 #[derive(Clone)]
 pub struct RuntimeManager {
     app: AppHandle,
+    /// Where the workspace comes from, and what the runtime runs in.
+    projects: ProjectsStore,
     inner: Arc<Mutex<Core>>,
 }
 
 impl RuntimeManager {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, projects: ProjectsStore) -> Self {
         RuntimeManager {
             app,
+            projects,
             inner: Arc::new(Mutex::new(Core {
                 child: None,
                 writer: None,
@@ -133,7 +138,7 @@ impl RuntimeManager {
 
     async fn try_start(&self) -> Result<Status, HostError> {
         let bridge = paths::resolve_bridge()?;
-        let workspace = paths::resolve_workspace(&self.app)?;
+        let workspace = self.workspace().await?;
 
         let (pid, generation) = {
             let mut core = self.inner.lock().await;
@@ -344,6 +349,36 @@ impl RuntimeManager {
     pub async fn restart(&self) -> Result<Status, HostError> {
         self.stop().await?;
         self.start().await
+    }
+
+    /// The folder the runtime is started in: the active project when the user
+    /// has chosen one, otherwise the per-user workspace.
+    ///
+    /// A chosen project that is no longer a directory is an error rather than a
+    /// fallback: quietly running somewhere else would contradict the project
+    /// the UI is showing as active.
+    async fn workspace(&self) -> Result<PathBuf, HostError> {
+        match self.projects.active_path().await {
+            Some(path) if path.is_dir() => Ok(path),
+            Some(path) => Err(HostError::new(
+                "workspace_missing",
+                format!("the active project folder is gone: {}", path.display()),
+            )),
+            None => paths::resolve_workspace(&self.app),
+        }
+    }
+
+    /// Apply a change to the active project.
+    ///
+    /// A live runtime is restarted so it picks up the new workspace; a stopped
+    /// one is left stopped, because choosing a project is not a request to
+    /// start a runtime. Returns the new status when a restart happened.
+    pub async fn apply_workspace_change(&self) -> Result<Option<Status>, HostError> {
+        let live = matches!(self.status().await.state, State::Starting | State::Ready);
+        if !live {
+            return Ok(None);
+        }
+        Ok(Some(self.restart().await?))
     }
 
     /// Best-effort shutdown for application exit.

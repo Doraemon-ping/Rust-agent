@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted } from 'vue'
 
-import AppSidebar from '@/components/AppSidebar.vue'
+import AppRail from '@/components/AppRail.vue'
+import ProjectPanel from '@/components/ProjectPanel.vue'
 import { useRuntimeStore } from '@/stores/runtime'
 
 const runtime = useRuntimeStore()
@@ -15,8 +16,10 @@ onBeforeUnmount(() => runtime.disconnect())
 </script>
 
 <template>
+  <!-- Three columns, the shell's whole shape: destinations, projects, work. -->
   <div class="flex h-full min-h-0 bg-canvas">
-    <AppSidebar />
+    <AppRail />
+    <ProjectPanel />
     <main class="flex min-w-0 flex-1 flex-col">
       <router-view />
     </main>

@@ -5,9 +5,11 @@ and talks to it over JSON Lines on stdin/stdout.
 
 **Phase 1 scope.** This is infrastructure, not product. It proves the shell can
 start the real runtime, correlate requests, stream events, show honest status,
-and shut down without leaving orphans. Departments, agents, group chat, and
-tasks are not implemented; the navigation lists them as `待建` placeholders on
-purpose.
+and shut down without leaving orphans. It also ships the shell's chrome: an icon
+rail of destinations, a project column backed by a real folder picker, and a
+chat page that says out loud that the protocol has no prompt method yet.
+Departments, group chat, agents, and tasks are not implemented; the pages that
+will hold them are `待建` placeholders on purpose.
 
 ## Prerequisites
 
@@ -55,25 +57,68 @@ rebuild: `src-tauri/build.rs` watches the generated icon files, because the
 Windows icon is embedded by the build script and cargo would otherwise keep a
 stale resource. Do not hand-edit the files under `src-tauri/icons/`.
 
+## Layout
+
+Three columns, left to right:
+
+| column | contents |
+| --- | --- |
+| rail (`src/components/AppRail.vue`) | 定时任务 / 插件 / 技能, the app mark, the runtime's health dot, and 设置 |
+| projects (`src/components/ProjectPanel.vue`) | 添加项目 (the system folder picker), the stored projects, which one is active, and a runtime state badge |
+| work (`src/views/`) | the routed page: 对话, the `待建` page behind a rail destination, or 设置 |
+
+The rail lists only destinations that exist. The three that are not built are
+pages, not dead links, and they carry the facts `runtime.status` already reports
+about their area -- how many cron jobs, which skills are loaded -- rather than
+invented ones.
+
+## Projects
+
+A project is a folder the user picked, and it means more than a bookmark: it is
+the workspace the runtime is started in, so the runtime keeps its memories,
+tasks, transcripts, and logs inside it. With no project selected, the runtime
+uses the per-user app data workspace as before.
+
+- The list lives in `projects.json` under the app data directory
+  (`src-tauri/src/projects.rs`). The page reads it from the host, never from
+  browser storage: there is no localStorage copy that could drift from what the
+  runtime will actually use.
+- The page cannot name a folder. `projects_pick` opens the system picker from
+  Rust (`tauri-plugin-dialog`) and stores what the user chose; the page can only
+  select or remove ids the host already holds.
+- Choosing a project while the runtime is live restarts it so it moves
+  workspace. Choosing one while the runtime is stopped does not start it:
+  picking a project is not a request to run anything.
+- A project whose folder was deleted is flagged (`目录缺失`) and kept -- the
+  host does not delete what the user added. Starting the runtime in it fails
+  with `workspace_missing` rather than quietly running somewhere else.
+- A `projects.json` this build cannot read is reported and never rewritten:
+  mutations refuse until the file is dealt with, so a parse bug cannot eat the
+  list.
+
 ## How the pieces fit
 
 ```
-Vue view  ->  Pinia store  ->  lib/runtime (the only @tauri-apps/api importer)
+Vue view  ->  Pinia store  ->  lib/runtime + lib/projects (the two seams)
           ->  Tauri command (commands.rs)
           ->  RuntimeManager (runtime.rs)  ->  child process stdin
 child stdout  ->  reader task  ->  status + events  ->  emit  ->  store  ->  view
 ```
 
-**Frontend service** (`src/lib/runtime/index.ts`) is the single seam. It exposes
-`getRuntimeStatus`, `startRuntime`, `stopRuntime`, `restartRuntime`,
-`pingRuntime`, `getRuntimeLogs`, `getHostInfo`, `subscribeRuntimeEvents`, and
-`unsubscribeRuntimeEvents`, and it is the only file that imports
-`@tauri-apps/api`.
+**Frontend services** (`src/lib/runtime/index.ts`, `src/lib/projects/index.ts`)
+are the only modules that import `@tauri-apps/api`, and `src/lib/shell.ts` holds
+the one guard they share. The runtime seam exposes `getRuntimeStatus`,
+`startRuntime`, `stopRuntime`, `restartRuntime`, `pingRuntime`,
+`getRuntimeLogs`, `getHostInfo`, `subscribeRuntimeEvents`, and
+`unsubscribeRuntimeEvents`. The projects seam exposes `listProjects`,
+`pickProject`, `selectProject`, and `removeProject`.
 
-**Host commands** (`src-tauri/src/commands.rs`) are thin wrappers that take no
-paths and no arguments from the caller: `runtime_status`, `runtime_start`,
-`runtime_stop`, `runtime_restart`, `runtime_ping`, `runtime_logs`,
-`runtime_host_info`.
+**Host commands** (`src-tauri/src/commands.rs`) are thin wrappers:
+`runtime_status`, `runtime_start`, `runtime_stop`, `runtime_restart`,
+`runtime_ping`, `runtime_logs`, `runtime_host_info`, `projects_list`,
+`projects_pick`, `projects_select`, `projects_remove`. None of them takes a
+path, a binary, or a command line from the caller, and the two projects commands
+that name a project take an id the host itself handed out.
 
 **Host events** are `runtime://status`, `runtime://message`, and `runtime://log`.
 Status is pushed on every state change; the page never polls and never infers.
@@ -83,7 +128,9 @@ one place, in this order: `RUST_AGENT_BRIDGE` (debug builds only), the bundled
 sidecar next to the executable, then the sibling cargo target directory so
 `tauri dev` works without packaging. The frontend cannot name an executable or
 pass it a command line. There is no shell capability in
-`capabilities/default.json` beyond `core:event:default`.
+`capabilities/default.json` beyond `core:event:default`; the folder picker is
+opened by the host from Rust, so the page is granted no dialog permission
+either. It can ask for a picker, not for a directory.
 
 ## Protocol (v1)
 
@@ -155,13 +202,14 @@ cd desktop/src-tauri && cargo test --all-targets
 
 Measured on Windows 11, `x86_64-pc-windows-msvc`, 2026-10-14:
 
-- `cargo test --all-targets`: 179 passed / 0 failed, plus 14 for the bridge.
-- `desktop/src-tauri` `cargo test --all-targets`: 20 passed / 0 failed.
+- `cargo test --all-targets`: 191 passed / 0 failed, plus 15 for the bridge.
+- `desktop/src-tauri` `cargo test --all-targets`: 29 passed / 0 failed.
 - `node scripts/desktop-bridge-smoke.mjs`: 30 of 30 checks passed against the
   built binary (framing, ids, errors, stdout purity, clean shutdown).
 - `pnpm typecheck` and `pnpm build`: clean.
-- `pnpm app:build`: builds, and the MSI lands in
-  `src-tauri/target/release/bundle/msi/`.
+- `pnpm app:build`: builds both bundles, and leaves a runnable layout in
+  `src-tauri/target/release/` -- the app next to its sidecar, so it can be run
+  without installing anything.
 
 Checked by hand in a real window against a real child process:
 
@@ -176,6 +224,12 @@ Checked by hand in a real window against a real child process:
   nothing behind.
 - The release binary runs standalone off the sidecar beside it, and uses the
   workspace under the per-user app data directory.
+
+The project column and the folder picker came after that pass and have not been
+exercised in a real window yet. What is covered: `projects.rs` unit tests,
+`cargo check --all-targets`, `pnpm typecheck`, and `pnpm build`. Still to check
+by hand: opening the picker, adding and removing a project, and watching a live
+runtime move workspace when another project is chosen.
 
 ## Platform status
 
@@ -199,12 +253,19 @@ What is cross-platform by construction, and what is not:
 - Linux needs `webkit2gtk-4.1`, `libayatana-appindicator3-dev`, and
   `librsvg2-dev` installed before `pnpm app:dev` will link.
 - Windows-specific work still to do: none known.
-- Known gap in this environment: `targets: "all"` also asks for NSIS, and the
-  NSIS toolchain download timed out here, so only the MSI was produced. That is
-  a network condition, not a build failure; retry with a working connection or
-  run `pnpm tauri build --bundles msi`.
+- `pnpm app:build` produced both bundles: the MSI (2.2 MiB) and the NSIS setup
+  (1.5 MiB). An earlier run produced only the MSI because the NSIS toolchain
+  download timed out -- a network condition, not a build failure. If it
+  recurs, `pnpm tauri build --bundles msi` builds the MSI alone.
 
 ## Not in this phase
+
+The chat page is a placeholder, and honestly so: protocol v1 answers
+`runtime.status`, `runtime.ping`, and `runtime.shutdown`, and nothing takes a
+prompt. So the page lists those methods -- read from the runtime's own snapshot,
+not hard-coded -- and shows a disabled composer instead of a fake conversation.
+A real chat is a bridge method that accepts a prompt and streams the model's
+answer back as events.
 
 Departments, agents, group chat, task claiming, delivery, and acceptance are
 next. `runtime.status` already reports skills, tasks, memory, and cron counts,

@@ -6,6 +6,7 @@
 
 mod commands;
 mod paths;
+mod projects;
 mod protocol;
 mod runtime;
 mod state;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, RunEvent};
 
+use projects::ProjectsStore;
 use runtime::RuntimeManager;
 
 /// Set once the exit cleanup has been scheduled, so a second close request
@@ -23,8 +25,22 @@ static FINISHING: AtomicBool = AtomicBool::new(false);
 /// Build and run the shell. Called from `main`.
 pub fn run() {
     tauri::Builder::default()
+        // The host opens the folder picker on the page's behalf; the page
+        // itself is granted no dialog, filesystem, or shell permission.
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let manager = RuntimeManager::new(app.handle().clone());
+            // The project list outlives a run, so it is opened before anything
+            // can read it -- including the runtime, which is started in the
+            // active project.
+            let projects = ProjectsStore::new(app.handle()).map_err(|error| {
+                format!(
+                    "could not open the project list: {}: {}",
+                    error.code, error.message
+                )
+            })?;
+            app.manage(projects.clone());
+
+            let manager = RuntimeManager::new(app.handle().clone(), projects);
             app.manage(manager.clone());
 
             // The host starts the runtime, not the page: the UI never names a
@@ -46,6 +62,10 @@ pub fn run() {
             commands::runtime_ping,
             commands::runtime_logs,
             commands::runtime_host_info,
+            commands::projects_list,
+            commands::projects_pick,
+            commands::projects_select,
+            commands::projects_remove,
         ])
         .build(tauri::generate_context!())
         .expect("could not build the desktop shell")

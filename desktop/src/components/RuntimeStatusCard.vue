@@ -5,7 +5,7 @@ import Badge from '@/components/ui/Badge.vue'
 import Card from '@/components/ui/Card.vue'
 import Alert from '@/components/ui/Alert.vue'
 import { formatDuration, formatRelative, formatTime, shortenPath } from '@/lib/format'
-import { RUNTIME_STATE_LABEL } from '@/lib/runtime/types'
+import { RUNTIME_STATE_LABEL, runtimeStateTone } from '@/lib/runtime/types'
 import { useRuntimeStore } from '@/stores/runtime'
 
 const props = defineProps<{ now: number }>()
@@ -13,19 +13,7 @@ const props = defineProps<{ now: number }>()
 const runtime = useRuntimeStore()
 const snapshot = computed(() => runtime.snapshot)
 
-const tone = computed(() => {
-  switch (runtime.state) {
-    case 'ready':
-      return 'ok'
-    case 'error':
-      return 'danger'
-    case 'starting':
-    case 'stopping':
-      return 'warn'
-    default:
-      return 'neutral'
-  }
-})
+const tone = computed(() => runtimeStateTone(runtime.state))
 
 /**
  * Facts straight off `runtime.status`; nothing here is invented.
