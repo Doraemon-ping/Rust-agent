@@ -33,7 +33,14 @@ pub const EVENT_CHAT: &str = "runtime://chat";
 pub const EVENT_LOG: &str = "runtime://log";
 
 /// Longest single line the host will buffer from the runtime.
-const MAX_LINE_BYTES: usize = 1 << 20;
+///
+/// Larger than the cap the runtime reads with, because the runtime's one
+/// answer that grows with the conversation is the history it keeps: up to 4 MiB
+/// of turns (`MAX_LOG_BYTES` in `src/bin/desktop_bridge.rs`) plus the envelope
+/// around them. A line this reader drops is a conversation the page can never
+/// read back -- the request that asked for it is left unanswered and times out
+/// -- so the two numbers are chosen together rather than independently.
+const MAX_LINE_BYTES: usize = 8 << 20;
 
 /// How long one request may take before the caller is told it failed.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -421,6 +428,46 @@ impl RuntimeManager {
         self.request("chat.cancel", json!({}), CHAT_TIMEOUT).await
     }
 
+    /// Answer the question the runtime is waiting on.
+    ///
+    /// The id is one the runtime itself reported, and the answer is the user's
+    /// words: nothing about which question is being answered is decided here.
+    /// The runtime answers whether the answer reached the question, so a page
+    /// that answered one that is already over is told so rather than left to
+    /// believe it was heard.
+    pub async fn chat_answer(&self, id: &str, answer: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_interaction",
+                "an interaction id cannot be empty",
+            ));
+        }
+        self.request(
+            "chat.answer",
+            json!({ "id": id, "answer": answer }),
+            CHAT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Say what to do about the call the runtime is waiting on.
+    pub async fn chat_approve(&self, id: &str, allow: bool) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_interaction",
+                "an interaction id cannot be empty",
+            ));
+        }
+        self.request(
+            "chat.approve",
+            json!({ "id": id, "allow": allow }),
+            CHAT_TIMEOUT,
+        )
+        .await
+    }
+
     /// The conversations this workspace holds, and the one being continued.
     pub async fn chat_sessions(&self) -> Result<Value, HostError> {
         self.request("sessions.list", json!({}), CHAT_TIMEOUT).await
@@ -479,6 +526,399 @@ impl RuntimeManager {
         }
         self.request("sessions.delete", json!({ "id": id }), CHAT_TIMEOUT)
             .await
+    }
+
+    /// Every cron job this workspace holds, with when each one next runs.
+    ///
+    /// The jobs live in the runtime, not here: the page asks what the runtime
+    /// has, and the same table is what the ticker fires and the status counts.
+    pub async fn cron_list(&self) -> Result<Value, HostError> {
+        self.request("cron.list", json!({}), REQUEST_TIMEOUT).await
+    }
+
+    /// Schedule a prompt on the runtime's own clock.
+    ///
+    /// The expression and the prompt are the page's to choose; the check here
+    /// is only the cheap one -- the runtime validates the expression and owns
+    /// the job it creates. The status is re-read afterwards so the counts every
+    /// other surface shows agree with the schedule the page just changed.
+    pub async fn cron_schedule(
+        &self,
+        cron: &str,
+        prompt: &str,
+        recurring: bool,
+        durable: bool,
+    ) -> Result<Value, HostError> {
+        let cron = cron.trim();
+        if cron.is_empty() {
+            return Err(HostError::new(
+                "empty_cron",
+                "a cron expression cannot be empty",
+            ));
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(HostError::new("empty_prompt", "a prompt cannot be empty"));
+        }
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err(HostError::new(
+                "prompt_too_long",
+                format!("a prompt cannot be longer than {MAX_PROMPT_BYTES} bytes"),
+            ));
+        }
+        let job = self
+            .request(
+                "cron.schedule",
+                json!({ "cron": cron, "prompt": prompt, "recurring": recurring, "durable": durable }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(job)
+    }
+
+    /// Forget a cron job. The id is one the runtime handed out, not a path.
+    pub async fn cron_cancel(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new("empty_job", "a cron job id cannot be empty"));
+        }
+        let cancelled = self
+            .request("cron.cancel", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(cancelled)
+    }
+
+    /// Every skill the runtime found in the workspace, with its manifest path.
+    ///
+    /// Read-only by nature: a skill is a file in `skills/`, so the page lists
+    /// what the loader scanned and can read one back. Nothing here can change
+    /// them, which is why none of these re-reads the status.
+    pub async fn skills_list(&self) -> Result<Value, HostError> {
+        self.request("skills.list", json!({}), REQUEST_TIMEOUT).await
+    }
+
+    /// One full `SKILL.md`, the same text `load_skill` hands the model.
+    pub async fn skills_read(&self, name: &str) -> Result<Value, HostError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(HostError::new("empty_skill", "a skill name cannot be empty"));
+        }
+        self.request("skills.read", json!({ "name": name }), REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Copy skills into the workspace from a folder the host picked.
+    ///
+    /// The path comes from the picker, never from the page: the page can ask
+    /// for the dialog, but it cannot name what gets copied where. The skill
+    /// count is part of the status, so the snapshot is re-read afterwards.
+    pub async fn skills_import(&self, path: &str) -> Result<Value, HostError> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(HostError::new("empty_skill_source", "no folder was chosen"));
+        }
+        let imported = self
+            .request("skills.import", json!({ "path": path }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(imported)
+    }
+
+    /// What the runtime is holding for the conversation in hand.
+    ///
+    /// Read-only, and cheap: the size it reports is the one its own compaction
+    /// pipeline measures before every model call.
+    pub async fn chat_context(&self) -> Result<Value, HostError> {
+        self.request("chat.context", json!({}), REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Every plugin this build ships, with the tools of the ones connected.
+    pub async fn plugins_list(&self) -> Result<Value, HostError> {
+        self.request("plugins.list", json!({}), REQUEST_TIMEOUT).await
+    }
+
+    /// Connect a plugin this build ships, discovering its tools.
+    ///
+    /// The page names a server, never a transport: an unknown name is refused on
+    /// the other side with a code. The status is re-read afterwards so the
+    /// counts the rest of the UI shows agree with what the page just connected.
+    pub async fn plugins_connect(&self, server: &str) -> Result<Value, HostError> {
+        let server = server.trim();
+        if server.is_empty() {
+            return Err(HostError::new(
+                "empty_plugin",
+                "a plugin name cannot be empty",
+            ));
+        }
+        let connected = self
+            .request("plugins.connect", json!({ "server": server }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(connected)
+    }
+
+    /// Every task on the workspace's board, with the state its edges imply.
+    ///
+    /// Read-only: the board lives under `<workspace>/.tasks` and is the same
+    /// graph the model's task tools work from. Nothing is cached here.
+    pub async fn tasks_list(&self) -> Result<Value, HostError> {
+        self.request("tasks.list", json!({}), REQUEST_TIMEOUT).await
+    }
+
+    /// Add a node to the task board.
+    ///
+    /// The subject and description are the page's words; the id is the
+    /// runtime's to make. Dependencies are ids the page read from the board,
+    /// and the runtime checks each one before it writes anything.
+    pub async fn tasks_create(
+        &self,
+        subject: &str,
+        description: &str,
+        blocked_by: &[String],
+    ) -> Result<Value, HostError> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return Err(HostError::new(
+                "empty_task",
+                "a task subject cannot be empty",
+            ));
+        }
+        let created = self
+            .request(
+                "tasks.create",
+                json!({
+                    "subject": subject,
+                    "description": description.trim(),
+                    "blocked_by": blocked_by,
+                }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(created)
+    }
+
+    /// Claim a ready task for the person at the page.
+    pub async fn tasks_claim(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new("empty_task", "a task id cannot be empty"));
+        }
+        let claimed = self
+            .request("tasks.claim", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(claimed)
+    }
+
+    /// Give a task the page claimed back to the board.
+    pub async fn tasks_release(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new("empty_task", "a task id cannot be empty"));
+        }
+        let released = self
+            .request("tasks.release", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(released)
+    }
+
+    /// Close a task the page claimed, reporting what that unblocked.
+    pub async fn tasks_complete(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new("empty_task", "a task id cannot be empty"));
+        }
+        let completed = self
+            .request("tasks.complete", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(completed)
+    }
+
+    /// Every department, with its members, group chat, and task counts.
+    pub async fn departments_list(&self) -> Result<Value, HostError> {
+        self.request("departments.list", json!({}), REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Create a department or a sub-department under `parent_id`.
+    pub async fn departments_create(
+        &self,
+        name: &str,
+        description: &str,
+        instructions: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Value, HostError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(HostError::new(
+                "empty_department",
+                "a department name cannot be empty",
+            ));
+        }
+        let created = self
+            .request(
+                "departments.create",
+                json!({
+                    "name": name,
+                    "description": description.trim(),
+                    "instructions": instructions.trim(),
+                    "parent_id": parent_id,
+                }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(created)
+    }
+
+    /// Remove a department and the sub-departments below it.
+    pub async fn departments_remove(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_department",
+                "a department id cannot be empty",
+            ));
+        }
+        let removed = self
+            .request("departments.remove", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(removed)
+    }
+
+    /// Add one agent to a department.
+    pub async fn agents_add(
+        &self,
+        department_id: &str,
+        name: &str,
+        role: &str,
+        instructions: &str,
+    ) -> Result<Value, HostError> {
+        let department_id = department_id.trim();
+        let name = name.trim();
+        if department_id.is_empty() {
+            return Err(HostError::new(
+                "empty_department",
+                "a department id cannot be empty",
+            ));
+        }
+        if name.is_empty() {
+            return Err(HostError::new("empty_agent", "an agent name cannot be empty"));
+        }
+        let added = self
+            .request(
+                "agents.add",
+                json!({
+                    "department_id": department_id,
+                    "name": name,
+                    "role": role.trim(),
+                    "instructions": instructions.trim(),
+                }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(added)
+    }
+
+    /// Remove one agent from a department.
+    pub async fn agents_remove(
+        &self,
+        department_id: &str,
+        agent_id: &str,
+    ) -> Result<Value, HostError> {
+        let department_id = department_id.trim();
+        let agent_id = agent_id.trim();
+        if department_id.is_empty() || agent_id.is_empty() {
+            return Err(HostError::new(
+                "empty_agent",
+                "a department id and agent id are required",
+            ));
+        }
+        let removed = self
+            .request(
+                "agents.remove",
+                json!({ "department_id": department_id, "agent_id": agent_id }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(removed)
+    }
+
+    /// Start one department shift. The answer arrives before the agents work;
+    /// progress comes back as `department.*` events.
+    pub async fn departments_run(
+        &self,
+        id: &str,
+        instruction: &str,
+    ) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_department",
+                "a department id cannot be empty",
+            ));
+        }
+        let started = self
+            .request(
+                "departments.run",
+                json!({ "id": id, "instruction": instruction.trim() }),
+                CHAT_TIMEOUT,
+            )
+            .await?;
+        self.refresh_after_change().await;
+        Ok(started)
+    }
+
+    /// Ask the department's shift to stop after the current model call.
+    pub async fn departments_stop(&self, id: &str) -> Result<Value, HostError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(HostError::new(
+                "empty_department",
+                "a department id cannot be empty",
+            ));
+        }
+        let stopped = self
+            .request("departments.stop", json!({ "id": id }), CHAT_TIMEOUT)
+            .await?;
+        self.refresh_after_change().await;
+        Ok(stopped)
+    }
+
+    /// Re-read `runtime.status` and push it to the UI.
+    ///
+    /// The job table lives in the runtime, so a change the page made is re-read
+    /// rather than patched into the shell's idea of the counts.
+    async fn refresh_snapshot(&self) -> Result<(), HostError> {
+        self.request("runtime.status", json!({}), REQUEST_TIMEOUT)
+            .await?;
+        self.emit_status().await;
+        Ok(())
+    }
+
+    /// A change already happened; the snapshot is refreshed so the rest of the
+    /// UI agrees, and a refresh that fails is a warning rather than a failure --
+    /// the change itself is stored and valid.
+    async fn refresh_after_change(&self) {
+        if let Err(error) = self.refresh_snapshot().await {
+            self.log(
+                LogLevel::Warn,
+                format!(
+                    "the schedule changed, but the status could not be refreshed: {}",
+                    error.message
+                ),
+            )
+            .await;
+        }
     }
 
     /// The folder the runtime is started in: the active project when the user
@@ -1169,6 +1609,27 @@ mod tests {
         let (kind, text) = frame(&input[201..], 64);
         assert!(matches!(kind, Frame::Line));
         assert_eq!(text, "{\"a\":1}");
+    }
+
+    #[test]
+    fn the_longest_reply_the_runtime_keeps_still_frames() {
+        // `chat.history` is answered with the runtime's whole log on one line,
+        // and that log is bounded at 4 MiB of turns plus the envelope around
+        // them. A limit that only covered what a request may carry would drop
+        // the conversation instead of handing it back, so the frame this reader
+        // takes has to reach past the runtime's own budget.
+        let mut reply = vec![b'x'; (4 << 20) + (256 << 10)];
+        reply.push(b'\n');
+        let (kind, text) = frame(&reply, MAX_LINE_BYTES);
+        assert!(matches!(kind, Frame::Line));
+        assert_eq!(text.len(), (4 << 20) + (256 << 10));
+
+        // The guard is still a guard: a line past it is dropped as before.
+        let mut relentless = vec![b'x'; MAX_LINE_BYTES + 1];
+        relentless.push(b'\n');
+        let (kind, text) = frame(&relentless, MAX_LINE_BYTES);
+        assert!(matches!(kind, Frame::Oversized));
+        assert!(text.is_empty());
     }
 
     #[test]

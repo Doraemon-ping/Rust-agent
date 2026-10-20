@@ -76,6 +76,31 @@ pub async fn chat_cancel(manager: State<'_, RuntimeManager>) -> Result<Value, Ho
     manager.chat_cancel().await
 }
 
+/// Answer the question the runtime is waiting on.
+///
+/// The id names a question the runtime itself reported, and the words are the
+/// user's: the runtime decides whether either reached anything.
+#[tauri::command]
+pub async fn chat_answer(
+    id: String,
+    answer: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_answer(&id, &answer).await
+}
+
+/// Say what to do about the call the runtime is waiting on.
+///
+/// `allow` is the whole decision; which call it applies to is the runtime's id.
+#[tauri::command]
+pub async fn chat_approve(
+    id: String,
+    allow: bool,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.chat_approve(&id, allow).await
+}
+
 /// The conversations this workspace holds, and the one being continued.
 #[tauri::command]
 pub async fn chat_sessions(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
@@ -124,6 +149,234 @@ pub async fn chat_delete_session(
     manager: State<'_, RuntimeManager>,
 ) -> Result<Value, HostError> {
     manager.chat_delete_session(&id).await
+}
+
+/// The cron jobs the runtime holds, with when each one next runs.
+#[tauri::command]
+pub async fn cron_list(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.cron_list().await
+}
+
+/// Schedule a prompt on the runtime's own clock.
+///
+/// The page names the expression and the prompt; the runtime validates the
+/// expression and owns the job, so the answer is the job it stored.
+#[tauri::command]
+pub async fn cron_schedule(
+    cron: String,
+    prompt: String,
+    recurring: bool,
+    durable: bool,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager
+        .cron_schedule(&cron, &prompt, recurring, durable)
+        .await
+}
+
+/// Cancel a job the runtime holds. The id is one the runtime handed out.
+#[tauri::command]
+pub async fn cron_cancel(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.cron_cancel(&id).await
+}
+
+/// The skills the runtime found in the workspace.
+///
+/// Read-only: a skill is a file in `skills/`, so this is a window onto the same
+/// loader the system prompt catalogues. The page names no path.
+#[tauri::command]
+pub async fn skills_list(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.skills_list().await
+}
+
+/// One full `SKILL.md`, the same text `load_skill` gives the model.
+#[tauri::command]
+pub async fn skills_read(
+    name: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.skills_read(&name).await
+}
+
+/// Copy skills into the workspace from a folder the user picks.
+///
+/// The host opens the picker and hands the chosen folder to the runtime, the
+/// same way the project picker works: the page asks for the dialog, and never
+/// names the path that is copied. `None` means the dialog was dismissed.
+#[tauri::command]
+pub async fn skills_import(
+    app: AppHandle,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("选择技能文件夹（含 SKILL.md，或其子文件夹各含一个）");
+    // Parented to the window when there is one, so the picker comes up modal to
+    // the app instead of somewhere behind it.
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    let Some(picked) = dialog.blocking_pick_folder() else {
+        return Ok(Value::Null);
+    };
+    let path = picked.into_path().map_err(|error| {
+        HostError::new(
+            "skill_source_unusable",
+            format!("the picker returned a path the host cannot use: {error}"),
+        )
+    })?;
+    manager
+        .skills_import(path.to_string_lossy().as_ref())
+        .await
+}
+
+/// What the runtime is holding for the conversation in hand.
+#[tauri::command]
+pub async fn chat_context(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.chat_context().await
+}
+
+/// The plugins this build ships, with the tools of the ones connected.
+#[tauri::command]
+pub async fn plugins_list(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.plugins_list().await
+}
+
+/// Connect a plugin. The name is one this build ships, checked on the other side.
+#[tauri::command]
+pub async fn plugins_connect(
+    server: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.plugins_connect(&server).await
+}
+
+/// Every task on the workspace's board.
+#[tauri::command]
+pub async fn tasks_list(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.tasks_list().await
+}
+
+/// Add a task. The page names the subject, the description, and the ids of any
+/// prerequisites it read from the board; the runtime makes the id.
+#[tauri::command]
+pub async fn tasks_create(
+    subject: String,
+    description: String,
+    blocked_by: Vec<String>,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager
+        .tasks_create(&subject, &description, &blocked_by)
+        .await
+}
+
+/// Claim a ready task for the person at the page.
+#[tauri::command]
+pub async fn tasks_claim(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.tasks_claim(&id).await
+}
+
+/// Give a task the page claimed back to the board.
+#[tauri::command]
+pub async fn tasks_release(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.tasks_release(&id).await
+}
+
+/// Close a task the page claimed.
+#[tauri::command]
+pub async fn tasks_complete(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.tasks_complete(&id).await
+}
+
+/// Every department in the active workspace.
+#[tauri::command]
+pub async fn departments_list(manager: State<'_, RuntimeManager>) -> Result<Value, HostError> {
+    manager.departments_list().await
+}
+
+/// Add a department, or a sub-department under the parent id the page picked.
+#[tauri::command]
+pub async fn departments_create(
+    name: String,
+    description: String,
+    instructions: String,
+    parent_id: Option<String>,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager
+        .departments_create(
+            &name,
+            &description,
+            &instructions,
+            parent_id.as_deref(),
+        )
+        .await
+}
+
+/// Remove a department and the sub-departments below it.
+#[tauri::command]
+pub async fn departments_remove(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.departments_remove(&id).await
+}
+
+/// Add one agent to a department.
+#[tauri::command]
+pub async fn agents_add(
+    department_id: String,
+    name: String,
+    role: String,
+    instructions: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager
+        .agents_add(&department_id, &name, &role, &instructions)
+        .await
+}
+
+/// Remove one agent from a department.
+#[tauri::command]
+pub async fn agents_remove(
+    department_id: String,
+    agent_id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.agents_remove(&department_id, &agent_id).await
+}
+
+/// Start a department shift.
+#[tauri::command]
+pub async fn departments_run(
+    id: String,
+    instruction: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.departments_run(&id, &instruction).await
+}
+
+/// Stop a department shift.
+#[tauri::command]
+pub async fn departments_stop(
+    id: String,
+    manager: State<'_, RuntimeManager>,
+) -> Result<Value, HostError> {
+    manager.departments_stop(&id).await
 }
 
 /// The most recent log lines, oldest first.

@@ -4,18 +4,22 @@
 //! registry for [`ToolDefinition`]s, and dispatches [`ToolCall`]s back by
 //! name. Adding a capability means implementing [`Tool`] and registering it.
 
+pub mod ask;
 pub mod bash;
 pub mod fs;
 pub mod skill;
 pub mod task;
 pub mod todo;
 
+pub use ask::{
+    AskUserTool, Asker, ASK_USER_TOOL_NAME, MAX_ANSWER_CHARS, MAX_OPTIONS, MAX_QUESTION_CHARS,
+};
 pub use bash::BashTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use skill::{LoadSkillTool, LOAD_SKILL_TOOL_NAME};
 pub use task::{
-    register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool, GetTaskTool,
-    ListTasksTool, Task, TaskStatus, TaskStore, UpdateTaskTool, CLAIM_TASK_TOOL_NAME,
+    is_valid_task_id, register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool,
+    GetTaskTool, ListTasksTool, Task, TaskStatus, TaskStore, UpdateTaskTool, CLAIM_TASK_TOOL_NAME,
     COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME, DEFAULT_OWNER, GET_TASK_TOOL_NAME,
     LIST_TASKS_TOOL_NAME, TASKS_DIR, TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
 };

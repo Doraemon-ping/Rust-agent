@@ -84,6 +84,7 @@ it.)
 | `src/tools/bash.rs` | `bash` tool (platform shell, timeout, output cap) |
 | `src/tools/fs.rs` | `read_file`, `write_file`, `edit_file`, `glob` |
 | `src/tools/todo.rs` | Stateful `todo_write` task list (s05) |
+| `src/tools/ask.rs` | `ask_user`: put one question to the person driving the turn, through an `Asker` |
 | `src/tools/task.rs` | Persistent task graph: `create_task` / `update_task` / `claim_task` / `complete_task` (s10) |
 | `src/tools/skill.rs` | `load_skill` tool: reads a full `SKILL.md` on demand (s07) |
 | `src/skills.rs` | `SkillLoader`: scans `skills/*/SKILL.md`, builds the catalog |
@@ -192,6 +193,13 @@ let agent = Agent::builder()
 `compaction(..)` registers `compact`, runs the pipeline each turn, and emits
 `AgentEvent::Compacted { kind, transcript }` so an observer can show what
 happened. Every threshold is a field on `CompactConfig`.
+
+None of it is visible from a page on its own, so the desktop bridge answers
+`chat.context` with the size the compactor measures
+(`Compactor::estimate_chars`), the limit it measures against
+(`context_char_limit`), and how many times it has already run; the Chat page
+shows that beside the mode, so a window that suddenly shrank has an explanation
+instead of a mystery.
 
 ## Memory
 
@@ -334,6 +342,9 @@ and puts the job back in the queue. `durable` jobs are written to
 `start_ticker()` polls once a second on a background thread so a job fires
 while the agent sits idle -- delivery still happens at the next turn
 boundary. `cron(..)` emits `AgentEvent::CronDelivered`.
+`next_match(expression, after)` answers the first minute an expression matches,
+walking day by day rather than minute by minute -- the number the desktop page
+counts down to.
 
 ## Agent teams
 
@@ -447,8 +458,28 @@ let agent = Agent::builder()
 destructive command), lists connected servers in the system prompt, and emits
 `AgentEvent::McpConnected { server, tools }`. A malformed catalogue or a name
 collision is rejected at connect time, so the per-turn pool never half-fails.
-The shipped `docs` and `deploy` servers are in-process mocks; a real transport
-is just an `McpServer` implementation handed to `McpRegistry::register_server`.
+The shipped `docs` and `deploy` servers are in-process mocks. A real one is a
+child process the harness speaks to over stdin/stdout, declared in a
+`plugins.json` at the workspace root:
+
+```json
+{
+  "servers": [
+    { "name": "notes", "command": "node", "args": ["tools/notes-mcp.mjs"], "policy": "allow" }
+  ]
+}
+```
+
+`name` and `command` are required; `args` and `env` are optional; `policy`
+(`allow` or `confirm`) overrides the host default for that server's tools.
+`load_plugin_specs` reads the file and `McpRegistry::new().with_plugins(specs)`
+puts the names on the list; connecting one spawns the child, runs the
+`initialize` handshake, and reads its `tools/list`. A name that shadows a
+built-in, a missing `name` or `command`, or a file that will not parse is an
+error rather than a silent skip, and the file is read once at startup--add a
+server and restart the runtime. `McpServer` is still the seam underneath, so a
+different transport hands itself to `McpRegistry::register_server` and nothing
+else changes.
 
 ## Recovery and asynchronous turns
 
@@ -473,10 +504,11 @@ partial answer is kept and `CONTINUATION_PROMPT` asks for the rest (bounded by
 `max_continuation_retries`). The fallback model needs a per-request override, so
 `CompletionRequest::model` carries it.
 
-The second seam is approval. A turn that runs on its own thread -- a teammate --
-has no terminal to prompt on, so it is built with `interactive(false)`. Anything
-the policy would have *asked* about is denied instead, with a reason the model
-can read, rather than blocking on input nobody can answer:
+The second seam is approval. Gate three needs somebody to ask, and a turn can
+have nobody: a teammate runs on its own thread with no terminal, so it is built
+with `interactive(false)`, and anything the policy would have *asked* about is
+denied instead, with a reason the model can read, rather than blocking on input
+nobody can answer:
 
 ```rust
 let agent = Agent::builder()
@@ -485,6 +517,13 @@ let agent = Agent::builder()
     .interactive(false)          // deny instead of asking
     .build();
 ```
+
+The other answer is to ask somebody further away. An `Approver` is a synchronous
+trait -- the call does not proceed until it returns -- but nothing says the
+answer has to come from a terminal. The desktop shell parks the turn in the
+request, reports it over the bridge, and returns whatever the window decides;
+`ask_user` uses the same seam through `Asker` to put a question to the user. See
+`src/bin/desktop_bridge.rs` for both, and `desktop/README.md` for the protocol.
 
 `recovery(..)` emits `AgentEvent::ModelRecovered`, `ModelFellBack`,
 `MaxTokensEscalated`, and `ContinuationRequested`; `Config::fallback_model`
@@ -685,10 +724,36 @@ turn the runtime streams back as `chat.*` events, re-reading them with
 `chat.history` when the window is reloaded, ending a turn early with
 `chat.cancel`, and moving between the conversations the runtime keeps on disk
 with `sessions.list`, `sessions.new`, `sessions.open`, `sessions.rename`, and
-`sessions.delete`. The shell keeps those conversations in its own storage under
-the per-user app data directory, one store per workspace, so a project folder is
-never also a folder the runtime writes into. Protocol revision, layout, and
-platform status live in `desktop/README.md`.
+`sessions.delete`. Approval and questions cross the same bridge: a turn that
+flags a call stops inside it, the shell reports `chat.permission`, and the
+user's answer goes back as `chat.approve` -- so the window is the terminal the
+gate would otherwise be missing -- while `ask_user` becomes `chat.question` and
+`chat.answer`. The 任务 page drives the same `.tasks` graph the model's task
+tools write (`tasks.list`, `tasks.create`, `tasks.claim`, `tasks.release`, and
+`tasks.complete`): the page can add a node, put it behind prerequisites it read
+from the board, and claim, release, or complete what it owns as `user`, while a
+task owned by a model turn stays that turn's to finish. The 部门 page keeps
+departments, sub-departments, agents, and a group chat on disk
+(`departments.list`, `departments.create`, `departments.remove`, `agents.add`,
+`agents.remove`, `departments.run`, and `departments.stop`): a member's tool pool
+is scoped to its department and owner id, so starting a shift lets each agent
+create, claim, and complete its own tasks in order. The 定时任务 page is a
+window onto the runtime's own schedule
+(`cron.list`, `cron.schedule`, `cron.cancel`), and the bridge's own ticker
+starts a turn when a job comes due while the app sits idle, so a scheduled
+prompt arrives without anybody typing. The 技能 page reads the same catalogue
+the system prompt carries and the same `SKILL.md` `load_skill` hands the model
+(`skills.list`, `skills.read`, and `skills.import`, which copies a folder the
+user already has on disk under `<workspace>/skills/`), and the 插件 page drives
+the MCP registry the
+model's tool pool reads (`plugins.list`, `plugins.connect`), so a plugin
+installed from the page is one the model can call on its next turn. The Chat
+page also reads `chat.context` -- the size the compactor measures and how often
+it has run -- so automatic compaction is shown rather than merely happening. The shell
+keeps those conversations in its own storage under the per-user app data
+directory, one store per workspace, so a project folder is never also a folder
+the runtime writes into. Protocol revision, layout, and platform status live in
+`desktop/README.md`.
 
 ## Embedding
 
@@ -746,13 +811,18 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 - **External tools**: `builder().mcp(McpRegistry::new())` registers
   `connect_mcp` and the `mcp__*` host policy. Implement `McpServer` over any
   transport and hand it to `McpRegistry::register_server`; the pool, the
-  permission hook, and the loop are unchanged.
+  permission hook, and the loop are unchanged. To skip the code entirely,
+  declare stdio servers in a workspace `plugins.json` and pass them with
+  `McpRegistry::new().with_plugins(load_plugin_specs(workspace)?)`.
 - **Provider resilience**: `builder().recovery(RecoveryConfig::default())`
   retries `429`/`529`, switches models, and escalates truncation. Every knob is
   a field on `RecoveryConfig`; leave it off and the loop calls the provider
   exactly once per round.
 - **Asynchronous approval**: `builder().interactive(false)` turns "ask the user"
-  into "deny, with a reason" -- for turns with no terminal to prompt on.
+  into "deny, with a reason" -- for turns with no terminal to prompt on. To
+  ask somewhere else instead, implement `Approver` (and `Asker`, for
+  `ask_user`) over whatever carries the question -- a window, a socket, a
+  queue -- and keep `.interactive(true)`.
 - **Saved workflows**: `builder().workflow(registry)` registers the `Workflow`
   tool. Register trusted scripts with `registry.register(meta, script)`; the
   model only ever passes a name and args. `WorkflowRegistry::set_runner` swaps
@@ -762,6 +832,6 @@ let answer = agent.ask("summarise src/lib.rs").await?;
 ## Tests
 
 ```sh
-cargo test      # loop, hooks, todos, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery, workflows, goals
+cargo test      # loop, hooks, todos, questions, subagents, permissions, escaping, skills, compaction, memory, tasks, background, cron, teams, mcp, recovery, workflows, goals
 cargo clippy --all-targets
 ```

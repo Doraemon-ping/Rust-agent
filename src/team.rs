@@ -1342,7 +1342,7 @@ impl TeammateRuntime {
         observer: Arc<dyn AgentObserver>,
     ) -> Self {
         let mut tools = ToolRegistry::base();
-        tools.register(ListTasksTool);
+        tools.register(ListTasksTool::default());
         tools.register(ClaimTaskTool::owned_by(&name));
         let completions = Arc::new(CompletionLog::default());
         tools.register(RecordingCompleteTask::new(

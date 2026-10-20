@@ -142,10 +142,16 @@ impl SkillLoader {
     }
 
     /// The block appended to a system prompt so the model knows what exists.
+    ///
+    /// The directory is named on purpose: "install this skill for me" is a
+    /// request the model can only carry out if it knows where skills go.
     pub fn prompt_section(&self) -> String {
         format!(
-            "Skills available:\n{}\n\nUse load_skill to read the full instructions when a skill applies.",
-            self.catalog()
+            "Skills available:\n{}\n\nUse load_skill to read the full instructions when a \
+             skill applies. Skills are folders holding a {SKILL_MANIFEST}, kept in {}; \
+             that is where a new one goes.",
+            self.catalog(),
+            self.skills_dir.display()
         )
     }
 
@@ -339,6 +345,10 @@ mod tests {
         assert!(loader.load("alpha").unwrap().contains("Alpha skill"));
         assert!(loader.load("beta").unwrap().contains("More detail."));
         assert!(loader.prompt_section().contains("load_skill"));
+        // The model is told where skills live, so it can add one itself.
+        assert!(loader
+            .prompt_section()
+            .contains(&dir.path().display().to_string()));
     }
 
     #[test]

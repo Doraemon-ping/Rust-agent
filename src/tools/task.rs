@@ -86,6 +86,13 @@ pub struct Task {
     /// Optional teammate worktree (s13) bound to this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// The department this task belongs to, when it was made for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department: Option<String>,
+    /// The agent that created this task, when it was not created by a person
+    /// or by the main conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
 }
 
 /// Whether `id` matches `task_` followed by 8 lowercase hex digits.
@@ -157,6 +164,22 @@ impl TaskStore {
 
     /// Create a task and persist it, retrying on the (unlikely) id clash.
     pub fn create(&self, subject: &str, description: &str) -> Result<Task> {
+        self.create_scoped(subject, description, None, None)
+    }
+
+    /// Create a task stamped with the department and creator it came from.
+    ///
+    /// The stamps are opaque ids chosen by the caller -- the department store
+    /// owns their shape. A blank stamp is stored as `None`, so a page that
+    /// leaves the department unset writes the same file as before this field
+    /// existed.
+    pub fn create_scoped(
+        &self,
+        subject: &str,
+        description: &str,
+        department: Option<&str>,
+        created_by: Option<&str>,
+    ) -> Result<Task> {
         let subject = subject.trim();
         if subject.is_empty() {
             return Err(task_error("task subject cannot be empty"));
@@ -172,6 +195,14 @@ impl TaskStore {
                 owner: None,
                 blocked_by: Vec::new(),
                 worktree: None,
+                department: department
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                created_by: created_by
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
             };
             let path = self.path(&task.id)?;
             match fs::OpenOptions::new()
@@ -405,7 +436,30 @@ fn status_name(status: TaskStatus) -> &'static str {
 }
 
 /// `create_task`: allocate a node and return its runtime-generated id.
-pub struct CreateTaskTool;
+pub struct CreateTaskTool {
+    department: Option<String>,
+    created_by: Option<String>,
+}
+
+impl Default for CreateTaskTool {
+    fn default() -> Self {
+        CreateTaskTool {
+            department: None,
+            created_by: None,
+        }
+    }
+}
+
+impl CreateTaskTool {
+    /// A variant that stamps every task with the department and agent that
+    /// created it. This is what a department agent's tool pool holds.
+    pub fn scoped(department: impl Into<String>, created_by: impl Into<String>) -> Self {
+        CreateTaskTool {
+            department: Some(department.into()),
+            created_by: Some(created_by.into()),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for CreateTaskTool {
@@ -436,13 +490,35 @@ impl Tool for CreateTaskTool {
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let task = TaskStore::new(ctx.workspace()).create(subject, description)?;
+        let task = TaskStore::new(ctx.workspace()).create_scoped(
+            subject,
+            description,
+            self.department.as_deref(),
+            self.created_by.as_deref(),
+        )?;
         Ok(format!("Created {}: {}", task.id, task.subject))
     }
 }
 
 /// `update_task`: add `blockedBy` edges using ids from `create_task`.
-pub struct UpdateTaskTool;
+pub struct UpdateTaskTool {
+    department: Option<String>,
+}
+
+impl Default for UpdateTaskTool {
+    fn default() -> Self {
+        UpdateTaskTool { department: None }
+    }
+}
+
+impl UpdateTaskTool {
+    /// A variant that may only edit tasks belonging to one department.
+    pub fn in_department(department: impl Into<String>) -> Self {
+        UpdateTaskTool {
+            department: Some(department.into()),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for UpdateTaskTool {
@@ -473,11 +549,30 @@ impl Tool for UpdateTaskTool {
 
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let task_id = required_str(&input, "task_id")?;
+        let store = TaskStore::new(ctx.workspace());
+        if let Some(department) = &self.department {
+            let task = store.load(task_id)?;
+            if task.department.as_deref() != Some(department.as_str()) {
+                return Err(task_error(format!(
+                    "task {task_id} does not belong to this department"
+                )));
+            }
+        }
         let raw = input.get("addBlockedBy").cloned().unwrap_or(Value::Null);
         let dependencies: Vec<String> = serde_json::from_value(raw).map_err(|error| {
             task_error(format!("addBlockedBy must be a list of task IDs: {error}"))
         })?;
-        let task = TaskStore::new(ctx.workspace()).update_dependencies(task_id, &dependencies)?;
+        if let Some(department) = &self.department {
+            for dependency in &dependencies {
+                let task = store.load(dependency)?;
+                if task.department.as_deref() != Some(department.as_str()) {
+                    return Err(task_error(format!(
+                        "task {dependency} does not belong to this department"
+                    )));
+                }
+            }
+        }
+        let task = store.update_dependencies(task_id, &dependencies)?;
         let dependencies = if task.blocked_by.is_empty() {
             "(none)".to_string()
         } else {
@@ -488,7 +583,24 @@ impl Tool for UpdateTaskTool {
 }
 
 /// `list_tasks`: one line per task, with status, owner, and dependencies.
-pub struct ListTasksTool;
+pub struct ListTasksTool {
+    department: Option<String>,
+}
+
+impl Default for ListTasksTool {
+    fn default() -> Self {
+        ListTasksTool { department: None }
+    }
+}
+
+impl ListTasksTool {
+    /// A variant that only shows the tasks belonging to `department`.
+    pub fn in_department(department: impl Into<String>) -> Self {
+        ListTasksTool {
+            department: Some(department.into()),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ListTasksTool {
@@ -505,9 +617,20 @@ impl Tool for ListTasksTool {
     }
 
     async fn call(&self, ctx: &ToolContext, _input: Value) -> Result<String> {
-        let tasks = TaskStore::new(ctx.workspace()).list()?;
+        let tasks: Vec<Task> = TaskStore::new(ctx.workspace())
+            .list()?
+            .into_iter()
+            .filter(|task| match &self.department {
+                Some(department) => task.department.as_deref() == Some(department.as_str()),
+                None => true,
+            })
+            .collect();
         if tasks.is_empty() {
-            return Ok("No tasks. Use create_task to add some.".to_string());
+            return Ok(if self.department.is_some() {
+                "No tasks in this department. Use create_task to add one.".to_string()
+            } else {
+                "No tasks. Use create_task to add some.".to_string()
+            });
         }
         let lines = tasks
             .iter()
@@ -541,7 +664,24 @@ impl Tool for ListTasksTool {
 }
 
 /// `get_task`: the full task JSON, description and all.
-pub struct GetTaskTool;
+pub struct GetTaskTool {
+    department: Option<String>,
+}
+
+impl Default for GetTaskTool {
+    fn default() -> Self {
+        GetTaskTool { department: None }
+    }
+}
+
+impl GetTaskTool {
+    /// A variant that may only read tasks belonging to one department.
+    pub fn in_department(department: impl Into<String>) -> Self {
+        GetTaskTool {
+            department: Some(department.into()),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for GetTaskTool {
@@ -564,6 +704,13 @@ impl Tool for GetTaskTool {
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let task_id = required_str(&input, "task_id")?;
         let task = TaskStore::new(ctx.workspace()).load(task_id)?;
+        if let Some(department) = &self.department {
+            if task.department.as_deref() != Some(department.as_str()) {
+                return Err(task_error(format!(
+                    "task {task_id} does not belong to this department"
+                )));
+            }
+        }
         Ok(serde_json::to_string_pretty(&task)?)
     }
 }
@@ -571,12 +718,14 @@ impl Tool for GetTaskTool {
 /// `claim_task`: take ownership of a pending, unblocked task.
 pub struct ClaimTaskTool {
     owner: String,
+    department: Option<String>,
 }
 
 impl Default for ClaimTaskTool {
     fn default() -> Self {
         ClaimTaskTool {
             owner: DEFAULT_OWNER.to_string(),
+            department: None,
         }
     }
 }
@@ -586,6 +735,15 @@ impl ClaimTaskTool {
     pub fn owned_by(owner: impl Into<String>) -> Self {
         ClaimTaskTool {
             owner: owner.into(),
+            department: None,
+        }
+    }
+
+    /// A variant that may only claim tasks in one department.
+    pub fn scoped(owner: impl Into<String>, department: impl Into<String>) -> Self {
+        ClaimTaskTool {
+            owner: owner.into(),
+            department: Some(department.into()),
         }
     }
 }
@@ -611,7 +769,16 @@ impl Tool for ClaimTaskTool {
 
     async fn call(&self, ctx: &ToolContext, input: Value) -> Result<String> {
         let task_id = required_str(&input, "task_id")?;
-        TaskStore::new(ctx.workspace()).claim(task_id, &self.owner)
+        let store = TaskStore::new(ctx.workspace());
+        if let Some(department) = &self.department {
+            let task = store.load(task_id)?;
+            if task.department.as_deref() != Some(department.as_str()) {
+                return Err(task_error(format!(
+                    "task {task_id} does not belong to this department"
+                )));
+            }
+        }
+        store.claim(task_id, &self.owner)
     }
 }
 
@@ -664,10 +831,10 @@ impl Tool for CompleteTaskTool {
 
 /// Register all six task tools on a registry.
 pub fn register_task_tools(registry: &mut ToolRegistry) {
-    registry.register(CreateTaskTool);
-    registry.register(UpdateTaskTool);
-    registry.register(ListTasksTool);
-    registry.register(GetTaskTool);
+    registry.register(CreateTaskTool::default());
+    registry.register(UpdateTaskTool::default());
+    registry.register(ListTasksTool::default());
+    registry.register(GetTaskTool::default());
     registry.register(ClaimTaskTool::default());
     registry.register(CompleteTaskTool::default());
 }
@@ -941,5 +1108,84 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("addBlockedBy"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_scoped_agent_only_creates_sees_and_claims_its_department() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let store = TaskStore::new(dir.path());
+        let foreign = store
+            .create_scoped("other", "", Some("dept_22222222"), Some("agent_33333333"))
+            .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(CreateTaskTool::scoped("dept_11111111", "agent_44444444"));
+        registry.register(ListTasksTool::in_department("dept_11111111"));
+        registry.register(ClaimTaskTool::scoped("agent_44444444", "dept_11111111"));
+        registry.register(CompleteTaskTool::owned_by("agent_44444444"));
+
+        let created = registry
+            .execute(
+                &ctx,
+                &call(CREATE_TASK_TOOL_NAME, json!({ "subject": "mine" })),
+            )
+            .await
+            .unwrap();
+        let id = created
+            .strip_prefix("Created ")
+            .and_then(|rest| rest.split(':').next())
+            .unwrap();
+        let task = store.load(id).unwrap();
+        assert_eq!(task.department.as_deref(), Some("dept_11111111"));
+        assert_eq!(task.created_by.as_deref(), Some("agent_44444444"));
+
+        let listed = registry
+            .execute(&ctx, &call(LIST_TASKS_TOOL_NAME, json!({})))
+            .await
+            .unwrap();
+        assert!(listed.contains("mine"), "{listed}");
+        assert!(!listed.contains("other"), "{listed}");
+
+        let refused = registry
+            .execute(
+                &ctx,
+                &call(CLAIM_TASK_TOOL_NAME, json!({ "task_id": foreign.id })),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("department"), "{refused}");
+        assert_eq!(store.load(&foreign.id).unwrap().owner, None);
+
+        registry
+            .execute(&ctx, &call(CLAIM_TASK_TOOL_NAME, json!({ "task_id": id })))
+            .await
+            .unwrap();
+        registry
+            .execute(
+                &ctx,
+                &call(COMPLETE_TASK_TOOL_NAME, json!({ "task_id": id })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.load(id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn a_task_file_from_before_departments_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        fs::create_dir_all(store.root()).unwrap();
+        let id = "task_12345678";
+        fs::write(
+            store.root().join(format!("{id}.json")),
+            r#"{"id":"task_12345678","subject":"old","status":"pending"}"#,
+        )
+        .unwrap();
+
+        let task = store.load(id).unwrap();
+        assert_eq!(task.department, None);
+        assert_eq!(task.created_by, None);
+        assert_eq!(task.status, TaskStatus::Pending);
     }
 }

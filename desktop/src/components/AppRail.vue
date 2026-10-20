@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import {
+  Building2,
   CalendarClock,
   CircleAlert,
   CircleCheck,
   CircleDot,
+  ListChecks,
   Puzzle,
   Settings,
   Sparkles,
@@ -21,10 +23,11 @@ const runtime = useRuntimeStore()
 /**
  * The rail is the shell's map of itself.
  *
- * Every entry leads to a page that exists. The three that are not built yet say
- * so on the page instead of pretending here.
+ * Every entry leads to a page that exists.
  */
 const DESTINATIONS = [
+  { name: '部门', to: '/departments', icon: Building2 },
+  { name: '任务', to: '/tasks', icon: ListChecks },
   { name: '定时任务', to: '/cron', icon: CalendarClock },
   { name: '插件', to: '/plugins', icon: Puzzle },
   { name: '技能', to: '/skills', icon: Sparkles },

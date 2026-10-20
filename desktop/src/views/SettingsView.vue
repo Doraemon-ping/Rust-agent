@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Bot, ListChecks, Users } from '@lucide/vue'
+import { Bot, MessageSquare, Users } from '@lucide/vue'
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 
 import ProviderSettingsCard from '@/components/ProviderSettingsCard.vue'
@@ -33,7 +33,7 @@ const runtime = useRuntimeStore()
 const LATER = [
   { icon: Users, name: '部门', line: '一组智能体，以及它们的协作规则' },
   { icon: Bot, name: '智能体', line: '单个智能体的角色、工具集与模型' },
-  { icon: ListChecks, name: '任务', line: '认领、派发与验收' },
+  { icon: MessageSquare, name: '群聊', line: '多个智能体共享的对话与投递' },
 ]
 </script>
 

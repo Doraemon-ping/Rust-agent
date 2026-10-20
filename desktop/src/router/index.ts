@@ -2,9 +2,11 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 
 import ChatView from '@/views/ChatView.vue'
 import CronView from '@/views/CronView.vue'
+import DepartmentsView from '@/views/DepartmentsView.vue'
 import PluginsView from '@/views/PluginsView.vue'
 import SettingsView from '@/views/SettingsView.vue'
 import SkillsView from '@/views/SkillsView.vue'
+import TasksView from '@/views/TasksView.vue'
 
 /**
  * Hash history on purpose: the packaged app is loaded from a custom scheme, and
@@ -23,6 +25,12 @@ export const router = createRouter({
       meta: { title: '对话' },
     },
     {
+      path: '/departments',
+      name: 'departments',
+      component: DepartmentsView,
+      meta: { title: '部门' },
+    },
+    {
       path: '/cron',
       name: 'cron',
       component: CronView,
@@ -39,6 +47,12 @@ export const router = createRouter({
       name: 'skills',
       component: SkillsView,
       meta: { title: '技能' },
+    },
+    {
+      path: '/tasks',
+      name: 'tasks',
+      component: TasksView,
+      meta: { title: '任务' },
     },
     {
       path: '/settings',

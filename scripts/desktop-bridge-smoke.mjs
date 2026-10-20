@@ -12,6 +12,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 
 const PROTOCOL_VERSION = 1
 const exe = process.platform === 'win32' ? 'desktop_bridge.exe' : 'desktop_bridge'
@@ -161,16 +162,46 @@ async function main() {
     check('the bridge announces runtime.ready', ready !== undefined)
     check('runtime.ready carries the workspace', ready?.data?.workspace === workspace)
     check('runtime.ready reports protocol 1', ready?.data?.protocol_version === PROTOCOL_VERSION)
-      check('runtime.ready lists every method', ready?.data?.methods?.length === 11)
+    check('runtime.ready lists every method', ready?.data?.methods?.length === 27)
     check('runtime.ready advertises chat.send', ready?.data?.methods?.includes('chat.send'))
     check('runtime.ready advertises chat.cancel', ready?.data?.methods?.includes('chat.cancel'))
     check('runtime.ready advertises chat.history', ready?.data?.methods?.includes('chat.history'))
+    check('runtime.ready advertises chat.context', ready?.data?.methods?.includes('chat.context'))
+    check(
+      'runtime.ready advertises the interaction methods',
+      ['chat.answer', 'chat.approve'].every((method) =>
+        ready?.data?.methods?.includes(method)),
+    )
     check('runtime.ready advertises the session methods', [
       'sessions.list',
       'sessions.new',
       'sessions.open',
-        'sessions.rename',
-        'sessions.delete',
+      'sessions.rename',
+      'sessions.delete',
+    ].every((method) => ready?.data?.methods?.includes(method)))
+    check('runtime.ready advertises the cron methods', [
+      'cron.list',
+      'cron.schedule',
+      'cron.cancel',
+    ].every((method) => ready?.data?.methods?.includes(method)))
+    check('runtime.ready advertises the task methods', [
+      'tasks.list',
+      'tasks.create',
+      'tasks.claim',
+      'tasks.release',
+      'tasks.complete',
+    ].every((method) => ready?.data?.methods?.includes(method)))
+    check('runtime.ready advertises the skill methods', [
+      'skills.list',
+      'skills.read',
+    ].every((method) => ready?.data?.methods?.includes(method)))
+    check(
+      'runtime.ready advertises skills.import',
+      ready?.data?.methods?.includes('skills.import'),
+    )
+    check('runtime.ready advertises the plugin methods', [
+      'plugins.list',
+      'plugins.connect',
     ].every((method) => ready?.data?.methods?.includes(method)))
 
     bridge.request('r-1', 'runtime.ping')
@@ -343,6 +374,502 @@ async function main() {
   } finally {
     await fromHost.stop()
     rmSync(dotted, { recursive: true, force: true })
+  }
+
+  // --- the schedule: the runtime's own job table, driven from the host ---
+  //
+  // No model is configured here on purpose. A job that comes due is marked for
+  // delivery by the bridge's ticker and then left in the queue, because there is
+  // nothing to hand it to -- which is exactly what the page shows as 待投递.
+  const scheduled = mkdtempSync(join(tmpdir(), 'bridge-cron-'))
+  const cron = new Harness(scheduled, { env: scrubbed })
+  try {
+    await cron.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    cron.request('k-1', 'cron.list')
+    const empty = await cron.waitFor((messages) => byId(messages, 'k-1'))
+    check('the schedule starts empty', (empty?.result?.jobs ?? []).length === 0, JSON.stringify(empty?.result))
+
+    cron.request('k-2', 'cron.schedule', {
+      params: { cron: '0 9 * * 1-5', prompt: 'weekday standup' },
+    })
+    const created = await cron.waitFor((messages) => byId(messages, 'k-2'))
+    check('a job can be scheduled', created?.ok === true, JSON.stringify(created))
+    const job = created?.result?.job
+    check(
+      'the job comes back with an id the runtime made',
+      /^cron_[0-9a-f]{8}$/.test(job?.id ?? ''),
+      job?.id,
+    )
+    check('recurring and durable default on', job?.recurring === true && job?.durable === true)
+    check(
+      'the job says when it next runs',
+      typeof job?.next_run === 'string' && job?.next_run_ms > 0,
+      JSON.stringify(job),
+    )
+    check('a job that is not due yet is not waiting', job?.pending_delivery === false)
+
+    cron.request('k-3', 'runtime.status')
+    const counted = await cron.waitFor((messages) => byId(messages, 'k-3'))
+    check(
+      'runtime.status counts the job without being told twice',
+      counted?.result?.cron?.jobs === 1,
+      JSON.stringify(counted?.result?.cron),
+    )
+
+    cron.request('k-4', 'cron.schedule', { params: { cron: 'every day at nine', prompt: 'x' } })
+    const refused = await cron.waitFor((messages) => byId(messages, 'k-4'))
+    check(
+      'an expression that cannot be parsed is refused',
+      refused?.error?.code === 'cron_invalid',
+      JSON.stringify(refused?.error),
+    )
+    cron.request('k-5', 'cron.cancel', { params: { id: 'cron_00000000' } })
+    const missing = await cron.waitFor((messages) => byId(messages, 'k-5'))
+    check(
+      'cancelling a job that is not there is refused',
+      missing?.error?.code === 'cron_unknown',
+      JSON.stringify(missing?.error),
+    )
+
+    // A job due every minute is marked by the ticker within a second or so.
+    cron.request('k-6', 'cron.schedule', { params: { cron: '* * * * *', prompt: 'due now' } })
+    const due = await cron.waitFor((messages) => byId(messages, 'k-6'))
+    check('a job due every minute can be scheduled', due?.ok === true, JSON.stringify(due?.error))
+    cron.request('k-7', 'cron.list')
+    const waiting = await cron.waitFor(
+      (messages) =>
+        (byId(messages, 'k-7')?.result?.jobs ?? []).some((entry) => entry.pending_delivery),
+      5000,
+    )
+    check('the ticker marks a due job for delivery while nothing is running', waiting !== undefined)
+    check(
+      'and no turn was started with no model to run it',
+      cron.messages().every((message) => !String(message.event ?? '').startsWith('chat.')),
+    )
+
+    cron.request('k-8', 'cron.cancel', { params: { id: job.id } })
+    const cancelled = await cron.waitFor((messages) => byId(messages, 'k-8'))
+    check('a job can be cancelled', cancelled?.result?.cancelled === job.id, JSON.stringify(cancelled?.result))
+    cron.request('k-9', 'cron.list')
+    const left = await cron.waitFor((messages) => byId(messages, 'k-9'))
+    check(
+      'and it is gone from the list',
+      (left?.result?.jobs ?? []).length === 1,
+      JSON.stringify(left?.result?.jobs),
+    )
+  } finally {
+    await cron.stop()
+    rmSync(scheduled, { recursive: true, force: true })
+  }
+
+  // --- tasks: the board the model's task tools write to ---
+  //
+  // A task is a JSON file under `.tasks/`, and the page drives the same files:
+  // create a node, put one behind another, claim the ready one, and watch the
+  // dependency open when it is completed.
+  const boarded = mkdtempSync(join(tmpdir(), 'bridge-tasks-'))
+  const board = new Harness(boarded, { env: scrubbed })
+  try {
+    await board.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    board.request('t-1', 'tasks.list')
+    const emptyBoard = await board.waitFor((messages) => byId(messages, 't-1'))
+    check('the task board starts empty', emptyBoard?.result?.count === 0, JSON.stringify(emptyBoard?.result))
+    check(
+      'and names the directory it read',
+      emptyBoard?.result?.dir === join(boarded, '.tasks'),
+      emptyBoard?.result?.dir,
+    )
+
+    board.request('t-2', 'tasks.create', {
+      params: { subject: 'write the plan', description: 'the first node' },
+    })
+    const firstCreated = await board.waitFor((messages) => byId(messages, 't-2'))
+    check('a task can be created', firstCreated?.ok === true, JSON.stringify(firstCreated?.error))
+    const first = firstCreated?.result?.task
+    check('the runtime made the id', /^task_[0-9a-f]{8}$/.test(String(first?.id ?? '')), first?.id)
+    check('a fresh task is ready', first?.ready === true && first?.status === 'pending')
+    check('and nobody owns it', first?.owner === null)
+
+    board.request('t-3', 'tasks.create', {
+      params: { subject: 'ship it', blocked_by: [first?.id] },
+    })
+    const secondCreated = await board.waitFor((messages) => byId(messages, 't-3'))
+    const second = secondCreated?.result?.task
+    check('a task can wait on another', secondCreated?.ok === true, JSON.stringify(secondCreated?.error))
+    check(
+      'and the dependency is reported as open',
+      second?.ready === false && second?.blocked?.[0] === first?.id,
+      JSON.stringify(second),
+    )
+
+    board.request('t-4', 'tasks.claim', { params: { id: second?.id } })
+    const blockedClaim = await board.waitFor((messages) => byId(messages, 't-4'))
+    check(
+      'a blocked task cannot be claimed',
+      blockedClaim?.error?.code === 'task_blocked',
+      JSON.stringify(blockedClaim?.error),
+    )
+
+    board.request('t-5', 'tasks.claim', { params: { id: first?.id } })
+    const claimed = await board.waitFor((messages) => byId(messages, 't-5'))
+    check('a ready task can be claimed', claimed?.ok === true, JSON.stringify(claimed?.error))
+    check(
+      'and the page is recorded as its owner',
+      claimed?.result?.task?.status === 'in_progress' && claimed?.result?.task?.owner === 'user',
+      JSON.stringify(claimed?.result?.task),
+    )
+
+    board.request('t-6', 'runtime.status')
+    const counted = await board.waitFor((messages) => byId(messages, 't-6'))
+    check(
+      'runtime.status counts it without being told twice',
+      counted?.result?.tasks?.in_progress === 1 && counted?.result?.tasks?.total === 2,
+      JSON.stringify(counted?.result?.tasks),
+    )
+
+    board.request('t-7', 'tasks.release', { params: { id: first?.id } })
+    const released = await board.waitFor((messages) => byId(messages, 't-7'))
+    check('a claimed task can be given back', released?.ok === true, JSON.stringify(released?.error))
+    check('and it is ready again', released?.result?.task?.ready === true && released?.result?.task?.owner === null)
+
+    board.request('t-8', 'tasks.claim', { params: { id: first?.id } })
+    await board.waitFor((messages) => byId(messages, 't-8'))
+    board.request('t-9', 'tasks.complete', { params: { id: first?.id } })
+    const completed = await board.waitFor((messages) => byId(messages, 't-9'))
+    check('a claimed task can be completed', completed?.ok === true, JSON.stringify(completed?.error))
+    check(
+      'and the completion names what it unblocked',
+      String(completed?.result?.message ?? '').includes('Unblocked: ship it'),
+      completed?.result?.message,
+    )
+
+    board.request('t-10', 'tasks.list')
+    const listed = await board.waitFor((messages) => byId(messages, 't-10'))
+    const ship = (listed?.result?.tasks ?? []).find((task) => task.id === second?.id)
+    check('the dependent task is ready now', ship?.ready === true, JSON.stringify(ship))
+    check('and its open prerequisites are empty', ship?.blocked?.length === 0, JSON.stringify(ship?.blocked))
+
+    board.request('t-11', 'tasks.create', {
+      params: { subject: 'x', blocked_by: ['task_00000000'] },
+    })
+    const missingDependency = await board.waitFor((messages) => byId(messages, 't-11'))
+    check(
+      'a dependency that is not on the board is refused',
+      missingDependency?.error?.code === 'task_unknown',
+      JSON.stringify(missingDependency?.error),
+    )
+
+    board.request('t-12', 'tasks.claim', { params: { id: 'task_00000000' } })
+    const missingTask = await board.waitFor((messages) => byId(messages, 't-12'))
+    check(
+      'claiming a task that is not there is refused',
+      missingTask?.error?.code === 'task_unknown',
+      JSON.stringify(missingTask?.error),
+    )
+  } finally {
+    await board.stop()
+    rmSync(boarded, { recursive: true, force: true })
+  }
+
+  // --- skills: the runtime's own loader, listed and read in full ---
+  //
+  // A skill is a file in the workspace, so the page lists the catalogue and
+  // opens one manifest; neither of those changes anything.
+  const equipped = mkdtempSync(join(tmpdir(), 'bridge-skills-'))
+  mkdirSync(join(equipped, 'skills', 'demo'), { recursive: true })
+  writeFileSync(
+    join(equipped, 'skills', 'demo', 'SKILL.md'),
+    '---\nname: demo\ndescription: A demo skill.\n---\n\n# Demo\n\nSay hi.\n',
+  )
+  const skills = new Harness(equipped, { env: scrubbed })
+  try {
+    await skills.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    skills.request('g-1', 'skills.list')
+    const catalogue = await skills.waitFor((messages) => byId(messages, 'g-1'))
+    check(
+      'the catalogue lists the skill',
+      catalogue?.result?.count === 1,
+      JSON.stringify(catalogue?.result),
+    )
+    check(
+      'and names the directory it scanned',
+      catalogue?.result?.dir === join(equipped, 'skills'),
+      catalogue?.result?.dir,
+    )
+    const listed = catalogue?.result?.skills?.[0]
+    check(
+      'a skill carries its description',
+      listed?.description === 'A demo skill.',
+      JSON.stringify(listed),
+    )
+    check(
+      'and the manifest it came from',
+      String(listed?.path ?? '').endsWith('SKILL.md'),
+      listed?.path,
+    )
+
+    skills.request('g-2', 'skills.read', { params: { name: 'demo' } })
+    const opened = await skills.waitFor((messages) => byId(messages, 'g-2'))
+    check('a skill can be read in full', opened?.ok === true, JSON.stringify(opened?.error))
+    check(
+      'and the answer is the manifest itself',
+      String(opened?.result?.content ?? '').includes('Say hi.'),
+      JSON.stringify(opened?.result?.content),
+    )
+
+    skills.request('g-3', 'skills.read', { params: { name: 'nope' } })
+    const unknownSkill = await skills.waitFor((messages) => byId(messages, 'g-3'))
+    check(
+      'reading a skill that is not there is refused',
+      unknownSkill?.error?.code === 'skill_unknown',
+      JSON.stringify(unknownSkill?.error),
+    )
+
+    // --- a skill folder the user already has on disk can be brought in ---
+    //
+    // The page has no other way to add one: the loader scans one directory, so
+    // the import is the copy that puts a folder there.
+    const source = mkdtempSync(join(tmpdir(), 'bridge-skill-src-'))
+    mkdirSync(join(source, 'imported'), { recursive: true })
+    writeFileSync(
+      join(source, 'imported', 'SKILL.md'),
+      '---\nname: imported\ndescription: A skill copied in.\n---\n\n# Imported\n',
+    )
+    skills.request('g-4', 'skills.import', { params: { path: source } })
+    const imported = await skills.waitFor((messages) => byId(messages, 'g-4'))
+    check('a skill folder on disk can be imported', imported?.ok === true, JSON.stringify(imported?.error))
+    check('and the answer counts it', imported?.result?.count === 1, JSON.stringify(imported?.result))
+    check('under the name its manifest gives', imported?.result?.skills?.[0]?.name === 'imported')
+
+    skills.request('g-5', 'skills.list')
+    const regrown = await skills.waitFor((messages) => byId(messages, 'g-5'))
+    check('the catalogue grew by the imported skill', regrown?.result?.count === 2, JSON.stringify(regrown?.result))
+    check(
+      'and it is listed like any other',
+      (regrown?.result?.skills ?? []).some((skill) => skill.name === 'imported'),
+    )
+
+    // A re-import never lands on top of what is already there.
+    skills.request('g-6', 'skills.import', { params: { path: source } })
+    const twice = await skills.waitFor((messages) => byId(messages, 'g-6'))
+    check(
+      'importing the same skill twice is refused',
+      twice?.error?.code === 'skill_exists',
+      JSON.stringify(twice?.error),
+    )
+
+    // A folder with no manifest anywhere in it is not a skill.
+    const empty = mkdtempSync(join(tmpdir(), 'bridge-skill-empty-'))
+    skills.request('g-7', 'skills.import', { params: { path: empty } })
+    const notSkill = await skills.waitFor((messages) => byId(messages, 'g-7'))
+    check(
+      'importing a folder with no manifest is refused',
+      notSkill?.error?.code === 'skill_invalid',
+      JSON.stringify(notSkill?.error),
+    )
+
+    // A path that is not a folder at all is refused with its own code.
+    skills.request('g-8', 'skills.import', { params: { path: join(empty, 'missing') } })
+    const noFolder = await skills.waitFor((messages) => byId(messages, 'g-8'))
+    check(
+      'importing a path that is not a folder is refused',
+      noFolder?.error?.code === 'skill_source',
+      JSON.stringify(noFolder?.error),
+    )
+
+    rmSync(source, { recursive: true, force: true })
+    rmSync(empty, { recursive: true, force: true })
+  } finally {
+    await skills.stop()
+    rmSync(equipped, { recursive: true, force: true })
+  }
+
+  // --- plugins: the MCP registry the model's tool pool reads ---
+  const plugged = mkdtempSync(join(tmpdir(), 'bridge-plugins-'))
+  const plugins = new Harness(plugged, { env: scrubbed })
+  try {
+    await plugins.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    plugins.request('p-1', 'plugins.list')
+    const before = await plugins.waitFor((messages) => byId(messages, 'p-1'))
+    check(
+      'the plugin list names what this build ships',
+      before?.result?.available >= 1,
+      JSON.stringify(before?.result),
+    )
+    check('nothing is connected at startup', (before?.result?.connected ?? []).length === 0)
+    check(
+      'and an unconnected plugin has no catalogue yet',
+      (before?.result?.servers ?? []).every((server) => server.tools.length === 0),
+      JSON.stringify(before?.result?.servers),
+    )
+
+    plugins.request('p-2', 'plugins.connect', { params: { server: 'docs' } })
+    const connected = await plugins.waitFor((messages) => byId(messages, 'p-2'))
+    check('a plugin can be connected', connected?.ok === true, JSON.stringify(connected?.error))
+    check('and the answer names it', connected?.result?.server === 'docs')
+
+    plugins.request('p-3', 'runtime.status')
+    const countedPlugin = await plugins.waitFor((messages) => byId(messages, 'p-3'))
+    check(
+      'runtime.status counts the connection without being told twice',
+      countedPlugin?.result?.plugins?.connected === 1,
+      JSON.stringify(countedPlugin?.result?.plugins),
+    )
+
+    plugins.request('p-4', 'plugins.list')
+    const after = await plugins.waitFor((messages) => byId(messages, 'p-4'))
+    const docs = (after?.result?.servers ?? []).find((server) => server.name === 'docs')
+    check('a connected plugin is marked connected', docs?.connected === true)
+    check(
+      'and its tools were discovered, namespaced and policy-tagged',
+      (docs?.tools ?? []).length > 0 &&
+        (docs?.tools ?? []).every(
+          (tool) => tool.name.startsWith('mcp__docs__') && typeof tool.policy === 'string',
+        ),
+      JSON.stringify(docs?.tools),
+    )
+
+    plugins.request('p-5', 'plugins.connect', { params: { server: 'nope' } })
+    const unknownPlugin = await plugins.waitFor((messages) => byId(messages, 'p-5'))
+    check(
+      'connecting a plugin this build does not ship is refused',
+      unknownPlugin?.error?.code === 'plugin_unknown',
+      JSON.stringify(unknownPlugin?.error),
+    )
+
+    // The size the page reads to show how full the conversation is. It is a
+    // fact about the conversation, so it is answerable before any model exists.
+    plugins.request('p-6', 'chat.context')
+    const context = await plugins.waitFor((messages) => byId(messages, 'p-6'))
+    check('chat.context answers', context?.ok === true, JSON.stringify(context?.error))
+    check(
+      'and counts messages and compactions',
+      typeof context?.result?.messages === 'number' &&
+        typeof context?.result?.compacted === 'number',
+      JSON.stringify(context?.result),
+    )
+    check('and measures chars the compactor way', typeof context?.result?.chars === 'number')
+  } finally {
+    await plugins.stop()
+    rmSync(plugged, { recursive: true, force: true })
+  }
+
+  // --- a workspace can declare its own MCP server in plugins.json ---
+  //
+  // This is the extension path: no rebuild, just a file naming the command to
+  // run. The server here is a real one over stdio, spawned the same way a
+  // shipped one would be.
+  const notesServer = resolve(
+    fileURLToPath(new URL('.', import.meta.url)),
+    'fixtures',
+    'mcp-notes-server.mjs',
+  )
+  const declaring = mkdtempSync(join(tmpdir(), 'bridge-plugins-declared-'))
+  writeFileSync(
+    join(declaring, 'plugins.json'),
+    `${JSON.stringify(
+      {
+        servers: [
+          { name: 'notes', command: process.execPath, args: [notesServer], policy: 'allow' },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  )
+  const declared = new Harness(declaring, { env: scrubbed })
+  try {
+    await declared.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    declared.request('d-1', 'plugins.list')
+    const listed = await declared.waitFor((messages) => byId(messages, 'd-1'))
+    const notes = (listed?.result?.servers ?? []).find((server) => server.name === 'notes')
+    check('a workspace can declare its own plugin', notes !== undefined, JSON.stringify(listed?.result))
+    check('and it is marked as coming from the workspace', notes?.source === 'workspace')
+    check(
+      'and its command is shown so the page can say what runs',
+      typeof notes?.command === 'string' && notes.command.includes('mcp-notes-server.mjs'),
+      notes?.command,
+    )
+    check(
+      'and a declared plugin starts out unconnected like any other',
+      notes?.connected === false,
+    )
+
+    declared.request('d-2', 'plugins.connect', { params: { server: 'notes' } })
+    const joined = await declared.waitFor((messages) => byId(messages, 'd-2'), 20000)
+    check('a declared plugin can be connected', joined?.ok === true, JSON.stringify(joined?.error))
+
+    declared.request('d-3', 'plugins.list')
+    const grown = await declared.waitFor((messages) => byId(messages, 'd-3'))
+    const connected = (grown?.result?.servers ?? []).find((server) => server.name === 'notes')
+    check('and it is then marked connected', connected?.connected === true)
+    check(
+      'and its tools were discovered and namespaced',
+      (connected?.tools ?? []).some((tool) => tool.name === 'mcp__notes__add_note') &&
+        (connected?.tools ?? []).some((tool) => tool.name === 'mcp__notes__list_notes'),
+      JSON.stringify(connected?.tools),
+    )
+    check(
+      'and its declared policy is the one the page shows',
+      (connected?.tools ?? []).every((tool) => tool.policy === 'allow'),
+      JSON.stringify(connected?.tools),
+    )
+
+    declared.request('d-4', 'runtime.status')
+    const counted = await declared.waitFor((messages) => byId(messages, 'd-4'))
+    check(
+      'runtime.status counts the declared plugin too',
+      counted?.result?.plugins?.connected === 1,
+      JSON.stringify(counted?.result?.plugins),
+    )
+  } finally {
+    await declared.stop()
+    rmSync(declaring, { recursive: true, force: true })
+  }
+
+  // --- the two ways a turn asks the page for something ---
+  //
+  // A run that wants a call approved, or an answer to a question, parks inside
+  // the tool call and reports the request as an event; the page replies on these
+  // two methods. Neither needs a model: a reply that reaches no parked call is
+  // what a page sends after the call is already over, and it is told so.
+  const asking = mkdtempSync(join(tmpdir(), 'bridge-interaction-'))
+  const waiting = new Harness(asking, { env: scrubbed })
+  try {
+    await waiting.waitFor((messages) => named(messages, 'runtime.ready'))
+
+    waiting.request('w-1', 'chat.answer', { params: { id: 'ask', answer: 'yes' } })
+    const spoken = await waiting.waitFor((messages) => byId(messages, 'w-1'))
+    check('an answer nobody asked for is taken as nothing to do', spoken?.ok === true, JSON.stringify(spoken?.error))
+    check('and says so rather than claiming it was delivered', spoken?.result?.accepted === false)
+
+    waiting.request('w-2', 'chat.approve', { params: { id: 'perm', allow: true } })
+    const decided = await waiting.waitFor((messages) => byId(messages, 'w-2'))
+    check('the same is true of a decision', decided?.result?.accepted === false, JSON.stringify(decided))
+    check('and it is a response, not an event', decided?.type === 'response')
+
+    waiting.request('w-3', 'chat.answer', { params: { id: 'ask' } })
+    const unspoken = await waiting.waitFor((messages) => byId(messages, 'w-3'))
+    check('an answer with no words is refused', unspoken?.error?.code === 'invalid_params', JSON.stringify(unspoken?.error))
+
+    waiting.request('w-4', 'chat.approve', { params: { id: 'perm', allow: 'yes' } })
+    const vague = await waiting.waitFor((messages) => byId(messages, 'w-4'))
+    check('a decision that is not a yes or no is refused', vague?.error?.code === 'invalid_params', JSON.stringify(vague?.error))
+
+    check(
+      'neither reply is broadcast as an event',
+      waiting.messages().every((message) =>
+        !String(message.event ?? '').startsWith('chat.permission') &&
+          !String(message.event ?? '').startsWith('chat.question')),
+    )
+  } finally {
+    await waiting.stop()
+    rmSync(asking, { recursive: true, force: true })
   }
 
   // --- chat: a prompt runs through the loop and the turn comes back as events ---
@@ -713,6 +1240,71 @@ async function main() {
           (afterDelete?.result?.turns ?? []).length === 0,
           JSON.stringify((afterDelete?.result?.turns ?? []).map((turn) => turn.turn)),
         )
+
+        // --- a conversation longer than one frame still reads back ---
+        //
+        // The bridge keeps up to 4 MiB of turns and answers `chat.history` with
+        // all of them on one line, so the host has to take a reply longer than
+        // the line it reads requests with. When it does not, the answer is
+        // dropped, the request times out, and the page is left with a
+        // conversation that simply does not load. Written here the way a
+        // previous run of the app would have left it.
+        const bigId = 's1791900000000-1-9'
+        const bigTurns = []
+        for (let number = 1; number <= 4; number += 1) {
+          const events = []
+          for (let index = 0; index < 6; index += 1) {
+            events.push({
+              protocol_version: PROTOCOL_VERSION,
+              type: 'event',
+              event: 'chat.delta',
+              ts: '2026-01-01T00:00:00Z',
+              data: { turn: `turn-${number}`, source: 'main', text: 'x'.repeat(64 * 1024) },
+            })
+          }
+          events.push({
+            protocol_version: PROTOCOL_VERSION,
+            type: 'event',
+            event: 'chat.done',
+            ts: '2026-01-01T00:00:00Z',
+            data: { turn: `turn-${number}`, ok: true, text: 'done' },
+          })
+          bigTurns.push({
+            turn: `turn-${number}`,
+            prompt: `prompt ${number}`,
+            status: 'done',
+            events,
+          })
+        }
+        writeFileSync(
+          join(mock, '.sessions', `${bigId}.json`),
+          JSON.stringify({
+            id: bigId,
+            title: 'a long conversation',
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:00:00Z',
+            messages: [],
+            view: { turns: bigTurns },
+          }),
+        )
+
+        resumed.request('c-40', 'sessions.open', { params: { id: bigId } })
+        const bigOpened = await resumed.waitFor((messages) => byId(messages, 'c-40'))
+        check('a long conversation opens', bigOpened?.result?.session === bigId, JSON.stringify(bigOpened?.result))
+
+        resumed.request('c-41', 'chat.history')
+        const bigRead = await resumed.waitFor((messages) => byId(messages, 'c-41'))
+        check(
+          'a long conversation reads back whole',
+          (bigRead?.result?.turns ?? []).length === 4,
+          JSON.stringify(bigRead?.result?.turns?.length),
+        )
+        const bigLine = resumed.stdout.find((line) => line.includes('"request_id":"c-41"')) ?? ''
+        // Longer than a request frame, so this is the answer that used to be
+        // dropped; shorter than the reply limit the host takes, which is the
+        // number that has to cover the runtime's own log budget.
+        check('the answer is one line longer than a request frame', bigLine.length > 1 << 20, `${bigLine.length} bytes`)
+        check('and one the host will take', bigLine.length > 0 && bigLine.length < 8 << 20, `${bigLine.length} bytes`)
     } finally {
       await resumed.stop()
     }

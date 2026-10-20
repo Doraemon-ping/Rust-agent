@@ -83,4 +83,8 @@ pub enum Error {
     /// The session store rejected a conversation, or an id that is not one.
     #[error("session error: {0}")]
     Session(String),
+
+    /// The department store rejected a department, an agent, or an id (s18).
+    #[error("workforce error: {0}")]
+    Workforce(String),
 }

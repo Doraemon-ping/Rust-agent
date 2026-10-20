@@ -33,6 +33,7 @@ export interface RuntimeSnapshot {
   tasks: { total: number; pending: number; in_progress: number; completed: number }
   memory: { records: number; by_kind: Record<string, number> }
   cron: { jobs: number; pending_delivery: number }
+  plugins: { available: number; connected: number; names: string[] }
   workflow: { last_run: string | null }
   paths: Record<string, string>
   warnings: string[]
@@ -89,11 +90,52 @@ export interface RuntimeCommands {
   chat_send: (prompt: string) => Promise<{ accepted: boolean; turn: string }>
   chat_cancel: () => Promise<{ cancelled: boolean }>
   chat_history: () => Promise<{ turns: unknown[] }>
+  chat_context: () => Promise<{
+    session: string
+    messages: number
+    compacted: number
+    chars: number
+    char_limit: number | null
+  }>
   chat_sessions: () => Promise<{ current?: string; sessions?: unknown[] }>
   chat_new_session: () => Promise<{ session: string; turns: number }>
   chat_open_session: (id: string) => Promise<{ session: string; turns: number }>
   chat_rename_session: (id: string, title: string) => Promise<{ session: string; title: string }>
   chat_delete_session: (id: string) => Promise<{ deleted: string; current: string }>
+  cron_list: () => Promise<{ jobs: unknown[]; pending_delivery: number }>
+  cron_schedule: (input: {
+    cron: string
+    prompt: string
+    recurring: boolean
+    durable: boolean
+  }) => Promise<{ job: unknown }>
+  cron_cancel: (id: string) => Promise<{ cancelled: string }>
+  skills_list: () => Promise<{ dir: string; count: number; skills: unknown[] }>
+  skills_read: (name: string) => Promise<unknown>
+  skills_import: () => Promise<{
+    dir: string
+    count: number
+    skills: unknown[]
+  } | null>
+  plugins_list: () => Promise<{ available: number; connected: string[]; servers: unknown[] }>
+  plugins_connect: (server: string) => Promise<{ server: string; message: string }>
+  departments_list: () => Promise<unknown>
+  departments_create: (input: {
+    name: string
+    description: string
+    instructions: string
+    parentId: string | null
+  }) => Promise<unknown>
+  departments_remove: (id: string) => Promise<unknown>
+  agents_add: (input: {
+    departmentId: string
+    name: string
+    role: string
+    instructions: string
+  }) => Promise<unknown>
+  agents_remove: (input: { departmentId: string; agentId: string }) => Promise<unknown>
+  departments_run: (input: { id: string; instruction: string }) => Promise<unknown>
+  departments_stop: (id: string) => Promise<unknown>
 }
 
 export const RUNTIME_STATE_LABEL: Record<RuntimeState, string> = {

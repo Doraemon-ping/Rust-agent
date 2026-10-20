@@ -24,10 +24,48 @@ export type ChatBlock =
       isError: boolean
     }
   | { kind: 'blocked'; name: string; reason: string }
-  | { kind: 'notice'; text: string }
+  | {
+      kind: 'notice'
+      text: string
+      /** The runtime's own kind for it, e.g. `compacted`, when it sent one. */
+      notice?: string
+    }
+  | {
+      kind: 'permission'
+      /** The runtime's name for this request, which a decision has to name back. */
+      id: string
+      /** The tool whose call is waiting. */
+      name: string
+      /** That call's arguments, as the runtime rendered them. */
+      input: string
+      /** Why the policy flagged it, in the runtime's own words. */
+      reason: string
+      source: string
+      /** `pending` until the decision is reported, which is the only truth. */
+      decision: 'pending' | 'allowed' | 'denied'
+    }
+  | {
+      kind: 'question'
+      /** The runtime's name for this question, which an answer has to name back. */
+      id: string
+      question: string
+      /** Suggested answers; the user may still answer in their own words. */
+      options: string[]
+      source: string
+      /** `null` until somebody answers, and for a question nobody did. */
+      answer: string | null
+      /** Whether it is over: answered, or given up on. */
+      resolved: boolean
+    }
 
 /** A tool call, once the template has narrowed a block down to one. */
 export type ChatToolBlock = Extract<ChatBlock, { kind: 'tool' }>
+
+/** A permission request, once the template has narrowed a block down to one. */
+export type ChatPermissionBlock = Extract<ChatBlock, { kind: 'permission' }>
+
+/** A question, once the template has narrowed a block down to one. */
+export type ChatQuestionBlock = Extract<ChatBlock, { kind: 'question' }>
 
 /**
  * Where a turn got to.
@@ -59,6 +97,12 @@ export interface ChatEventData {
   is_error?: boolean
   reason?: string
   kind?: string
+  /** The interaction a `chat.permission*` or `chat.question*` event is about. */
+  id?: string
+  question?: string
+  options?: string[]
+  answer?: string | null
+  allowed?: boolean
   error?: RuntimeError
 }
 
@@ -142,4 +186,36 @@ export interface ChatSessionDeleted {
 /** What `chat.cancel` answers with: whether there was a turn to stop. */
 export interface ChatCancelResult {
   cancelled: boolean
+}
+
+/**
+ * What `chat.answer` and `chat.approve` answer with.
+ *
+ * `accepted` is whether the answer reached the interaction it named: a page
+ * that answered a question that was already over is told so rather than left to
+ * believe it was heard.
+ */
+export interface ChatInteractionResult {
+  accepted: boolean
+}
+
+/**
+ * What `chat.context` answers with: the size of what the loop is holding.
+ *
+ * `chars` is the estimate the runtime's own compaction pipeline measures before
+ * every model call, `char_limit` is the threshold it measures against, and
+ * `compacted` is how many times it has already shrunk the conversation on its
+ * own. All three come from the runtime: the page shows them, it does not guess.
+ */
+export interface ChatContext {
+  /** The conversation these numbers describe. */
+  session: string
+  /** Messages the model has seen. */
+  messages: number
+  /** How many times the runtime has compacted the history. */
+  compacted: number
+  /** Estimated size of the history, in characters of JSON. */
+  chars: number
+  /** The size above which the runtime compacts, when it knows it. */
+  char_limit: number | null
 }

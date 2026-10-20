@@ -31,6 +31,7 @@ const facts = computed(() => {
     { label: '启动于', value: formatTime(data.started_at) },
     { label: '模型', value: data.model ?? '未配置' },
     { label: '技能', value: `${data.skills.count}` },
+    { label: '插件', value: `${data.plugins.connected} / ${data.plugins.available}` },
     { label: '任务', value: `${data.tasks.total}（待办 ${data.tasks.pending}）` },
     { label: '记忆', value: `${data.memory.records}` },
     { label: '定时任务', value: `${data.cron.jobs}` },

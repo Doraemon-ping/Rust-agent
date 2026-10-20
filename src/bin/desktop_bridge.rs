@@ -15,6 +15,21 @@
 //! conversation is being continued. `sessions.rename` and `sessions.delete` are
 //! what the page's conversation menu does to them.
 //!
+//! A turn can also stop and ask the page something. The permission policy's
+//! third gate and the `ask_user` tool both go out as `chat.permission` and
+//! `chat.question`, and wait for `chat.approve` and `chat.answer` -- so a call
+//! the policy flags is decided by the person at the window instead of being
+//! refused on their behalf, and a question nobody answers is a failed tool
+//! result rather than a turn that hangs. A turn the runtime started on its own,
+//! with no page behind it, is refused as it always was.
+//!
+//! Cron jobs are the runtime's own (`CronScheduler`), so `cron.list`,
+//! `cron.schedule`, and `cron.cancel` are a window onto that table rather than a
+//! second one. A ticker polls the clock every second and, when a job is due and
+//! the runtime is idle, starts a turn of its own: without it a job scheduled for
+//! 09:00 would not fire until somebody happened to send a prompt. The loop
+//! injects the `[Scheduled]` message itself, so the ticker never invents one.
+//!
 //! Conversations are written through the runtime's own `SessionStore`, so they
 //! outlive the process: a restart -- and choosing another project restarts the
 //! runtime -- resumes the conversation the user was reading instead of starting
@@ -25,25 +40,39 @@
 //!
 //! The agent is built on the first prompt, not at startup, so a workspace with
 //! no model credentials still starts and still answers for itself.
+//!
+//! `skills.list` and `skills.read` are a window onto the `SkillLoader` the loop
+//! itself uses -- the same catalogue the system prompt carries, and the same
+//! `SKILL.md` `load_skill` hands the model. `plugins.list` and `plugins.connect`
+//! are the MCP registry: the servers this build ships, and the tools of the ones
+//! already connected. The page connects a server through the same registry the
+//! agent's tool pool reads, so a plugin the page installs is one the model can
+//! immediately call.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use rust_agent::agent::{AgentEvent, AgentObserver};
 use rust_agent::subagent::{subagent_system_prompt, TaskTool};
 use rust_agent::{
-    default_system_prompt, is_session_id, last_run, Agent, AnthropicClient, CompactConfig, Config,
-    CronScheduler, Error, LlmClient, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role,
-    Session, SessionStore, SessionSummary, SkillLoader, TaskStatus, TaskStore, ToolRegistry,
-    CRON_PROMPT, MAILBOXES_DIR, SESSIONS_DIR, TASKS_PROMPT, WORKFLOWS_DIR,
+    default_system_prompt, is_session_id, is_valid_agent_id, is_valid_cron_id,
+    is_valid_department_id, is_valid_task_id, last_run, load_plugin_specs, next_match,
+    parse_frontmatter, validate_cron, Agent, AgentProfile, AnthropicClient, Approver, AskUserTool,
+    Asker, ClaimTaskTool, CompactConfig, Compactor, CompleteTaskTool, Config, CreateTaskTool,
+    CronJob, CronScheduler, Department, DepartmentMessage, Error, GetTaskTool, ListTasksTool,
+    LlmClient, McpRegistry, MemoryConfig, MemoryStore, Message, RecoveryConfig, Role, Session,
+    SessionStore, SessionSummary, Skill, SkillLoader, Task, TaskStatus, TaskStore, ToolCall,
+    ToolRegistry, UpdateTaskTool, WorkforceStore, CRON_PROMPT, MAILBOXES_DIR, MAX_MESSAGE_CHARS,
+    MCP_PROMPT, SESSIONS_DIR, SKILL_MANIFEST, TASKS_PROMPT, WORKFLOWS_DIR,
 };
 
 /// Wire revision of the protocol. Bumped whenever a message shape changes.
@@ -53,18 +82,41 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Every method this build answers, in the order we advertise them.
-const METHODS: [&str; 11] = [
+const METHODS: [&str; 34] = [
     "runtime.status",
     "runtime.ping",
     "runtime.shutdown",
     "chat.send",
     "chat.cancel",
     "chat.history",
+    "chat.context",
+    "chat.answer",
+    "chat.approve",
     "sessions.list",
     "sessions.new",
     "sessions.open",
     "sessions.rename",
     "sessions.delete",
+    "cron.list",
+    "cron.schedule",
+    "cron.cancel",
+    "tasks.list",
+    "tasks.create",
+    "tasks.claim",
+    "tasks.release",
+    "tasks.complete",
+    "departments.list",
+    "departments.create",
+    "departments.remove",
+    "agents.add",
+    "agents.remove",
+    "departments.run",
+    "departments.stop",
+    "skills.list",
+    "skills.read",
+    "skills.import",
+    "plugins.list",
+    "plugins.connect",
 ];
 
 /// The methods that take parameters. Everything else refuses them, so a host
@@ -72,7 +124,27 @@ const METHODS: [&str; 11] = [
 fn takes_params(method: &str) -> bool {
     matches!(
         method,
-        "chat.send" | "sessions.open" | "sessions.rename" | "sessions.delete"
+        "chat.send"
+            | "chat.answer"
+            | "chat.approve"
+            | "sessions.open"
+            | "sessions.rename"
+            | "sessions.delete"
+            | "cron.schedule"
+            | "cron.cancel"
+            | "tasks.create"
+            | "tasks.claim"
+            | "tasks.release"
+            | "tasks.complete"
+            | "departments.create"
+            | "departments.remove"
+            | "agents.add"
+            | "agents.remove"
+            | "departments.run"
+            | "departments.stop"
+            | "skills.read"
+            | "skills.import"
+            | "plugins.connect"
     )
 }
 
@@ -396,6 +468,9 @@ struct Bridge {
     started: Instant,
     started_at: String,
     cron: CronScheduler,
+    /// The MCP servers the runtime has connected. Shared with the chat, so a
+    /// plugin the page installs is one the agent's tool pool already holds.
+    mcp: McpRegistry,
     model: Option<String>,
     config_error: Option<String>,
     warnings: Vec<String>,
@@ -405,6 +480,19 @@ impl Bridge {
     fn new(workspace: PathBuf, sessions_dir: PathBuf) -> Self {
         let cron = CronScheduler::new(workspace.clone());
         let mut warnings = Vec::new();
+        // The servers the workspace declares. Nothing is connected yet: a
+        // server is connected by the page or by the model, and either way it is
+        // this one registry that remembers it.
+        let plugins = match load_plugin_specs(&workspace) {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                // Reported rather than fatal: a workspace with a broken
+                // plugins.json still has a usable agent and built-in servers.
+                warnings.push(format!("plugins: {error}"));
+                Vec::new()
+            }
+        };
+        let mcp = McpRegistry::new().with_plugins(plugins);
         match cron.load() {
             Ok(0) => {}
             Ok(count) => log(
@@ -427,6 +515,7 @@ impl Bridge {
             started: Instant::now(),
             started_at: Utc::now().to_rfc3339(),
             cron,
+            mcp,
             model,
             config_error,
             warnings,
@@ -488,6 +577,16 @@ impl Bridge {
         let jobs = self.cron.jobs();
         let pending_jobs = jobs.iter().filter(|job| job.pending_delivery).count();
         let skill_count = skill_names.len();
+        let connected_plugins = self.mcp.connected_names();
+        let workforce = WorkforceStore::new(&self.workspace);
+        let departments = match workforce.list() {
+            Ok(list) => list,
+            Err(error) => {
+                warnings.push(format!("departments: {error}"));
+                Vec::new()
+            }
+        };
+        let agent_count: usize = departments.iter().map(|dept| dept.agents.len()).sum();
 
         json!({
             "protocol_version": PROTOCOL_VERSION,
@@ -496,7 +595,7 @@ impl Bridge {
             "started_at": self.started_at,
             "uptime_ms": self.uptime_ms(),
             "workspace": self.workspace.display().to_string(),
-            "methods": METHODS,
+            "methods": METHODS.as_slice(),
             "model": self.model,
             "config_error": self.config_error,
             "skills": { "count": skill_count, "names": skill_names },
@@ -508,11 +607,21 @@ impl Bridge {
             },
             "memory": { "records": records.len(), "by_kind": by_kind },
             "cron": { "jobs": jobs.len(), "pending_delivery": pending_jobs },
+            "plugins": {
+                "available": self.mcp.available().len(),
+                "connected": connected_plugins.len(),
+                "names": connected_plugins,
+            },
+            "workforce": {
+                "departments": departments.len(),
+                "agents": agent_count,
+            },
             "workflow": { "last_run": last_run(&self.workspace) },
             "paths": {
                 "workspace": self.workspace.display().to_string(),
                 "skills": skills.dir().display().to_string(),
                 "tasks": tasks.root().display().to_string(),
+                "departments": workforce.root().display().to_string(),
                 "memory": memories.dir().display().to_string(),
                 "sessions": self.sessions_dir.display().to_string(),
                 "mailboxes": self.workspace.join(MAILBOXES_DIR).display().to_string(),
@@ -568,6 +677,11 @@ fn dispatch(
         "chat.send" => accept_chat(request, chat, handle),
         "chat.cancel" => accept_cancel(request, chat, handle),
         "chat.history" => Turn::answered(Response::ok(&request.request_id, chat.log.snapshot())),
+        "chat.context" => {
+            Turn::answered(Response::ok(&request.request_id, chat.context_snapshot()))
+        }
+        "chat.answer" => accept_answer(request, chat),
+        "chat.approve" => accept_approve(request, chat),
         "sessions.list" => {
             Turn::answered(Response::ok(&request.request_id, chat.sessions_snapshot()))
         }
@@ -575,6 +689,44 @@ fn dispatch(
         "sessions.open" => accept_open_session(request, chat),
         "sessions.rename" => accept_rename_session(request, chat),
         "sessions.delete" => accept_delete_session(request, chat),
+        "cron.list" => Turn::answered(Response::ok(&request.request_id, chat.cron_snapshot())),
+        "cron.schedule" => accept_schedule_cron(request, chat),
+        "cron.cancel" => accept_cancel_cron(request, chat),
+        "tasks.list" => match tasks_snapshot(&chat.workspace) {
+            Ok(tasks) => Turn::answered(Response::ok(&request.request_id, tasks)),
+            Err(error) => Turn::answered(Response::failed(
+                &request.request_id,
+                ProtocolError::new(TASK_STORE, error.to_string()),
+            )),
+        },
+        "tasks.create" => accept_create_task(request, chat),
+        "tasks.claim" => accept_claim_task(request, chat),
+        "tasks.release" => accept_release_task(request, chat),
+        "tasks.complete" => accept_complete_task(request, chat),
+        "departments.list" => match departments_snapshot(chat) {
+            Ok(departments) => Turn::answered(Response::ok(&request.request_id, departments)),
+            Err(error) => Turn::answered(Response::failed(
+                &request.request_id,
+                ProtocolError::new(WORKFORCE_STORE, error.to_string()),
+            )),
+        },
+        "departments.create" => accept_create_department(request, chat),
+        "departments.remove" => accept_remove_department(request, chat),
+        "agents.add" => accept_add_agent(request, chat),
+        "agents.remove" => accept_remove_agent(request, chat),
+        "departments.run" => accept_run_department(request, chat, handle),
+        "departments.stop" => accept_stop_department(request, chat),
+        "skills.list" => Turn::answered(Response::ok(
+            &request.request_id,
+            skills_snapshot(&chat.workspace),
+        )),
+        "skills.read" => accept_read_skill(request, chat),
+        "skills.import" => accept_import_skill(request, chat),
+        "plugins.list" => Turn::answered(Response::ok(
+            &request.request_id,
+            plugins_snapshot(&chat.mcp),
+        )),
+        "plugins.connect" => accept_connect_plugin(request, chat),
         other => Turn::answered(Response::failed(
             &request.request_id,
             ProtocolError::new(
@@ -599,12 +751,21 @@ fn dispatch(
 /// Longest prompt the bridge accepts, in bytes.
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
+/// How often the runtime looks at the clock while the host is quiet.
+const CRON_TICK: Duration = Duration::from_secs(1);
+
 /// Longest run of tool output echoed back to the host, in bytes. One `bash`
 /// call can print megabytes, and the host drops a line it cannot frame.
 const MAX_EVENT_TEXT_BYTES: usize = 8 * 1024;
 
 /// How much of the conversation is kept for a page that asks for it again.
 /// Oldest turns go first, and a turn that is still running is never dropped.
+///
+/// A snapshot of this is one line on the wire, and the host drops a line it
+/// cannot frame: the budget has to stay inside the frame the host reads with,
+/// or `chat.history` is answered with something nobody can read back. The host
+/// takes the larger line of the two directions for exactly this answer -- see
+/// `MAX_LINE_BYTES` in `desktop/src-tauri/src/runtime.rs`.
 const MAX_LOG_TURNS: usize = 50;
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 
@@ -615,6 +776,53 @@ const CHAT_NOT_CONFIGURED: &str = "chat_not_configured";
 const SESSION_UNKNOWN: &str = "session_unknown";
 /// The conversations could not be read or written where they are kept.
 const SESSION_STORE: &str = "session_store";
+/// A cron expression this runtime does not accept.
+const CRON_INVALID: &str = "cron_invalid";
+/// Asked to cancel a cron job this runtime does not hold.
+const CRON_UNKNOWN: &str = "cron_unknown";
+
+/// The task board could not be read or written.
+const TASK_STORE: &str = "task_store";
+/// Asked for a task this workspace does not hold.
+const TASK_UNKNOWN: &str = "task_unknown";
+/// A task field this runtime will not take.
+const TASK_INVALID: &str = "task_invalid";
+/// The task is waiting on prerequisites that are not complete.
+const TASK_BLOCKED: &str = "task_blocked";
+/// The task is not in the state this action needs.
+const TASK_NOT_READY: &str = "task_not_ready";
+/// The task is claimed by somebody other than the page's user.
+const TASK_NOT_OWNED: &str = "task_not_owned";
+/// The task changed under the action, so the action did not land.
+const TASK_CONFLICT: &str = "task_conflict";
+
+/// The department store could not be read or written.
+const WORKFORCE_STORE: &str = "workforce_store";
+/// A department or agent field this runtime will not take.
+const WORKFORCE_INVALID: &str = "workforce_invalid";
+/// A shift is already running, so another one was not started.
+const WORKFORCE_CONFLICT: &str = "workforce_conflict";
+/// Asked for a department this workspace does not hold.
+const DEPARTMENT_UNKNOWN: &str = "department_unknown";
+/// Asked for an agent that is not in the department named.
+const AGENT_UNKNOWN: &str = "agent_unknown";
+
+/// The owner recorded when the page claims a task. Model turns use `agent` or
+/// a teammate's name, so the two can never be mistaken for one another.
+const PAGE_TASK_OWNER: &str = "user";
+
+/// Asked to read a skill this workspace does not hold.
+const SKILL_UNKNOWN: &str = "skill_unknown";
+/// The folder to import from is not a folder the runtime can read.
+const SKILL_SOURCE: &str = "skill_source";
+/// Neither the folder nor any folder under it holds a `SKILL.md`.
+const SKILL_INVALID: &str = "skill_invalid";
+/// A skill of that name is already in the workspace.
+const SKILL_EXISTS: &str = "skill_exists";
+/// Asked to connect a plugin this build does not ship.
+const PLUGIN_UNKNOWN: &str = "plugin_unknown";
+/// A plugin this build ships could not be connected.
+const PLUGIN_FAILED: &str = "plugin_failed";
 
 /// Longest name a conversation may be given, in characters. Long enough for a
 /// sentence, short enough that a list can show it.
@@ -850,16 +1058,20 @@ struct ChatObserver {
     source: &'static str,
     /// Whether this observer's text is the answer the user asked for.
     answers: bool,
+    /// Where each compaction is counted, for the conversation's own observer.
+    /// A subagent compacts nothing, so it has none.
+    compactions: Option<Arc<AtomicUsize>>,
 }
 
 impl ChatObserver {
     /// The observer for the conversation itself.
-    fn conversation(tag: Arc<TurnTag>, log: Arc<TurnLog>) -> Self {
+    fn conversation(tag: Arc<TurnTag>, log: Arc<TurnLog>, compactions: Arc<AtomicUsize>) -> Self {
         ChatObserver {
             tag,
             log,
             source: "main",
             answers: true,
+            compactions: Some(compactions),
         }
     }
 
@@ -871,12 +1083,18 @@ impl ChatObserver {
             log,
             source: "subagent",
             answers: false,
+            compactions: None,
         }
     }
 }
 
 impl AgentObserver for ChatObserver {
     fn on_event(&self, signal: AgentEvent<'_>) {
+        if matches!(signal, AgentEvent::Compacted { .. }) {
+            if let Some(compactions) = &self.compactions {
+                compactions.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let Some((name, mut data)) = describe(&signal, self.answers) else {
             return;
         };
@@ -1012,12 +1230,114 @@ fn clamp(text: &str) -> String {
     )
 }
 
+/// The one department shift this runtime may be driving.
+///
+/// Shifts are sequential on purpose: every agent in a department works from
+/// the same `.tasks` directory, and two shifts at once would make the board
+/// disagree with itself between a claim and its completion. The page can start
+/// another shift as soon as this one reports that it is over.
+struct ActiveShift {
+    started_at: String,
+    agents_total: usize,
+    agents_done: usize,
+    current_agent: Option<String>,
+    stop: watch::Sender<bool>,
+}
+
+/// Departments on disk, plus the shift in flight (if any).
+struct WorkforceRuntime {
+    store: WorkforceStore,
+    shifts: Mutex<BTreeMap<String, ActiveShift>>,
+}
+
+impl WorkforceRuntime {
+    fn new(workspace: impl Into<PathBuf>) -> Self {
+        WorkforceRuntime {
+            store: WorkforceStore::new(workspace),
+            shifts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock_shifts(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, ActiveShift>> {
+        self.shifts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn active_department(&self) -> Option<String> {
+        self.lock_shifts().keys().next().cloned()
+    }
+
+    /// Reserve the single shift slot. `None` means a shift is already running.
+    fn start(&self, department_id: &str, agents_total: usize) -> Option<watch::Receiver<bool>> {
+        let mut shifts = self.lock_shifts();
+        if !shifts.is_empty() {
+            return None;
+        }
+        let (stop, receiver) = watch::channel(false);
+        shifts.insert(
+            department_id.to_string(),
+            ActiveShift {
+                started_at: Utc::now().to_rfc3339(),
+                agents_total,
+                agents_done: 0,
+                current_agent: None,
+                stop,
+            },
+        );
+        Some(receiver)
+    }
+
+    fn set_current_agent(&self, department_id: &str, agent_id: &str) {
+        if let Some(shift) = self.lock_shifts().get_mut(department_id) {
+            shift.current_agent = Some(agent_id.to_string());
+        }
+    }
+
+    fn mark_agent_done(&self, department_id: &str) {
+        if let Some(shift) = self.lock_shifts().get_mut(department_id) {
+            shift.agents_done += 1;
+            shift.current_agent = None;
+        }
+    }
+
+    fn finish(&self, department_id: &str) {
+        self.lock_shifts().remove(department_id);
+    }
+
+    /// Ask the shift to stop. `false` means there was nothing to stop.
+    fn stop(&self, department_id: &str) -> bool {
+        let shifts = self.lock_shifts();
+        let Some(shift) = shifts.get(department_id) else {
+            return false;
+        };
+        let _ = shift.stop.send(true);
+        true
+    }
+
+    /// The shift in flight for one department, as the page lists it.
+    fn shift_view(&self, department_id: &str) -> Option<Value> {
+        let shifts = self.lock_shifts();
+        let shift = shifts.get(department_id)?;
+        Some(json!({
+            "running": true,
+            "startedAt": shift.started_at,
+            "currentAgentId": shift.current_agent,
+            "agentsDone": shift.agents_done,
+            "agentsTotal": shift.agents_total,
+        }))
+    }
+}
+
 /// The conversation the shell is having, and the one turn that may be running.
 struct Chat {
     workspace: PathBuf,
     /// The same job table the snapshot reports, so a scheduled prompt fires in
     /// the next turn rather than never.
     cron: CronScheduler,
+    /// The same MCP registry the snapshot reports, so a plugin the page
+    /// connects is in the pool the next model call sees.
+    mcp: McpRegistry,
     /// Built on the first prompt and reused, so the conversation keeps its
     /// history. A build that failed is remembered with its reason: the answer
     /// will not change until the runtime is restarted.
@@ -1036,13 +1356,27 @@ struct Chat {
     busy: AtomicBool,
     /// Monotonic turn counter, so a host can match events to its prompt.
     turns: AtomicU64,
+    /// How many times the loop has compacted the conversation's history.
+    ///
+    /// Counted here rather than read back from the transcript so the page can
+    /// say "it compacts by itself" with a number behind it.
+    compactions: Arc<AtomicUsize>,
     tag: Arc<TurnTag>,
     /// Every turn reported so far, for a page that asks for them again.
     log: Arc<TurnLog>,
+    /// Where a turn stops to ask the window something, and hears back.
+    hub: Arc<InteractionHub>,
+    /// The departments the page made, and the shift currently driving one.
+    workforce: WorkforceRuntime,
 }
 
 impl Chat {
-    fn new(workspace: PathBuf, sessions_dir: PathBuf, cron: CronScheduler) -> Self {
+    fn new(
+        workspace: PathBuf,
+        sessions_dir: PathBuf,
+        cron: CronScheduler,
+        mcp: McpRegistry,
+    ) -> Self {
         let sessions = SessionStore::at(sessions_dir);
         // Pick up where the last run left off. A store this build cannot read is
         // reported and stepped over: history is not worth refusing to start a
@@ -1073,17 +1407,22 @@ impl Chat {
             None => (sessions.create(""), Arc::new(TurnLog::new())),
         };
         let turns = log.last_number();
+        let workforce = WorkforceRuntime::new(workspace.clone());
         Chat {
             workspace,
             cron,
+            mcp,
             agent: Mutex::new(None),
             session: Mutex::new(session),
             sessions,
             cancel: TurnCancel::default(),
             busy: AtomicBool::new(false),
             turns: AtomicU64::new(turns),
+            compactions: Arc::new(AtomicUsize::new(0)),
             tag: Arc::new(TurnTag::default()),
+            hub: Arc::new(InteractionHub::default()),
             log,
+            workforce,
         }
     }
 
@@ -1190,6 +1529,17 @@ impl Chat {
         json!({ "current": current.id, "sessions": sessions })
     }
 
+    /// Every cron job this workspace holds, with when each one next runs.
+    ///
+    /// The table is the runtime's own, the same one `schedule_cron` writes to,
+    /// so the page and the model can never disagree about what is scheduled.
+    fn cron_snapshot(&self) -> Value {
+        let table = self.cron.jobs();
+        let pending = table.iter().filter(|job| job.pending_delivery).count();
+        let jobs: Vec<Value> = table.iter().map(cron_view).collect();
+        json!({ "jobs": jobs, "pending_delivery": pending })
+    }
+
     /// The agent loop for this workspace, built once.
     fn agent(&self) -> Result<Arc<Agent>, ProtocolError> {
         let mut cached = self.agent.lock().unwrap_or_else(|error| error.into_inner());
@@ -1197,11 +1547,40 @@ impl Chat {
             build_agent(
                 &self.workspace,
                 &self.cron,
+                &self.mcp,
                 Arc::clone(&self.tag),
                 Arc::clone(&self.log),
+                Arc::clone(&self.compactions),
+                Arc::clone(&self.hub),
             )
         });
         built.clone()
+    }
+
+    /// What the loop is holding for the conversation in hand.
+    ///
+    /// The runtime compacts a long conversation on its own, before every model
+    /// call; nothing about that is visible from the page unless it is asked
+    /// for. This is that answer: the size the summary step measures, the
+    /// threshold it measures against, and how often it has already run.
+    fn context_snapshot(&self) -> Value {
+        let session = self.session();
+        let messages = session.messages.len();
+        let compacted = self.compactions.load(Ordering::SeqCst);
+        // The size is a fact about the conversation, so it is answered whether
+        // or not a model is configured; the threshold is the loop's, so it is
+        // only known once the loop exists.
+        let char_limit = self
+            .agent()
+            .ok()
+            .and_then(|agent| agent.compactor().map(|c| c.config().context_char_limit));
+        json!({
+            "session": session.id,
+            "messages": messages,
+            "compacted": compacted,
+            "chars": Compactor::estimate_chars(&session.messages),
+            "char_limit": char_limit,
+        })
     }
 
     /// The next turn id. Only ever called with the busy slot held.
@@ -1307,6 +1686,219 @@ impl TurnCancel {
     }
 }
 
+/// How long the runtime waits for a person before it gives up on an
+/// interaction and tells the model nobody answered.
+///
+/// Long enough to read a diff and decide, short enough that a window closed on
+/// a question does not leave the runtime holding a turn nobody will ever end.
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The id prefix for a question the model asked, and for a decision the
+/// permission gate is waiting on. A transcript can tell the two apart, and so
+/// can an answer that arrives late.
+const QUESTION_ID: &str = "ask";
+const PERMISSION_ID: &str = "perm";
+
+/// What a person said when the runtime asked them something.
+enum Reply {
+    /// Whether the flagged call may run.
+    Verdict(bool),
+    /// What the user typed, or `None` when they said nothing.
+    Answer(Option<String>),
+}
+
+/// How a turn asks the window something, and hears back.
+///
+/// The permission gate and the `ask_user` tool both need the same thing: stop
+/// here, put the question to whoever is driving this shell, carry on with
+/// whatever they say. Both are reached from inside a tool call, which is to say
+/// from inside the turn, so one slot is enough -- exactly like [`TurnCancel`] --
+/// and an answer is matched to its question by id rather than by order.
+///
+/// The wait is a blocking one. The gates are synchronous hooks, so the turn
+/// parks on a channel until somebody answers, the wait runs out, or the turn is
+/// stopped and the slot is emptied under it.
+#[derive(Default)]
+struct InteractionHub {
+    /// The interaction the turn is waiting on, if any.
+    waiting: Mutex<Option<Waiting>>,
+    /// Whether anybody is behind the turn that is running.
+    ///
+    /// A turn the runtime started on its own -- a due scheduled job -- has no
+    /// page in front of it, and a question put to an empty room is a turn that
+    /// hangs and holds the one-turn slot while it does. Such a turn is refused
+    /// instead, which is what this bridge has always done.
+    attended: AtomicBool,
+    /// Names each interaction, so an answer can be matched to the question it
+    /// belongs to.
+    ids: AtomicU64,
+}
+
+/// One interaction the turn has parked on.
+struct Waiting {
+    id: String,
+    replies: std::sync::mpsc::Sender<Reply>,
+}
+
+impl InteractionHub {
+    /// Say whether anybody is behind the turn about to run.
+    fn attend(&self, attended: bool) {
+        self.attended.store(attended, Ordering::SeqCst);
+    }
+
+    /// The next id for a kind of interaction.
+    fn next_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.ids.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// Take the slot for `id`, and hand back the end that resolves when somebody
+    /// answers it.
+    ///
+    /// `None` when nobody is watching: the caller must not wait at all. The
+    /// slot is booked before the question is reported, so an answer that comes
+    /// straight back -- somebody who was already looking -- cannot arrive before
+    /// there is anything to give it to.
+    fn park(&self, id: &str) -> Option<std::sync::mpsc::Receiver<Reply>> {
+        if !self.attended.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (replies, waiting) = std::sync::mpsc::channel();
+        self.replace(Some(Waiting {
+            id: id.to_string(),
+            replies,
+        }));
+        Some(waiting)
+    }
+
+    /// Wait for the answer to the slot that was parked, or for the wait to run
+    /// out. Either way the slot is given back: a question is asked once.
+    fn wait(&self, waiting: std::sync::mpsc::Receiver<Reply>) -> Option<Reply> {
+        let reply = waiting.recv_timeout(INTERACTION_TIMEOUT).ok();
+        // Whoever answered already emptied the slot; this is for a wait that
+        // ran out, and for an answer that arrived a moment too late to matter.
+        self.replace(None);
+        reply
+    }
+
+    /// Hand `reply` to whoever is waiting on `id`. `false` when nobody is: an
+    /// answer for an interaction that is already over.
+    fn deliver(&self, id: &str, reply: Reply) -> bool {
+        let mut slot = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match slot.as_ref() {
+            Some(waiting) if waiting.id == id => {
+                let delivered = waiting.replies.send(reply).is_ok();
+                *slot = None;
+                delivered
+            }
+            _ => false,
+        }
+    }
+
+    /// Let whoever is waiting go, with nothing: the turn is over, or a stop has
+    /// arrived. Dropping the sender is what `recv_timeout` reads as "nobody is
+    /// going to answer", which is exactly what happened.
+    fn withdraw(&self) {
+        self.replace(None);
+    }
+
+    fn replace(&self, waiting: Option<Waiting>) {
+        let mut slot = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *slot = waiting;
+    }
+}
+
+/// Report one interaction to the host, and keep it, for the same reason a tool
+/// call is kept: a page that reloads reads the conversation back rather than
+/// losing the question it was in the middle of answering.
+fn report_interaction(tag: &TurnTag, log: &TurnLog, name: &str, data: Value) {
+    let mut data = data;
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("turn".to_string(), json!(tag.get()));
+        fields.insert("source".to_string(), json!("main"));
+    }
+    log.emit(event(name, data));
+}
+
+/// Gate three, answered by the window instead of by a terminal.
+///
+/// The permission hooks are synchronous, so this is where a turn stops and the
+/// page picks up: the question goes out on the protocol stream, and the answer
+/// comes back as `chat.approve`.
+struct WindowApprover {
+    hub: Arc<InteractionHub>,
+    tag: Arc<TurnTag>,
+    log: Arc<TurnLog>,
+}
+
+impl Approver for WindowApprover {
+    fn approve(&self, call: &ToolCall, reason: &str) -> bool {
+        let id = self.hub.next_id(PERMISSION_ID);
+        let Some(waiting) = self.hub.park(&id) else {
+            // Nobody is behind this turn. The call is refused, and the
+            // transcript already says why.
+            return false;
+        };
+        report_interaction(
+            &self.tag,
+            &self.log,
+            "chat.permission",
+            json!({
+                "id": id,
+                "name": call.name,
+                "input": clamp(&call.input.to_string()),
+                "reason": reason,
+            }),
+        );
+        let allowed = matches!(self.hub.wait(waiting), Some(Reply::Verdict(true)));
+        report_interaction(
+            &self.tag,
+            &self.log,
+            "chat.permission_result",
+            json!({ "id": id, "allowed": allowed }),
+        );
+        allowed
+    }
+}
+
+/// `ask_user`, answered by the window.
+struct WindowAsker {
+    hub: Arc<InteractionHub>,
+    tag: Arc<TurnTag>,
+    log: Arc<TurnLog>,
+}
+
+impl Asker for WindowAsker {
+    fn ask(&self, question: &str, options: &[String]) -> Option<String> {
+        let id = self.hub.next_id(QUESTION_ID);
+        let Some(waiting) = self.hub.park(&id) else {
+            return None;
+        };
+        report_interaction(
+            &self.tag,
+            &self.log,
+            "chat.question",
+            json!({ "id": id, "question": question, "options": options }),
+        );
+        let answer = match self.hub.wait(waiting) {
+            Some(Reply::Answer(answer)) => answer,
+            _ => None,
+        };
+        report_interaction(
+            &self.tag,
+            &self.log,
+            "chat.question_result",
+            json!({ "id": id, "answer": answer }),
+        );
+        answer
+    }
+}
+
 /// The label a conversation list shows for a prompt: its first line, collapsed
 /// to one line and cut to something a list can hold.
 fn session_title(prompt: &str) -> String {
@@ -1329,14 +1921,17 @@ fn session_title(prompt: &str) -> String {
 ///
 /// The same agent the CLI builds, with two differences that come from there
 /// being no terminal behind a prompt: the observer streams to the protocol
-/// stream instead of printing, and the turn is non-interactive, so a call the
-/// permission policy would have asked about is refused with a reason the
-/// transcript can show rather than blocking on an approval nobody can give.
+/// stream instead of printing, and gate three asks the page rather than reading
+/// a line. A call the permission policy flags stops the turn, is reported as
+/// `chat.permission`, and runs -- or is refused -- according to `chat.approve`.
 fn build_agent(
     workspace: &Path,
     cron: &CronScheduler,
+    mcp: &McpRegistry,
     tag: Arc<TurnTag>,
     log: Arc<TurnLog>,
+    compactions: Arc<AtomicUsize>,
+    hub: Arc<InteractionHub>,
 ) -> Result<Arc<Agent>, ProtocolError> {
     let config = Config::from_env().map_err(|error| {
         ProtocolError::new(
@@ -1364,6 +1959,13 @@ fn build_agent(
 
     let mut tools = ToolRegistry::with_tasks();
     tools.register(TaskTool::new(subagent));
+    // The one way the model can put a question to the person driving this
+    // shell. The subagent above does not get it: its turn is not the user's.
+    tools.register(AskUserTool::new(Arc::new(WindowAsker {
+        hub: Arc::clone(&hub),
+        tag: Arc::clone(&tag),
+        log: Arc::clone(&log),
+    })));
 
     // s15: retry transient model failures, and fall back when one is configured.
     let mut recovery = RecoveryConfig::default();
@@ -1380,16 +1982,30 @@ fn build_agent(
             .compaction(CompactConfig::default())
             .memory(MemoryConfig::default())
             .cron(cron.clone())
+            // The registry the page reads through `plugins.*`, so a plugin
+            // either side installs is in the pool the next model call sees.
+            .mcp(mcp.clone())
             .recovery(recovery)
-            .interactive(false)
+            // s03's approval gate, pointed at the window: a call the policy
+            // flags stops the turn, is reported as `chat.permission`, and runs
+            // or is refused according to `chat.approve`. The subagent above
+            // keeps `interactive(false)`, so a teammate's own turn is refused
+            // rather than left waiting on a prompt nobody is there to see.
+            .approver(WindowApprover {
+                hub: Arc::clone(&hub),
+                tag: Arc::clone(&tag),
+                log: Arc::clone(&log),
+            })
+            .interactive(true)
             .max_tokens(config.max_tokens)
             .system_prompt(format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 default_system_prompt(),
                 TASKS_PROMPT,
-                CRON_PROMPT
+                CRON_PROMPT,
+                MCP_PROMPT
             ))
-            .observer(ChatObserver::conversation(tag, log))
+            .observer(ChatObserver::conversation(tag, log, compactions))
             .build(),
     ))
 }
@@ -1435,6 +2051,9 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
         ));
     }
 
+    // A page that sent this prompt is a page to answer it: the approval gate
+    // and `ask_user` wait on the window rather than refusing outright.
+    chat.hub.attend(true);
     let turn = chat.next_turn();
     chat.log.begin(&turn, prompt);
     chat.name_session(prompt);
@@ -1447,8 +2066,9 @@ fn accept_chat(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Han
     handle.spawn(async move {
         let busy = Busy(&chat.busy);
         chat.tag.set(&running);
-        let stopped = run_turn(&chat, &running, &prompt, stop).await;
+        let stopped = run_turn(&chat, &running, Some(&prompt), stop).await;
         chat.cancel.disarm();
+        chat.hub.withdraw();
         // The slot is free before anything says the turn is over: a prompt sent
         // the moment the page hears that must be taken, not told a turn it has
         // just seen end is still running. Nothing waits on `over` unless a stop
@@ -1665,6 +2285,1645 @@ fn accept_delete_session(request: &Request, chat: &Arc<Chat>) -> Turn {
     ))
 }
 
+/// One cron job as the page renders it: the job as stored, plus when it next
+/// runs and how far away that is.
+///
+/// A one-shot that has already fired has no next run: it is on its way to the
+/// model now, and the expression it came from would only name a minute that has
+/// nothing left to do.
+fn cron_view(job: &CronJob) -> Value {
+    let now = CronScheduler::now();
+    let next_run = if job.recurring || job.last_fired.is_none() {
+        next_match(&job.cron, now)
+    } else {
+        None
+    };
+    json!({
+        "id": job.id,
+        "cron": job.cron,
+        "prompt": job.prompt,
+        "recurring": job.recurring,
+        "durable": job.durable,
+        "pending_delivery": job.pending_delivery,
+        "last_fired": job.last_fired,
+        // Local wall-clock, so a page on this machine reads back the moment the
+        // runtime will actually fire; `next_run_ms` is for countdowns.
+        "next_run": next_run.map(|moment| moment.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        "next_run_ms": next_run.map(|moment| (moment - now).num_milliseconds().max(0) as u64),
+    })
+}
+
+/// The message inside a cron tool error, without the tool wrapper around it.
+fn cron_message(error: &Error) -> String {
+    match error {
+        Error::Tool { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Add a job to the scheduler the runtime already uses.
+///
+/// The expression is validated before it is stored, so one this runtime cannot
+/// parse is refused here rather than accepted and silently never run. The page
+/// names the expression and the prompt; both are its to choose, and a prompt
+/// longer than one turn takes is refused rather than truncated.
+fn accept_schedule_cron(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+
+    let Some(cron) = request.params.get("cron").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`cron.schedule` needs a `cron` string",
+        ));
+    };
+    let cron = cron.trim();
+    if let Err(error) = validate_cron(cron) {
+        return rejected(ProtocolError::new(CRON_INVALID, cron_message(&error)));
+    }
+
+    let Some(prompt) = request.params.get("prompt").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`cron.schedule` needs a `prompt` string",
+        ));
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`prompt` must not be empty",
+        ));
+    }
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`prompt` is longer than {MAX_PROMPT_BYTES} bytes"),
+        ));
+    }
+
+    let (recurring, durable) = match (
+        optional_flag(&request.params, "recurring", true),
+        optional_flag(&request.params, "durable", true),
+    ) {
+        (Ok(recurring), Ok(durable)) => (recurring, durable),
+        (Err(error), _) | (_, Err(error)) => return rejected(error),
+    };
+
+    match chat.cron.schedule(cron, prompt, recurring, durable) {
+        Ok(job) => {
+            log(
+                Level::Info,
+                format!("scheduled {}: {} -> {}", job.id, job.cron, job.prompt),
+            );
+            Turn::answered(Response::ok(
+                &request.request_id,
+                json!({ "job": cron_view(&job) }),
+            ))
+        }
+        Err(error) => rejected(ProtocolError::new(CRON_INVALID, cron_message(&error))),
+    }
+}
+
+/// An optional flag: absent means `default`, and anything but a boolean is
+/// refused. A host that sends `"recurring": "no"` is told so, rather than
+/// answered with a job that repeats for ever.
+fn optional_flag(params: &Value, key: &str, default: bool) -> Result<bool, ProtocolError> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{key}` must be `true` or `false`"),
+        )),
+    }
+}
+
+/// Forget a cron job. Nothing but the runtime's own job table is touched: a job
+/// is not a file on disk the page could name.
+fn accept_cancel_cron(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`cron.cancel` needs an `id` string",
+        ));
+    };
+    let id = id.trim();
+    // A job id is not a path, and it is not free-form either: the page may only
+    // name one the runtime itself handed out.
+    if !is_valid_cron_id(id) {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a cron job id"),
+        ));
+    }
+
+    match chat.cron.cancel(id) {
+        Ok(_) => {
+            log(Level::Info, format!("cancelled cron job {id}"));
+            Turn::answered(Response::ok(
+                &request.request_id,
+                json!({ "cancelled": id }),
+            ))
+        }
+        Err(error) => rejected(ProtocolError::new(CRON_UNKNOWN, cron_message(&error))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+/// Every task on the workspace's board, with the state its dependencies imply.
+///
+/// `TaskStore` is the same store the model's `create_task` / `claim_task` /
+/// `complete_task` tools write to, so a board read here is the graph the loop
+/// works from rather than a second copy. A dependency that has gone missing is
+/// treated as incomplete, exactly as `TaskStore::incomplete_dependencies` does.
+fn tasks_snapshot(workspace: &Path) -> Result<Value, Error> {
+    let store = TaskStore::new(workspace);
+    let tasks = store.list()?;
+    let views: Vec<Value> = tasks.iter().map(|task| task_view(&store, task)).collect();
+    Ok(json!({
+        "dir": store.root().display().to_string(),
+        "count": views.len(),
+        "tasks": views,
+    }))
+}
+
+/// One task as the page lists it: the persisted fields, plus whether it can be
+/// claimed now and which prerequisites are still open.
+fn task_view(store: &TaskStore, task: &Task) -> Value {
+    let blocked = store.incomplete_dependencies(task);
+    let ready = task.status == TaskStatus::Pending && blocked.is_empty();
+    json!({
+        "id": task.id,
+        "subject": task.subject,
+        "description": task.description,
+        "status": task.status,
+        "owner": task.owner,
+        "blockedBy": task.blocked_by,
+        "worktree": task.worktree,
+        "department": task.department,
+        "createdBy": task.created_by,
+        "blocked": blocked,
+        "ready": ready,
+    })
+}
+
+/// The id a task action names. It has to be one the runtime itself handed out,
+/// not any string that could name a file.
+fn task_id_param<'a>(request: &'a Request, method: &str) -> Result<&'a str, ProtocolError> {
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{method}` needs an `id` string"),
+        ));
+    };
+    let id = id.trim();
+    if !is_valid_task_id(id) {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a task id"),
+        ));
+    }
+    Ok(id)
+}
+
+/// Read one task, telling "not there" apart from "the board is unreadable".
+fn load_task(store: &TaskStore, id: &str) -> Result<Task, ProtocolError> {
+    if !store.exists(id) {
+        return Err(ProtocolError::new(
+            TASK_UNKNOWN,
+            format!("task not found: {id}"),
+        ));
+    }
+    store
+        .load(id)
+        .map_err(|error| ProtocolError::new(TASK_STORE, error.to_string()))
+}
+
+fn task_status_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Completed => "completed",
+    }
+}
+
+/// Add a node to the board, optionally behind prerequisites the page picked.
+///
+/// The dependencies are checked before the task is written, so a typo does not
+/// leave a node behind that nobody asked for. A new node cannot be part of a
+/// cycle: nothing can depend on an id that does not exist yet.
+fn accept_create_task(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(subject) = request.params.get("subject").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`tasks.create` needs a `subject` string",
+        ));
+    };
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return rejected(ProtocolError::new(
+            TASK_INVALID,
+            "a task subject cannot be empty",
+        ));
+    }
+
+    let description = match request.params.get("description") {
+        None => "",
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => {
+            return rejected(ProtocolError::new(
+                INVALID_PARAMS,
+                "`description` must be a string",
+            ))
+        }
+    };
+
+    let department = match request.params.get("department") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(Value::String(value)) => {
+            let id = value.trim();
+            if !is_valid_department_id(id) {
+                return rejected(ProtocolError::new(
+                    TASK_INVALID,
+                    format!("`{id}` is not a department id"),
+                ));
+            }
+            if !WorkforceStore::new(&chat.workspace).exists(id) {
+                return rejected(ProtocolError::new(
+                    DEPARTMENT_UNKNOWN,
+                    format!("department not found: {id}"),
+                ));
+            }
+            Some(id.to_string())
+        }
+        Some(_) => {
+            return rejected(ProtocolError::new(
+                INVALID_PARAMS,
+                "`department` must be a department id string",
+            ))
+        }
+    };
+
+    let dependencies = match request.params.get("blocked_by") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut dependencies = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return rejected(ProtocolError::new(
+                        INVALID_PARAMS,
+                        "`blocked_by` must be an array of task ids",
+                    ));
+                };
+                let id = id.trim();
+                if !is_valid_task_id(id) {
+                    return rejected(ProtocolError::new(
+                        TASK_INVALID,
+                        format!("`{id}` is not a task id"),
+                    ));
+                }
+                dependencies.push(id.to_string());
+            }
+            dependencies
+        }
+        Some(_) => {
+            return rejected(ProtocolError::new(
+                INVALID_PARAMS,
+                "`blocked_by` must be an array of task ids",
+            ))
+        }
+    };
+
+    let store = TaskStore::new(&chat.workspace);
+    for dependency in &dependencies {
+        if !store.exists(dependency) {
+            return rejected(ProtocolError::new(
+                TASK_UNKNOWN,
+                format!("task dependency not found: {dependency}"),
+            ));
+        }
+    }
+
+    let task = match store.create_scoped(
+        subject,
+        description,
+        department.as_deref(),
+        Some(PAGE_TASK_OWNER),
+    ) {
+        Ok(task) => task,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    if !dependencies.is_empty() {
+        if let Err(error) = store.update_dependencies(&task.id, &dependencies) {
+            return rejected(ProtocolError::new(TASK_STORE, error.to_string()));
+        }
+    }
+    let task = match store.load(&task.id) {
+        Ok(task) => task,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    log(
+        Level::Info,
+        format!("task {} created: {}", task.id, task.subject),
+    );
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "task": task_view(&store, &task) }),
+    ))
+}
+
+/// Claim a ready task for the person at the page.
+///
+/// A task owned by a model turn is not the page's to take: the store records
+/// one owner, and completion is checked against it. The page claims as `user`,
+/// which no model turn uses.
+fn accept_claim_task(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match task_id_param(request, "tasks.claim") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let store = TaskStore::new(&chat.workspace);
+    let task = match load_task(&store, id) {
+        Ok(task) => task,
+        Err(error) => return rejected(error),
+    };
+    if task.status != TaskStatus::Pending {
+        return rejected(ProtocolError::new(
+            TASK_NOT_READY,
+            format!(
+                "task {id} is {}, not pending",
+                task_status_name(task.status)
+            ),
+        ));
+    }
+    let blocked = store.incomplete_dependencies(&task);
+    if !blocked.is_empty() {
+        return rejected(ProtocolError::new(
+            TASK_BLOCKED,
+            format!("task {id} is blocked by {}", blocked.join(", ")),
+        ));
+    }
+
+    let message = match store.claim(id, PAGE_TASK_OWNER) {
+        Ok(message) => message,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    let task = match store.load(id) {
+        Ok(task) => task,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    if task.status != TaskStatus::InProgress || task.owner.as_deref() != Some(PAGE_TASK_OWNER) {
+        // Another writer took it between the check and the claim.
+        return rejected(ProtocolError::new(TASK_CONFLICT, message));
+    }
+    log(
+        Level::Info,
+        format!("task {id} claimed by {PAGE_TASK_OWNER}"),
+    );
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "task": task_view(&store, &task), "message": message }),
+    ))
+}
+
+/// Give a task the page claimed back to the board.
+fn accept_release_task(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match task_id_param(request, "tasks.release") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let store = TaskStore::new(&chat.workspace);
+    let task = match load_task(&store, id) {
+        Ok(task) => task,
+        Err(error) => return rejected(error),
+    };
+    if task.status != TaskStatus::InProgress {
+        return rejected(ProtocolError::new(
+            TASK_NOT_READY,
+            format!("task {id} is {}", task_status_name(task.status)),
+        ));
+    }
+    if task.owner.as_deref() != Some(PAGE_TASK_OWNER) {
+        return rejected(ProtocolError::new(
+            TASK_NOT_OWNED,
+            format!(
+                "task {id} is owned by {}, not {PAGE_TASK_OWNER}",
+                task.owner.as_deref().unwrap_or("nobody")
+            ),
+        ));
+    }
+    let task = match store.release(id) {
+        Ok(task) => task,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    log(Level::Info, format!("task {id} released"));
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "task": task_view(&store, &task) }),
+    ))
+}
+
+/// Close a task the page claimed, reporting what that unblocked.
+fn accept_complete_task(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match task_id_param(request, "tasks.complete") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let store = TaskStore::new(&chat.workspace);
+    let task = match load_task(&store, id) {
+        Ok(task) => task,
+        Err(error) => return rejected(error),
+    };
+    if task.status != TaskStatus::InProgress {
+        return rejected(ProtocolError::new(
+            TASK_NOT_READY,
+            format!("task {id} is {}", task_status_name(task.status)),
+        ));
+    }
+    if task.owner.as_deref() != Some(PAGE_TASK_OWNER) {
+        return rejected(ProtocolError::new(
+            TASK_NOT_OWNED,
+            format!(
+                "task {id} is owned by {}, not {PAGE_TASK_OWNER}",
+                task.owner.as_deref().unwrap_or("nobody")
+            ),
+        ));
+    }
+
+    let message = match store.complete(id, PAGE_TASK_OWNER) {
+        Ok(message) => message,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    let task = match store.load(id) {
+        Ok(task) => task,
+        Err(error) => return rejected(ProtocolError::new(TASK_STORE, error.to_string())),
+    };
+    if task.status != TaskStatus::Completed {
+        return rejected(ProtocolError::new(TASK_CONFLICT, message));
+    }
+    log(Level::Info, format!("task {id} completed"));
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "task": task_view(&store, &task), "message": message }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Departments and their agents
+// ---------------------------------------------------------------------------
+
+/// Every department in the workspace, with its members, group chat, task
+/// counts, and the shift currently driving it.
+fn departments_snapshot(chat: &Chat) -> Result<Value, Error> {
+    let store = &chat.workforce.store;
+    let tasks = TaskStore::new(&chat.workspace);
+    let task_list = tasks.list()?;
+    let departments = store.list()?;
+    let views: Vec<Value> = departments
+        .iter()
+        .map(|department| {
+            department_view(
+                store,
+                &tasks,
+                &task_list,
+                department,
+                chat.workforce.shift_view(&department.id),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "dir": store.root().display().to_string(),
+        "count": views.len(),
+        "departments": views,
+    }))
+}
+
+/// One department as the page lists it.
+fn department_view(
+    _store: &WorkforceStore,
+    tasks: &TaskStore,
+    task_list: &[Task],
+    department: &Department,
+    shift: Option<Value>,
+) -> Value {
+    let owned: Vec<&Task> = task_list
+        .iter()
+        .filter(|task| task.department.as_deref() == Some(department.id.as_str()))
+        .collect();
+    let count = |status: TaskStatus| owned.iter().filter(|task| task.status == status).count();
+    let ready = owned
+        .iter()
+        .filter(|task| {
+            task.status == TaskStatus::Pending && tasks.incomplete_dependencies(task).is_empty()
+        })
+        .count();
+    let messages: Vec<Value> = department
+        .messages
+        .iter()
+        .map(department_message_view)
+        .collect();
+    let agents: Vec<Value> = department.agents.iter().map(agent_view).collect();
+    json!({
+        "id": department.id,
+        "name": department.name,
+        "description": department.description,
+        "instructions": department.instructions,
+        "parentId": department.parent_id,
+        "createdAt": department.created_at,
+        "agents": agents,
+        "messages": messages,
+        "tasks": {
+            "total": owned.len(),
+            "pending": count(TaskStatus::Pending),
+            "inProgress": count(TaskStatus::InProgress),
+            "completed": count(TaskStatus::Completed),
+            "ready": ready,
+        },
+        "shift": shift,
+    })
+}
+
+fn agent_view(agent: &AgentProfile) -> Value {
+    json!({
+        "id": agent.id,
+        "name": agent.name,
+        "role": agent.role,
+        "instructions": agent.instructions,
+        "lastRunAt": agent.last_run_at,
+        "lastStatus": agent.last_status,
+        "lastSummary": agent.last_summary,
+        "lastCreated": agent.last_created,
+        "lastCompleted": agent.last_completed,
+    })
+}
+
+fn department_message_view(message: &DepartmentMessage) -> Value {
+    json!({
+        "id": message.id,
+        "senderKind": message.sender_kind,
+        "senderId": message.sender_id,
+        "senderName": message.sender_name,
+        "content": message.content,
+        "createdAt": message.created_at,
+    })
+}
+
+/// The department id a request names. Like task ids, this is not a path.
+fn department_id_param<'a>(request: &'a Request, method: &str) -> Result<&'a str, ProtocolError> {
+    let Some(id) = request
+        .params
+        .get("id")
+        .or_else(|| request.params.get("department_id"))
+        .and_then(Value::as_str)
+    else {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{method}` needs a department id"),
+        ));
+    };
+    let id = id.trim();
+    if !is_valid_department_id(id) {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not a department id"),
+        ));
+    }
+    Ok(id)
+}
+
+fn agent_id_param<'a>(request: &'a Request, method: &str) -> Result<&'a str, ProtocolError> {
+    let Some(id) = request.params.get("agent_id").and_then(Value::as_str) else {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{method}` needs an `agent_id` string"),
+        ));
+    };
+    let id = id.trim();
+    if !is_valid_agent_id(id) {
+        return Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{id}` is not an agent id"),
+        ));
+    }
+    Ok(id)
+}
+
+fn workforce_code(error: &Error) -> &'static str {
+    match error {
+        Error::Workforce(message) if message.contains("not found") => DEPARTMENT_UNKNOWN,
+        Error::Workforce(_) => WORKFORCE_INVALID,
+        _ => WORKFORCE_STORE,
+    }
+}
+
+/// Read an optional string parameter, trimming it and treating an empty value
+/// as absent.
+fn optional_text<'a>(request: &'a Request, key: &str) -> Result<&'a str, ProtocolError> {
+    match request.params.get(key) {
+        None | Some(Value::Null) => Ok(""),
+        Some(Value::String(value)) => Ok(value.trim()),
+        Some(_) => Err(ProtocolError::new(
+            INVALID_PARAMS,
+            format!("`{key}` must be a string"),
+        )),
+    }
+}
+
+/// Add a department, or a sub-department under an existing one.
+fn accept_create_department(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`departments.create` needs a `name` string",
+        ));
+    };
+    let description = match optional_text(request, "description") {
+        Ok(value) => value,
+        Err(error) => return rejected(error),
+    };
+    let instructions = match optional_text(request, "instructions") {
+        Ok(value) => value,
+        Err(error) => return rejected(error),
+    };
+    let parent_id = match optional_text(request, "parent_id") {
+        Ok("") => None,
+        Ok(value) => {
+            if !is_valid_department_id(value) {
+                return rejected(ProtocolError::new(
+                    WORKFORCE_INVALID,
+                    format!("`{value}` is not a department id"),
+                ));
+            }
+            Some(value)
+        }
+        Err(error) => return rejected(error),
+    };
+
+    let store = WorkforceStore::new(&chat.workspace);
+    if let Some(parent) = parent_id {
+        if !store.exists(parent) {
+            return rejected(ProtocolError::new(
+                DEPARTMENT_UNKNOWN,
+                format!("parent department not found: {parent}"),
+            ));
+        }
+    }
+    let created = match store.create_child(name, description, instructions, parent_id) {
+        Ok(department) => department,
+        Err(error) => {
+            return rejected(ProtocolError::new(
+                workforce_code(&error),
+                error.to_string(),
+            ))
+        }
+    };
+    log(
+        Level::Info,
+        format!("department {} created: {}", created.id, created.name),
+    );
+    let tasks = TaskStore::new(&chat.workspace);
+    let task_list = tasks.list().unwrap_or_default();
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "department": department_view(&store, &tasks, &task_list, &created, None) }),
+    ))
+}
+
+/// Remove a department and every sub-department below it.
+fn accept_remove_department(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match department_id_param(request, "departments.remove") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    if let Some(active) = chat.workforce.active_department() {
+        return rejected(ProtocolError::new(
+            WORKFORCE_CONFLICT,
+            format!("department {active} is still working; stop that shift first"),
+        ));
+    }
+    let store = WorkforceStore::new(&chat.workspace);
+    if !store.exists(id) {
+        return rejected(ProtocolError::new(
+            DEPARTMENT_UNKNOWN,
+            format!("department not found: {id}"),
+        ));
+    }
+    let removed = match store.remove_tree(id) {
+        Ok(removed) => removed,
+        Err(error) => {
+            return rejected(ProtocolError::new(
+                workforce_code(&error),
+                error.to_string(),
+            ))
+        }
+    };
+    let ids: Vec<String> = removed
+        .iter()
+        .map(|department| department.id.clone())
+        .collect();
+    log(
+        Level::Info,
+        format!("removed {} department(s): {}", ids.len(), ids.join(", ")),
+    );
+    Turn::answered(Response::ok(&request.request_id, json!({ "removed": ids })))
+}
+
+/// Add one agent to a department.
+fn accept_add_agent(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match department_id_param(request, "agents.add") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`agents.add` needs a `name` string",
+        ));
+    };
+    let role = match optional_text(request, "role") {
+        Ok(value) => value,
+        Err(error) => return rejected(error),
+    };
+    let instructions = match optional_text(request, "instructions") {
+        Ok(value) => value,
+        Err(error) => return rejected(error),
+    };
+    let store = WorkforceStore::new(&chat.workspace);
+    if !store.exists(id) {
+        return rejected(ProtocolError::new(
+            DEPARTMENT_UNKNOWN,
+            format!("department not found: {id}"),
+        ));
+    }
+    if chat.workforce.active_department().as_deref() == Some(id) {
+        return rejected(ProtocolError::new(
+            WORKFORCE_CONFLICT,
+            "this department is working right now; add the agent after the shift stops",
+        ));
+    }
+    let (department, agent) = match store.add_agent(id, name, role, instructions) {
+        Ok(answer) => answer,
+        Err(error) => {
+            return rejected(ProtocolError::new(
+                workforce_code(&error),
+                error.to_string(),
+            ))
+        }
+    };
+    log(
+        Level::Info,
+        format!(
+            "agent {} added to {}: {}",
+            agent.id, department.id, agent.name
+        ),
+    );
+    let tasks = TaskStore::new(&chat.workspace);
+    let task_list = tasks.list().unwrap_or_default();
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({
+            "department": department_view(
+                &store,
+                &tasks,
+                &task_list,
+                &department,
+                chat.workforce.shift_view(&department.id),
+            ),
+            "agent": agent_view(&agent),
+        }),
+    ))
+}
+
+/// Remove one agent from a department.
+fn accept_remove_agent(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let department_id = match department_id_param(request, "agents.remove") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let agent_id = match agent_id_param(request, "agents.remove") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let store = WorkforceStore::new(&chat.workspace);
+    let department = match store.load(department_id) {
+        Ok(department) => department,
+        Err(error) => return rejected(ProtocolError::new(DEPARTMENT_UNKNOWN, error.to_string())),
+    };
+    if chat.workforce.active_department().as_deref() == Some(department_id) {
+        return rejected(ProtocolError::new(
+            WORKFORCE_CONFLICT,
+            "this department is working right now; remove the agent after the shift stops",
+        ));
+    }
+    if department.agent(agent_id).is_none() {
+        return rejected(ProtocolError::new(
+            AGENT_UNKNOWN,
+            format!("agent not found in this department: {agent_id}"),
+        ));
+    }
+    if chat
+        .workforce
+        .shift_view(department_id)
+        .and_then(|shift| shift.get("currentAgentId").cloned())
+        .and_then(|id| id.as_str().map(str::to_string))
+        .as_deref()
+        == Some(agent_id)
+    {
+        return rejected(ProtocolError::new(
+            WORKFORCE_CONFLICT,
+            "agent is working right now; stop the shift before removing it",
+        ));
+    }
+    let department = match store.remove_agent(department_id, agent_id) {
+        Ok(department) => department,
+        Err(error) => {
+            return rejected(ProtocolError::new(
+                workforce_code(&error),
+                error.to_string(),
+            ))
+        }
+    };
+    log(
+        Level::Info,
+        format!("agent {agent_id} removed from {department_id}"),
+    );
+    let tasks = TaskStore::new(&chat.workspace);
+    let task_list = tasks.list().unwrap_or_default();
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({
+            "department": department_view(
+                &store,
+                &tasks,
+                &task_list,
+                &department,
+                chat.workforce.shift_view(&department.id),
+            ),
+        }),
+    ))
+}
+
+/// Start a shift: every agent in the department, one after another, works on
+/// its own department-scoped task board.
+fn accept_run_department(
+    request: &Request,
+    chat: &Arc<Chat>,
+    handle: &tokio::runtime::Handle,
+) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match department_id_param(request, "departments.run") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let instruction = match optional_text(request, "instruction") {
+        Ok(value) if value.chars().count() > MAX_MESSAGE_CHARS => {
+            return rejected(ProtocolError::new(
+                INVALID_PARAMS,
+                format!("`instruction` is longer than {MAX_MESSAGE_CHARS} characters"),
+            ))
+        }
+        Ok(value) => value,
+        Err(error) => return rejected(error),
+    };
+    let store = WorkforceStore::new(&chat.workspace);
+    let department = match store.load(id) {
+        Ok(department) => department,
+        Err(error) => return rejected(ProtocolError::new(DEPARTMENT_UNKNOWN, error.to_string())),
+    };
+    if department.agents.is_empty() {
+        return rejected(ProtocolError::new(
+            WORKFORCE_INVALID,
+            "this department has no agents; add one before starting a shift",
+        ));
+    }
+    if let Err(error) = Config::from_env() {
+        return rejected(ProtocolError::new(
+            CHAT_NOT_CONFIGURED,
+            format!("{error}; set the model in Settings, then restart the runtime"),
+        ));
+    }
+    let Some(stop) = chat.workforce.start(id, department.agents.len()) else {
+        return rejected(ProtocolError::new(
+            WORKFORCE_CONFLICT,
+            "a department shift is already running; let it finish or stop it first",
+        ));
+    };
+
+    let instruction = if instruction.is_empty() {
+        None
+    } else {
+        Some(instruction.to_string())
+    };
+    let chat_message = instruction
+        .clone()
+        .unwrap_or_else(|| format!("让「{}」按部门简介开工。", department.name));
+    if let Err(error) = store.append_message(id, "user", None, "我", &chat_message) {
+        chat.workforce.finish(id);
+        return rejected(ProtocolError::new(
+            workforce_code(&error),
+            error.to_string(),
+        ));
+    }
+
+    log(
+        Level::Info,
+        format!(
+            "department {} shift started with {} agent(s)",
+            department.id,
+            department.agents.len()
+        ),
+    );
+    let worker = Arc::clone(chat);
+    let department_id = id.to_string();
+    let shift_instruction = instruction.clone();
+    handle.spawn(async move {
+        run_department_shift(worker, department_id, shift_instruction, stop).await;
+    });
+
+    let tasks = TaskStore::new(&chat.workspace);
+    let task_list = tasks.list().unwrap_or_default();
+    let department = match store.load(id) {
+        Ok(department) => department,
+        Err(error) => return rejected(ProtocolError::new(DEPARTMENT_UNKNOWN, error.to_string())),
+    };
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({
+            "accepted": true,
+            "department": department_view(
+                &store,
+                &tasks,
+                &task_list,
+                &department,
+                chat.workforce.shift_view(&department.id),
+            ),
+        }),
+    ))
+}
+
+/// Ask the running shift to stop after the current model call.
+fn accept_stop_department(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let id = match department_id_param(request, "departments.stop") {
+        Ok(id) => id,
+        Err(error) => return rejected(error),
+    };
+    let stopped = chat.workforce.stop(id);
+    if stopped {
+        log(Level::Info, format!("department {id} shift stop requested"));
+    }
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "stopped": stopped }),
+    ))
+}
+
+/// Finish a shift even if the future is dropped; a guard keeps the one-running
+/// slot honest without every early return having to remember to clear it.
+struct ShiftGuard {
+    chat: Arc<Chat>,
+    department_id: String,
+}
+
+impl Drop for ShiftGuard {
+    fn drop(&mut self) {
+        self.chat.workforce.finish(&self.department_id);
+    }
+}
+
+/// Run the department's agents in order. Each one sees the same task board but
+/// a tool pool scoped to this department and to its own owner id.
+async fn run_department_shift(
+    chat: Arc<Chat>,
+    department_id: String,
+    instruction: Option<String>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let _guard = ShiftGuard {
+        chat: Arc::clone(&chat),
+        department_id: department_id.clone(),
+    };
+    if let Err(error) =
+        run_department_shift_inner(&chat, &department_id, instruction.as_deref(), &mut stop).await
+    {
+        log(
+            Level::Error,
+            format!("department {department_id} shift failed: {error}"),
+        );
+        let store = WorkforceStore::new(&chat.workspace);
+        let _ = store.append_message(
+            &department_id,
+            "system",
+            None,
+            "系统",
+            &format!("本轮工作失败：{error}"),
+        );
+        let _ = send(&event(
+            "department.shift",
+            json!({
+                "department": department_id,
+                "state": "failed",
+                "message": error,
+            }),
+        ));
+        return;
+    }
+    let _ = send(&event(
+        "department.shift",
+        json!({ "department": department_id, "state": "finished" }),
+    ));
+}
+
+async fn run_department_shift_inner(
+    chat: &Arc<Chat>,
+    department_id: &str,
+    instruction: Option<&str>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let config = Config::from_env().map_err(|error| error.to_string())?;
+    let client: Arc<dyn LlmClient> = Arc::new(AnthropicClient::new(&config));
+    let store = WorkforceStore::new(&chat.workspace);
+    let department = store
+        .load(department_id)
+        .map_err(|error| error.to_string())?;
+
+    for agent in department.agents.clone() {
+        if *stop.borrow() {
+            break;
+        }
+        chat.workforce.set_current_agent(department_id, &agent.id);
+        let _ = send(&event(
+            "department.agent",
+            json!({
+                "department": department_id,
+                "agent": agent.id,
+                "name": agent.name,
+                "state": "started",
+            }),
+        ));
+
+        let task_store = TaskStore::new(&chat.workspace);
+        let before = task_store.list().unwrap_or_default();
+        let agent_loop = build_department_agent(
+            &chat.workspace,
+            Arc::clone(&client),
+            &config,
+            &department,
+            &agent,
+            instruction,
+        );
+        let outcome = tokio::select! {
+            result = agent_loop.ask("Begin this shift now.") => Some(result),
+            _ = wait_for_stop(stop) => None,
+        };
+        let after = task_store.list().unwrap_or_default();
+        let (created, completed) = shift_counts(&before, &after, &agent.id);
+
+        let (status, summary) = match outcome {
+            None => (
+                "stopped",
+                "本轮被停止。未完成的任务可能仍留在任务板上。".to_string(),
+            ),
+            Some(Ok(text)) if text.trim().is_empty() => {
+                ("empty", "本轮结束，但没有给出摘要。".to_string())
+            }
+            Some(Ok(text)) => ("completed", text.trim().to_string()),
+            Some(Err(error)) => ("failed", format!("本轮失败：{error}")),
+        };
+        let recorded_summary = clamp(&summary);
+        if let Err(error) = store.record_agent_run(
+            department_id,
+            &agent.id,
+            status,
+            &recorded_summary,
+            created,
+            completed,
+        ) {
+            log(
+                Level::Warn,
+                format!("could not record agent {} shift: {error}", agent.id),
+            );
+        }
+        let report = if created == 0 && completed == 0 {
+            summary.clone()
+        } else {
+            format!("{summary}\n\n新建 {created} 个任务，完成 {completed} 个任务。")
+        };
+        let recorded_report = clamp(&report);
+        if let Err(error) = store.append_message(
+            department_id,
+            "agent",
+            Some(&agent.id),
+            &agent.name,
+            &recorded_report,
+        ) {
+            log(
+                Level::Warn,
+                format!("could not write agent {} report: {error}", agent.id),
+            );
+        }
+        chat.workforce.mark_agent_done(department_id);
+        let _ = send(&event(
+            "department.agent",
+            json!({
+                "department": department_id,
+                "agent": agent.id,
+                "name": agent.name,
+                "state": "finished",
+                "status": status,
+                "created": created,
+                "completed": completed,
+            }),
+        ));
+        if *stop.borrow() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
+    if *stop.borrow() {
+        return;
+    }
+    let _ = stop.changed().await;
+}
+
+fn shift_counts(before: &[Task], after: &[Task], agent_id: &str) -> (usize, usize) {
+    let before_ids: HashSet<&str> = before.iter().map(|task| task.id.as_str()).collect();
+    let before_status: BTreeMap<&str, TaskStatus> = before
+        .iter()
+        .map(|task| (task.id.as_str(), task.status))
+        .collect();
+    let created = after
+        .iter()
+        .filter(|task| {
+            task.created_by.as_deref() == Some(agent_id) && !before_ids.contains(task.id.as_str())
+        })
+        .count();
+    let completed = after
+        .iter()
+        .filter(|task| {
+            task.owner.as_deref() == Some(agent_id)
+                && task.status == TaskStatus::Completed
+                && before_status.get(task.id.as_str()) != Some(&TaskStatus::Completed)
+        })
+        .count();
+    (created, completed)
+}
+
+/// The loop one department agent runs for one shift.
+fn build_department_agent(
+    workspace: &Path,
+    client: Arc<dyn LlmClient>,
+    config: &Config,
+    department: &Department,
+    agent: &AgentProfile,
+    instruction: Option<&str>,
+) -> Agent {
+    let mut tools = ToolRegistry::with_defaults();
+    tools.register(CreateTaskTool::scoped(&department.id, &agent.id));
+    tools.register(UpdateTaskTool::in_department(&department.id));
+    tools.register(ListTasksTool::in_department(&department.id));
+    tools.register(GetTaskTool::in_department(&department.id));
+    tools.register(ClaimTaskTool::scoped(&agent.id, &department.id));
+    tools.register(CompleteTaskTool::owned_by(&agent.id));
+
+    let mut recovery = RecoveryConfig::default();
+    if let Some(model) = &config.fallback_model {
+        recovery = recovery.with_fallback_model(model.clone());
+    }
+    Agent::builder()
+        .shared_client(client)
+        .tools(tools)
+        .workspace(workspace.to_path_buf())
+        .compaction(CompactConfig::default())
+        .recovery(recovery)
+        .interactive(false)
+        .max_tokens(config.max_tokens)
+        .max_steps(36)
+        .system_prompt(department_agent_prompt(department, agent, instruction))
+        .build()
+}
+
+/// What a department agent is asked to do for one shift.
+fn department_agent_prompt(
+    department: &Department,
+    agent: &AgentProfile,
+    instruction: Option<&str>,
+) -> String {
+    let goal = instruction
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| department.description.trim());
+    let mut prompt = default_system_prompt();
+    prompt.push_str(
+        "\n\n## Department shift\n\
+         You are an autonomous member of a department. You cannot ask the user a \
+         question and no interactive approval is available. Use the task board as \
+         the shared source of truth.\n",
+    );
+    prompt.push_str(&format!(
+        "Department: {} ({})\nDepartment brief: {}\nCollaboration rules: {}\n\
+         Your name: {}\nYour role: {}\nYour instructions: {}\n",
+        department.name,
+        department.id,
+        if department.description.trim().is_empty() {
+            "(none)"
+        } else {
+            department.description.trim()
+        },
+        if department.instructions.trim().is_empty() {
+            "(none)"
+        } else {
+            department.instructions.trim()
+        },
+        agent.name,
+        if agent.role.trim().is_empty() {
+            "(generalist)"
+        } else {
+            agent.role.trim()
+        },
+        if agent.instructions.trim().is_empty() {
+            "(none)"
+        } else {
+            agent.instructions.trim()
+        },
+    ));
+    prompt.push_str(&format!(
+        "\nThis shift's instruction: {}\n",
+        if goal.is_empty() {
+            "(none; improve the department's current work)"
+        } else {
+            goal
+        }
+    ));
+    prompt.push_str(
+        "\nHow to work this shift:\n\
+         1. Call list_tasks first. It only shows this department's board.\n\
+         2. If a pending, unblocked task is ready, claim one with claim_task. \
+         Otherwise create one concrete task with create_task (and wire any \
+         dependencies with update_task), then claim it.\n\
+         3. Do the work with the tools you have. The task is not done just \
+         because you described it: edit files, run checks, or otherwise verify it.\n\
+         4. Call complete_task when the work is actually finished. If the work is \
+         larger than one shift, complete the part that is finished and leave \
+         specific follow-up tasks behind.\n\
+         5. Do not claim or complete work owned by another agent, do not touch \
+         another department's tasks, and do not create duplicate tasks.\n\
+         6. Finish with a short report: what you created, what you claimed, what \
+         you completed, and any blocker.\n",
+    );
+    prompt.push_str(TASKS_PROMPT);
+    prompt
+}
+
+/// Every skill the loader finds, with the manifest each one came from.
+///
+/// The list is read fresh from `<workspace>/skills/*/SKILL.md`, the same
+/// directory the loop's `SkillLoader` scans, so what the page shows is what the
+/// system prompt catalogues.
+fn skills_snapshot(workspace: &Path) -> Value {
+    let loader = SkillLoader::new(workspace.join("skills"));
+    let skills: Vec<Value> = loader.skills().map(skill_view).collect();
+    json!({
+        "dir": loader.dir().display().to_string(),
+        "count": skills.len(),
+        "skills": skills,
+    })
+}
+
+/// One skill as the page lists it: the name `load_skill` takes, the line the
+/// catalogue shows, and the manifest it was read from.
+fn skill_view(skill: &Skill) -> Value {
+    json!({
+        "name": skill.name,
+        "description": skill.description,
+        "path": skill.path.display().to_string(),
+    })
+}
+
+/// Hand back one full `SKILL.md`, the same text `load_skill` gives the model.
+///
+/// The page names a skill, never a path: the name is looked up in the loader the
+/// runtime scanned, so this reads exactly the files the model can read.
+fn accept_read_skill(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`skills.read` needs a `name` string",
+        ));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`name` must not be empty",
+        ));
+    }
+
+    let loader = SkillLoader::new(chat.workspace.join("skills"));
+    match loader.load(name) {
+        Ok(content) => {
+            let mut detail = match loader.get(name) {
+                Some(skill) => skill_view(skill),
+                None => json!({ "name": name }),
+            };
+            detail["content"] = json!(content);
+            Turn::answered(Response::ok(&request.request_id, detail))
+        }
+        Err(error) => rejected(ProtocolError::new(SKILL_UNKNOWN, error.to_string())),
+    }
+}
+
+/// Copy skills into the workspace from a folder the host picked.
+///
+/// The folder may be one skill (`SKILL.md` in it) or a collection of them (one
+/// `SKILL.md` per child folder) -- the shape a `git clone` of a skills
+/// repository has. Either way the copy lands under `<workspace>/skills/`, the
+/// one directory the loader scans, so the next `skills.list` sees it and the
+/// model's catalogue carries it from the next turn on.
+fn accept_import_skill(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |code, message| {
+        Turn::answered(Response::failed(
+            &request.request_id,
+            ProtocolError::new(code, message),
+        ))
+    };
+    let Some(path) = request.params.get("path").and_then(Value::as_str) else {
+        return rejected(INVALID_PARAMS, "`skills.import` needs a `path` string");
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return rejected(INVALID_PARAMS, "`path` must not be empty");
+    }
+
+    match import_skills(&chat.workspace, Path::new(path)) {
+        Ok(imported) => Turn::answered(Response::ok(
+            &request.request_id,
+            json!({
+                "dir": chat.workspace.join("skills").display().to_string(),
+                "count": imported.len(),
+                "skills": imported,
+            }),
+        )),
+        Err((code, message)) => rejected(code, &message),
+    }
+}
+
+/// Copy every skill folder under `source` into `<workspace>/skills/`.
+///
+/// Existing skills are never overwritten: a name already in the workspace is
+/// refused, so a re-import cannot silently replace instructions the user has
+/// been editing.
+fn import_skills(
+    workspace: &Path,
+    source: &Path,
+) -> std::result::Result<Vec<Value>, (&'static str, String)> {
+    if !source.is_dir() {
+        return Err((
+            SKILL_SOURCE,
+            format!("{} is not a folder", source.display()),
+        ));
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if source.join(SKILL_MANIFEST).is_file() {
+        candidates.push(source.to_path_buf());
+    } else {
+        let entries = std::fs::read_dir(source).map_err(|error| {
+            (
+                SKILL_SOURCE,
+                format!("could not read {}: {error}", source.display()),
+            )
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join(SKILL_MANIFEST).is_file() {
+                candidates.push(path);
+            }
+        }
+        candidates.sort();
+    }
+    if candidates.is_empty() {
+        return Err((
+            SKILL_INVALID,
+            format!(
+                "no {SKILL_MANIFEST} in {} or in any folder under it",
+                source.display()
+            ),
+        ));
+    }
+
+    let skills_dir = workspace.join("skills");
+    std::fs::create_dir_all(&skills_dir).map_err(|error| {
+        (
+            SKILL_SOURCE,
+            format!("could not create {}: {error}", skills_dir.display()),
+        )
+    })?;
+    // The names the loader already answers to, so an import cannot land beside
+    // a skill it would silently shadow.
+    let taken: Vec<String> = SkillLoader::new(&skills_dir)
+        .skills()
+        .map(|skill| skill.name.clone())
+        .collect();
+
+    for candidate in &candidates {
+        let folder = candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if folder.is_empty() {
+            return Err((
+                SKILL_INVALID,
+                format!("{} has no folder name to import as", candidate.display()),
+            ));
+        }
+        // The name the model will know it by: the manifest's, else the folder's.
+        let manifest =
+            std::fs::read_to_string(candidate.join(SKILL_MANIFEST)).map_err(|error| {
+                (
+                    SKILL_SOURCE,
+                    format!("could not read {}: {error}", candidate.display()),
+                )
+            })?;
+        let (metadata, _) = parse_frontmatter(&manifest);
+        let name = match metadata.get("name").map(String::as_str).map(str::trim) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => folder.clone(),
+        };
+        let target = skills_dir.join(&folder);
+        if target.exists() || taken.contains(&name) {
+            return Err((
+                SKILL_EXISTS,
+                format!(
+                    "a skill named `{name}` is already in {}; remove it before \
+                     importing it again",
+                    skills_dir.display()
+                ),
+            ));
+        }
+        copy_tree(candidate, &target).map_err(|message| (SKILL_SOURCE, message))?;
+    }
+
+    // Read back through the same loader the page and the prompt use, so what is
+    // reported is the name the skill is really known by.
+    let loader = SkillLoader::new(&skills_dir);
+    Ok(candidates
+        .iter()
+        .map(|candidate| {
+            let target = skills_dir.join(
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            match loader
+                .skills()
+                .find(|skill| skill.path.starts_with(&target))
+            {
+                Some(skill) => skill_view(skill),
+                None => json!({ "path": target.display().to_string() }),
+            }
+        })
+        .collect())
+}
+
+/// Copy a folder tree. `.git` is left behind: a skill needs its files, not the
+/// history it was cloned with.
+fn copy_tree(from: &Path, to: &Path) -> std::result::Result<(), String> {
+    std::fs::create_dir_all(to)
+        .map_err(|error| format!("could not create {}: {error}", to.display()))?;
+    let entries = std::fs::read_dir(from)
+        .map_err(|error| format!("could not read {}: {error}", from.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read {}: {error}", from.display()))?;
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let target = to.join(&name);
+        if path.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target).map_err(|error| {
+                format!(
+                    "could not copy {} to {}: {error}",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Every plugin this build ships, with the tools discovered from the ones the
+/// runtime has connected.
+///
+/// A server's catalogue exists only once it is connected -- discovering it is
+/// what `connect_mcp` does -- so an unconnected server lists no tools here and
+/// the page says so, rather than showing a catalogue nobody has asked for.
+fn plugins_snapshot(mcp: &McpRegistry) -> Value {
+    let connected = mcp.connected_names();
+    let definitions = mcp.tool_definitions();
+    let servers: Vec<Value> = mcp
+        .available()
+        .iter()
+        .map(|name| {
+            let is_connected = connected.iter().any(|connected| connected == name);
+            let prefix = format!("mcp__{name}__");
+            let tools: Vec<Value> = definitions
+                .iter()
+                .filter(|definition| definition.name.starts_with(&prefix))
+                .map(|definition| {
+                    json!({
+                        "name": definition.name,
+                        "description": definition.description,
+                        // The host decides this, not the server, so the page
+                        // shows the policy the permission hook enforces.
+                        "policy": mcp.policy_for(&definition.name).as_str(),
+                    })
+                })
+                .collect();
+            let declared = mcp.plugin(name);
+            json!({
+                "name": name,
+                "connected": is_connected,
+                "tools": tools,
+                // Where the server comes from, so the page can say why it is
+                // on the list: compiled in, or declared by the workspace.
+                "source": if declared.is_some() { "workspace" } else { "builtin" },
+                "command": declared.map(|spec| {
+                    let mut command = spec.command;
+                    if !spec.args.is_empty() {
+                        command.push(' ');
+                        command.push_str(&spec.args.join(" "));
+                    }
+                    command
+                }),
+            })
+        })
+        .collect();
+    json!({
+        "available": servers.len(),
+        "connected": connected,
+        "servers": servers,
+    })
+}
+
+/// Connect a plugin this build ships, discovering its tools.
+///
+/// The name is checked against the ones this build knows before anything is
+/// built, so an unknown name is refused with a code rather than answered with a
+/// string the page would have to parse.
+fn accept_connect_plugin(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(server) = request.params.get("server").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`plugins.connect` needs a `server` string",
+        ));
+    };
+    let server = server.trim();
+    if !chat.mcp.available().iter().any(|known| known == server) {
+        return rejected(ProtocolError::new(
+            PLUGIN_UNKNOWN,
+            format!(
+                "unknown plugin `{server}`; available: {}",
+                chat.mcp.available().join(", ")
+            ),
+        ));
+    }
+
+    match chat.mcp.connect(server) {
+        Ok(message) => {
+            log(Level::Info, format!("plugin: {message}"));
+            Turn::answered(Response::ok(
+                &request.request_id,
+                json!({ "server": server, "message": message }),
+            ))
+        }
+        Err(error) => rejected(ProtocolError::new(PLUGIN_FAILED, error.to_string())),
+    }
+}
+
 /// Ask the turn that is running to stop.
 ///
 /// A stop that finds nothing running answers at once. A stop that reaches a turn
@@ -1672,6 +3931,10 @@ fn accept_delete_session(request: &Request, chat: &Arc<Chat>) -> Turn {
 /// free: the page that pressed stop then sends its next prompt, and that prompt
 /// must be taken rather than refused as a turn already running.
 fn accept_cancel(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::Handle) -> Turn {
+    // A turn parked on a question is not listening for the stop: it is blocked
+    // inside a tool call. Letting it go first is what makes stopping work at
+    // all while the runtime is waiting on the page.
+    chat.hub.withdraw();
     let Some(mut over) = chat.cancel.stop() else {
         return Turn::answered(Response::ok(
             &request.request_id,
@@ -1694,16 +3957,163 @@ fn accept_cancel(request: &Request, chat: &Arc<Chat>, handle: &tokio::runtime::H
     Turn::owed()
 }
 
+/// Answer the question the runtime is waiting on.
+///
+/// The answer is the page's to give, and nothing else here is: the id names a
+/// question the runtime is already holding, and a question that is over -- or
+/// that never reached this build -- is told so rather than answered twice.
+fn accept_answer(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`chat.answer` needs the `id` of the question it answers",
+        ));
+    };
+    let Some(answer) = request.params.get("answer").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`chat.answer` needs an `answer` string",
+        ));
+    };
+    // Blank is the user saying nothing, which is a thing they are allowed to
+    // do: the model is told nobody answered rather than handed an empty answer
+    // to read something into.
+    let answer = answer.trim();
+    let answer = (!answer.is_empty()).then(|| answer.to_string());
+    let accepted = chat.hub.deliver(id, Reply::Answer(answer));
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "accepted": accepted }),
+    ))
+}
+
+/// Say what to do about the call the runtime is waiting on.
+///
+/// The same shape as [`accept_answer`] and for the same reason: the decision
+/// goes to the one call the runtime is holding, and a decision that arrives
+/// after that call is over changes nothing.
+fn accept_approve(request: &Request, chat: &Arc<Chat>) -> Turn {
+    let rejected = |error| Turn::answered(Response::failed(&request.request_id, error));
+    let Some(id) = request.params.get("id").and_then(Value::as_str) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`chat.approve` needs the `id` of the call it decides",
+        ));
+    };
+    let Some(allow) = request.params.get("allow").and_then(Value::as_bool) else {
+        return rejected(ProtocolError::new(
+            INVALID_PARAMS,
+            "`chat.approve` needs an `allow` boolean",
+        ));
+    };
+    let accepted = chat.hub.deliver(id, Reply::Verdict(allow));
+    Turn::answered(Response::ok(
+        &request.request_id,
+        json!({ "accepted": accepted }),
+    ))
+}
+
+/// Watch the clock, and start the turn a due job is owed.
+///
+/// The CLI and the TUI wake their loop the same way; without a wake here, a job
+/// scheduled for 09:00 would not fire until somebody happened to send a prompt,
+/// which makes the schedule a decoration. The ticker only marks jobs due and
+/// starts the turn -- the loop injects the `[Scheduled]` message and
+/// acknowledges the job itself, so there is exactly one delivery path.
+fn spawn_cron_watch(chat: Arc<Chat>, handle: tokio::runtime::Handle) {
+    let turns = handle.clone();
+    handle.spawn(async move {
+        let mut warned = false;
+        let mut ticker = tokio::time::interval(CRON_TICK);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = chat.cron.poll(CronScheduler::now()) {
+                log(Level::Warn, format!("cron: poll failed: {error}"));
+                continue;
+            }
+            if chat.busy.load(Ordering::SeqCst) || !chat.cron.has_due() {
+                continue;
+            }
+            // A due job with no model to hand it to cannot become a turn, and
+            // saying so once beats a failure every second.
+            if chat.agent().is_err() {
+                if !warned {
+                    warned = true;
+                    log(
+                        Level::Warn,
+                        "cron: a scheduled job is due, but no model is configured to run it",
+                    );
+                }
+                continue;
+            }
+            warned = false;
+            start_scheduled_turn(&chat, &turns);
+        }
+    });
+}
+
+/// The transcript of a turn the runtime starts on its own: one `[Scheduled]`
+/// line per job that is waiting to be delivered, in id order, or the empty
+/// string when none is. It is what the loop is about to hand the model, so the
+/// page shows the words the model actually received.
+fn due_prompt(jobs: &[CronJob]) -> String {
+    jobs.iter()
+        .filter(|job| job.pending_delivery)
+        .map(|job| format!("[Scheduled] {}", job.prompt))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Start a turn for the jobs that are due.
+///
+/// The turn carries no prompt of the host's: the loop reads the due jobs and
+/// injects `[Scheduled] <prompt>` itself, so the transcript names what the model
+/// actually received. The turn is otherwise a turn like any other -- it holds
+/// the one-turn slot, it can be stopped, and what it produces is committed.
+fn start_scheduled_turn(chat: &Arc<Chat>, handle: &tokio::runtime::Handle) {
+    if chat.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // A scheduled turn has no page in front of it, so nothing is asked that
+    // somebody would have to be there to answer.
+    chat.hub.attend(false);
+    let prompt = due_prompt(&chat.cron.jobs());
+    if prompt.is_empty() {
+        // Nothing left to deliver; the slot goes straight back.
+        chat.busy.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let turn = chat.next_turn();
+    chat.log.begin(&turn, &prompt);
+    let (stop, over) = chat.cancel.arm();
+    let chat = Arc::clone(chat);
+    let running = turn.clone();
+    handle.spawn(async move {
+        let busy = Busy(&chat.busy);
+        chat.tag.set(&running);
+        let stopped = run_turn(&chat, &running, None, stop).await;
+        chat.cancel.disarm();
+        chat.hub.withdraw();
+        drop(busy);
+        let _ = over.send(stopped);
+    });
+}
+
 /// Run one prompt and stream it back.
 ///
 /// A second prompt is refused while this one runs rather than queued behind it,
 /// and a turn that failed -- or was stopped -- is rolled back instead of leaving
-/// half an exchange for the model to trip over next time. Answers whether it was
-/// the stop, rather than the model, that ended the turn.
+/// half an exchange for the model to trip over next time. `prompt` is the words
+/// the user typed, or `None` for a turn the runtime started on its own: a due
+/// scheduled job is injected by the loop itself, so there is no user message to
+/// add here. Answers whether it was the stop, rather than the model, that ended
+/// the turn.
 async fn run_turn(
     chat: &Chat,
     turn: &str,
-    prompt: &str,
+    prompt: Option<&str>,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let agent = match chat.agent() {
@@ -1721,7 +4131,9 @@ async fn run_turn(
     // page asking what the conversation holds is not made to wait for the model.
     let mut history = chat.session().messages;
     let rollback = history.len();
-    history.push(Message::user_text(agent.prepare_prompt(prompt)));
+    if let Some(prompt) = prompt {
+        history.push(Message::user_text(agent.prepare_prompt(prompt)));
+    }
 
     let mut stop = stop;
     let outcome = tokio::select! {
@@ -2045,6 +4457,7 @@ fn run() -> i32 {
         workspace.clone(),
         sessions_dir,
         bridge.cron.clone(),
+        bridge.mcp.clone(),
     ));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2061,6 +4474,10 @@ fn run() -> i32 {
         }
     };
     let handle = runtime.handle().clone();
+
+    // A schedule nobody wakes is a decoration: this is what makes a due job
+    // start a turn of its own while the host has nothing else to say.
+    spawn_cron_watch(Arc::clone(&chat), handle.clone());
 
     let mut code = EXIT_OK;
     loop {
@@ -2167,16 +4584,17 @@ mod tests {
 
     /// The pieces `dispatch` needs, for the tests that go through it.
     fn fixture(dir: &std::path::Path) -> (Bridge, Arc<Chat>, tokio::runtime::Runtime) {
+        // The chat and the snapshot share one job table, exactly as `run`
+        // wires them: a job the page schedules has to be the one the status
+        // counts and the ticker fires.
+        let bridge = bridge_at(dir);
         let chat = Arc::new(Chat::new(
             dir.to_path_buf(),
             dir.join(SESSIONS_DIR),
-            CronScheduler::new(dir),
+            bridge.cron.clone(),
+            bridge.mcp.clone(),
         ));
-        (
-            bridge_at(dir),
-            chat,
-            tokio::runtime::Runtime::new().unwrap(),
-        )
+        (bridge, chat, tokio::runtime::Runtime::new().unwrap())
     }
 
     /// The answer a dispatched request gave on the spot. A request whose answer
@@ -2312,6 +4730,7 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join(SESSIONS_DIR),
             bridge.cron.clone(),
+            bridge.mcp.clone(),
         ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&request, &bridge, &chat, runtime.handle());
@@ -2337,6 +4756,7 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join(SESSIONS_DIR),
             bridge.cron.clone(),
+            bridge.mcp.clone(),
         ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let turn = dispatch(&ping, &bridge, &chat, runtime.handle());
@@ -2637,7 +5057,11 @@ mod tests {
         tag.set("turn-2");
         assert_eq!(tag.get(), "turn-2");
 
-        let observer = ChatObserver::conversation(Arc::new(tag), Arc::new(TurnLog::new()));
+        let observer = ChatObserver::conversation(
+            Arc::new(tag),
+            Arc::new(TurnLog::new()),
+            Arc::new(AtomicUsize::new(0)),
+        );
         assert!(observer.answers);
         assert_eq!(observer.source, "main");
         assert!(
@@ -2825,6 +5249,244 @@ mod tests {
     }
 
     #[test]
+    fn the_interaction_methods_are_advertised_and_take_parameters() {
+        for method in ["chat.answer", "chat.approve"] {
+            assert!(METHODS.contains(&method), "`{method}` is not advertised");
+            assert!(takes_params(method), "`{method}` should take parameters");
+        }
+    }
+
+    /// The event the turn reported for `turn`, if it reported one.
+    fn reported(log: &TurnLog, event_name: &str) -> Option<Value> {
+        log.snapshot()["turns"]
+            .as_array()?
+            .iter()
+            .flat_map(|turn| turn["events"].as_array().cloned().unwrap_or_default())
+            .find(|event| event["event"] == json!(event_name))
+    }
+
+    /// Wait for `event_name` to reach the log, or give up. The turn reports
+    /// from another thread, so the test has to wait for it rather than assume
+    /// the order it got there in.
+    fn wait_for(log: &TurnLog, event_name: &str) -> Value {
+        for _ in 0..2000 {
+            if let Some(event) = reported(log, event_name) {
+                return event;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("`{event_name}` was never reported");
+    }
+
+    #[test]
+    fn an_answer_reaches_the_slot_that_was_parked() {
+        let hub = InteractionHub::default();
+        hub.attend(true);
+        let id = hub.next_id(QUESTION_ID);
+        assert_eq!(id, "ask-1");
+        let waiting = hub.park(&id).expect("somebody is watching");
+        assert!(hub.deliver(&id, Reply::Answer(Some("the second one".into()))));
+        match hub.wait(waiting) {
+            Some(Reply::Answer(answer)) => assert_eq!(answer.as_deref(), Some("the second one")),
+            _ => panic!("expected the answer that was delivered"),
+        }
+        // The slot was given back, so the same answer cannot land twice.
+        assert!(!hub.deliver(&id, Reply::Answer(Some("again".into()))));
+    }
+
+    #[test]
+    fn an_answer_for_another_question_is_not_taken() {
+        let hub = InteractionHub::default();
+        hub.attend(true);
+        let waiting = hub.park("ask-1").expect("somebody is watching");
+        assert!(!hub.deliver("ask-2", Reply::Answer(Some("no".into()))));
+        assert!(hub.deliver("ask-1", Reply::Answer(Some("yes".into()))));
+        assert!(matches!(
+            hub.wait(waiting),
+            Some(Reply::Answer(Some(answer))) if answer == "yes"
+        ));
+    }
+
+    #[test]
+    fn a_turn_nobody_is_watching_waits_for_nothing() {
+        let hub = InteractionHub::default();
+        // Unattended is what a turn starts as, and what a scheduled turn stays:
+        // a question put to an empty room would otherwise hang the one-turn
+        // slot for ten minutes.
+        assert!(hub.park("ask-1").is_none());
+
+        hub.attend(true);
+        let waiting = hub.park("ask-2").expect("somebody is watching");
+        hub.withdraw();
+        assert!(hub.wait(waiting).is_none());
+    }
+
+    #[test]
+    fn an_approval_is_reported_and_answered_by_the_page() {
+        let hub = Arc::new(InteractionHub::default());
+        hub.attend(true);
+        let tag = Arc::new(TurnTag::default());
+        tag.set("turn-1");
+        let log = Arc::new(TurnLog::new());
+        log.begin("turn-1", "clean up the build directory");
+
+        let approver = WindowApprover {
+            hub: Arc::clone(&hub),
+            tag: Arc::clone(&tag),
+            log: Arc::clone(&log),
+        };
+        let asking = std::thread::spawn(move || {
+            approver.approve(
+                &ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "command": "rm -rf build" }),
+                },
+                "potentially destructive command",
+            )
+        });
+
+        // The question reaches the host before the turn waits on it: a page
+        // that answers the moment it sees one has something to answer into.
+        let asked = wait_for(&log, "chat.permission");
+        assert_eq!(asked["data"]["turn"], json!("turn-1"));
+        assert_eq!(asked["data"]["name"], json!("bash"));
+        assert_eq!(
+            asked["data"]["reason"],
+            json!("potentially destructive command")
+        );
+        assert!(asked["data"]["input"]
+            .as_str()
+            .expect("the call is shown as it was made")
+            .contains("rm -rf build"));
+        let id = asked["data"]["id"].as_str().expect("an id").to_string();
+        assert!(id.starts_with("perm-"), "{id}");
+
+        assert!(hub.deliver(&id, Reply::Verdict(true)));
+        assert!(asking.join().expect("the turn did not panic"));
+
+        let decided = reported(&log, "chat.permission_result").expect("a decision");
+        assert_eq!(decided["data"]["id"], json!(id));
+        assert_eq!(decided["data"]["allowed"], json!(true));
+    }
+
+    #[test]
+    fn a_question_is_reported_and_the_answers_are_kept() {
+        let hub = Arc::new(InteractionHub::default());
+        hub.attend(true);
+        let tag = Arc::new(TurnTag::default());
+        tag.set("turn-1");
+        let log = Arc::new(TurnLog::new());
+        log.begin("turn-1", "which one?");
+
+        let asker = WindowAsker {
+            hub: Arc::clone(&hub),
+            tag: Arc::clone(&tag),
+            log: Arc::clone(&log),
+        };
+        let asking = std::thread::spawn(move || {
+            asker.ask("which one?", &["first".to_string(), "second".to_string()])
+        });
+
+        let asked = wait_for(&log, "chat.question");
+        assert_eq!(asked["data"]["question"], json!("which one?"));
+        assert_eq!(asked["data"]["options"], json!(["first", "second"]));
+        let id = asked["data"]["id"].as_str().expect("an id").to_string();
+
+        assert!(hub.deliver(&id, Reply::Answer(Some("the second".to_string()))));
+        assert_eq!(
+            asking.join().expect("the turn did not panic").as_deref(),
+            Some("the second")
+        );
+
+        let answered = reported(&log, "chat.question_result").expect("an answer");
+        assert_eq!(answered["data"]["answer"], json!("the second"));
+    }
+
+    #[test]
+    fn an_answer_without_a_question_is_refused_before_anything_is_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        for (case, params) in [
+            ("no id", json!({ "answer": "hello" })),
+            ("no answer", json!({ "id": "ask-1" })),
+            ("id is not a string", json!({ "id": 7, "answer": "hello" })),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "chat.answer", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(INVALID_PARAMS),
+                "`{case}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_that_reaches_no_call_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let turn = dispatch(
+            &request_with(
+                "r-1",
+                "chat.approve",
+                json!({ "id": "perm-1", "allow": true }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        // Nothing was parked on, so the decision was not taken -- which is an
+        // answer, not a failure: the call it was aimed at is already over.
+        assert!(answered(&turn).ok);
+        assert_eq!(answered(&turn).result, Some(json!({ "accepted": false })));
+
+        // A decision still needs to say what it is deciding.
+        let turn = dispatch(
+            &request_with("r-1", "chat.approve", json!({ "id": "perm-1" })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert_eq!(
+            answered(&turn)
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some(INVALID_PARAMS)
+        );
+    }
+
+    #[test]
+    fn stopping_a_turn_lets_go_of_the_question_it_was_parked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        chat.hub.attend(true);
+        let waiting = chat.hub.park("ask-1").expect("somebody is watching");
+        let held = Arc::clone(&chat);
+        let answer = std::thread::spawn(move || held.hub.wait(waiting));
+        // A stop is what a page presses when the runtime has gone quiet; the
+        // wait the runtime is stuck in has to end there too, or the turn never
+        // hears about it.
+        let turn = dispatch(
+            &request_with("r-1", "chat.cancel", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&turn).ok);
+        assert!(answer.join().expect("the turn did not panic").is_none());
+    }
+
+    #[test]
     fn a_conversation_that_was_written_out_reads_back_whole() {
         let log = TurnLog::new();
         log.begin("turn-1", "first");
@@ -2849,6 +5511,42 @@ mod tests {
         let turn = &TurnLog::from_snapshot(&interrupted).snapshot()["turns"][0];
         assert_eq!(turn["status"], json!("failed"));
         assert_eq!(turn["error"]["code"], json!("chat_interrupted"));
+    }
+
+    #[test]
+    fn a_full_log_is_answered_in_one_frame() {
+        // The host drops a line longer than this, and a dropped answer is a
+        // conversation that reads back as nothing at all -- the page is left
+        // waiting for a reply that never arrives. The log's own budget has to
+        // stay inside it. (`MAX_LINE_BYTES` in `desktop/src-tauri/src/runtime.rs`.)
+        const HOST_FRAME_BYTES: usize = 8 << 20;
+
+        // Fill the log to its own budget: as many turns as it keeps, each with
+        // events as large as a tool result may be echoed back, so both caps bind
+        // and this is the heaviest answer the log can produce.
+        let log = TurnLog::new();
+        let text = "x".repeat(MAX_EVENT_TEXT_BYTES);
+        let per_turn = MAX_LOG_BYTES / MAX_LOG_TURNS / MAX_EVENT_TEXT_BYTES + 1;
+        for number in 1..=MAX_LOG_TURNS {
+            let turn = format!("turn-{number}");
+            log.begin(&turn, "a prompt");
+            for _ in 0..per_turn {
+                log.record(&event(
+                    "chat.delta",
+                    json!({ "turn": turn, "text": text.clone() }),
+                ));
+            }
+            log.record(&event("chat.done", json!({ "turn": turn, "ok": true })));
+        }
+
+        let answer = serde_json::to_string(&log.snapshot()).unwrap();
+        assert!(log.lock().bytes <= MAX_LOG_BYTES);
+        assert!(log.lock().turns.len() <= MAX_LOG_TURNS);
+        assert!(
+            answer.len() < HOST_FRAME_BYTES,
+            "a log at its budget answers with {} bytes, which the host drops",
+            answer.len()
+        );
     }
 
     #[test]
@@ -3276,5 +5974,1058 @@ mod tests {
         // Nothing was changed, because nothing was allowed to be.
         assert_eq!(chat.session().id, id);
         drop(busy);
+    }
+
+    #[test]
+    fn a_cron_job_can_be_scheduled_listed_and_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        let created = dispatch(
+            &request_with(
+                "r-1",
+                "cron.schedule",
+                json!({
+                    "cron": "0 9 * * 1-5",
+                    "prompt": "weekday standup",
+                    "recurring": true,
+                    "durable": true,
+                }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&created).ok);
+        let job = answered(&created).result.clone().unwrap()["job"].clone();
+        assert!(is_valid_cron_id(job["id"].as_str().unwrap()));
+        assert_eq!(job["cron"], json!("0 9 * * 1-5"));
+        assert_eq!(job["prompt"], json!("weekday standup"));
+        assert_eq!(job["recurring"], json!(true));
+        assert_eq!(job["durable"], json!(true));
+        assert_eq!(job["pending_delivery"], json!(false));
+        // A recurring job always has somewhere to go next, and the answer says
+        // both the wall-clock time and how far away it is.
+        assert!(job["next_run"].is_string(), "{job}");
+        assert!(job["next_run_ms"].as_u64().unwrap() > 0, "{job}");
+
+        // It is stored in the runtime's own table, so `runtime.status` counts it
+        // without being told twice.
+        assert_eq!(bridge.snapshot()["cron"]["jobs"], json!(1));
+
+        let listed = dispatch(
+            &request_with("r-2", "cron.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let jobs = answered(&listed).result.clone().unwrap()["jobs"].clone();
+        assert_eq!(jobs.as_array().unwrap().len(), 1);
+        assert_eq!(jobs[0]["id"], job["id"]);
+
+        let cancelled = dispatch(
+            &request_with("r-3", "cron.cancel", json!({ "id": job["id"] })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&cancelled).ok);
+        assert_eq!(
+            answered(&cancelled).result.clone().unwrap()["cancelled"],
+            job["id"]
+        );
+
+        let empty = dispatch(
+            &request_with("r-4", "cron.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert_eq!(answered(&empty).result.clone().unwrap()["jobs"], json!([]));
+    }
+
+    #[test]
+    fn a_cron_job_this_build_will_not_take_is_refused_with_a_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        for (case, method, params, code) in [
+            (
+                "no expression",
+                "cron.schedule",
+                json!({ "prompt": "x" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "expression is not a string",
+                "cron.schedule",
+                json!({ "cron": 7, "prompt": "x" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "expression does not parse",
+                "cron.schedule",
+                json!({ "cron": "every day at nine", "prompt": "x" }),
+                CRON_INVALID,
+            ),
+            (
+                "expression has the wrong field count",
+                "cron.schedule",
+                json!({ "cron": "0 9 * *", "prompt": "x" }),
+                CRON_INVALID,
+            ),
+            (
+                "no prompt",
+                "cron.schedule",
+                json!({ "cron": "0 9 * * *" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "prompt is blank",
+                "cron.schedule",
+                json!({ "cron": "0 9 * * *", "prompt": "   " }),
+                INVALID_PARAMS,
+            ),
+            (
+                "a flag that is not a boolean",
+                "cron.schedule",
+                json!({ "cron": "0 9 * * *", "prompt": "x", "recurring": "no" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "a durable flag that is not a boolean",
+                "cron.schedule",
+                json!({ "cron": "0 9 * * *", "prompt": "x", "durable": 1 }),
+                INVALID_PARAMS,
+            ),
+            ("no id", "cron.cancel", json!({}), INVALID_PARAMS),
+            (
+                "id is not a job id",
+                "cron.cancel",
+                json!({ "id": "../cron_x" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "no such job",
+                "cron.cancel",
+                json!({ "id": "cron_00000000" }),
+                CRON_UNKNOWN,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", method, params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+        // A refusal stores nothing.
+        assert!(chat.cron.jobs().is_empty());
+    }
+
+    #[test]
+    fn a_due_job_names_the_turn_the_runtime_starts_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, _runtime) = fixture(dir.path());
+        chat.cron
+            .schedule("* * * * *", "run the tests", true, false)
+            .unwrap();
+        // A schedule no test run can land on, so only the first one is due.
+        chat.cron
+            .schedule("0 3 1 1 *", "new year", true, false)
+            .unwrap();
+        assert_eq!(due_prompt(&chat.cron.jobs()), "");
+
+        chat.cron.poll(CronScheduler::now()).unwrap();
+        assert_eq!(due_prompt(&chat.cron.jobs()), "[Scheduled] run the tests");
+
+        // The same table the page reads: one job waiting, two in total.
+        let snapshot = chat.cron_snapshot();
+        assert_eq!(snapshot["pending_delivery"], json!(1));
+        let jobs = snapshot["jobs"].as_array().unwrap();
+        let due = jobs
+            .iter()
+            .find(|job| job["prompt"] == json!("run the tests"))
+            .expect("the due job is in the list");
+        assert_eq!(due["pending_delivery"], json!(true));
+        // A job that has not come due has a next run and is not waiting.
+        let later = jobs
+            .iter()
+            .find(|job| job["prompt"] == json!("new year"))
+            .expect("the other job is in the list");
+        assert_eq!(later["pending_delivery"], json!(false));
+        assert!(later["next_run"].is_string());
+        assert_eq!(bridge.snapshot()["cron"]["pending_delivery"], json!(1));
+    }
+
+    #[test]
+    fn the_cron_methods_take_only_what_they_document() {
+        for method in ["cron.list", "cron.schedule", "cron.cancel"] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+        }
+        assert!(!takes_params("cron.list"));
+        assert!(takes_params("cron.schedule"));
+        assert!(takes_params("cron.cancel"));
+
+        // `cron.list` takes nothing, so a key on it is refused rather than
+        // quietly ignored -- a host talking to a newer bridge finds out.
+        let line = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "r-1",
+            "method": "cron.list",
+            "params": { "id": "cron_00000000" },
+        })
+        .to_string();
+        match parse_request(&line) {
+            Parsed::Rejected { error, .. } => assert_eq!(error.code, INVALID_PARAMS),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_task_graph_can_be_created_claimed_released_and_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        let created = dispatch(
+            &request_with(
+                "r-1",
+                "tasks.create",
+                json!({ "subject": "write the plan", "description": "the first node" }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&created).ok, "{:?}", answered(&created).error);
+        let first = answered(&created).result.clone().unwrap()["task"].clone();
+        assert!(is_valid_task_id(first["id"].as_str().unwrap()));
+        assert_eq!(first["status"], json!("pending"));
+        assert_eq!(first["owner"], json!(null));
+        assert_eq!(first["ready"], json!(true));
+        assert_eq!(first["blocked"], json!([]));
+
+        let dependent = dispatch(
+            &request_with(
+                "r-2",
+                "tasks.create",
+                json!({
+                    "subject": "ship it",
+                    "blocked_by": [first["id"].clone()],
+                }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&dependent).ok, "{:?}", answered(&dependent).error);
+        let second = answered(&dependent).result.clone().unwrap()["task"].clone();
+        let second_id = second["id"].clone();
+        assert_eq!(second["blockedBy"], json!([first["id"].clone()]));
+        assert_eq!(second["blocked"], json!([first["id"].clone()]));
+        assert_eq!(second["ready"], json!(false));
+
+        // A blocked node cannot be claimed, and the answer says what is open.
+        let blocked = dispatch(
+            &request_with("r-3", "tasks.claim", json!({ "id": second_id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(!answered(&blocked).ok);
+        assert_eq!(
+            answered(&blocked).error.as_ref().map(|e| e.code.as_str()),
+            Some(TASK_BLOCKED)
+        );
+
+        // The ready one can be, and it records the page's owner.
+        let claimed = dispatch(
+            &request_with("r-4", "tasks.claim", json!({ "id": first["id"] })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&claimed).ok, "{:?}", answered(&claimed).error);
+        let claimed = answered(&claimed).result.clone().unwrap()["task"].clone();
+        assert_eq!(claimed["status"], json!("in_progress"));
+        assert_eq!(claimed["owner"], json!(PAGE_TASK_OWNER));
+        assert_eq!(claimed["ready"], json!(false));
+
+        // Giving it back clears the owner and makes it ready again.
+        let released = dispatch(
+            &request_with("r-5", "tasks.release", json!({ "id": first["id"] })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&released).ok, "{:?}", answered(&released).error);
+        let released = answered(&released).result.clone().unwrap()["task"].clone();
+        assert_eq!(released["status"], json!("pending"));
+        assert_eq!(released["owner"], json!(null));
+        assert_eq!(released["ready"], json!(true));
+
+        // Claim and complete. The completion names the node it unblocked.
+        dispatch(
+            &request_with("r-6", "tasks.claim", json!({ "id": first["id"] })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let completed = dispatch(
+            &request_with("r-7", "tasks.complete", json!({ "id": first["id"] })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&completed).ok, "{:?}", answered(&completed).error);
+        let answer = answered(&completed).result.clone().unwrap();
+        assert_eq!(answer["task"]["status"], json!("completed"));
+        assert_eq!(answer["task"]["owner"], json!(PAGE_TASK_OWNER));
+        assert!(
+            answer["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unblocked: ship it"),
+            "{answer}"
+        );
+
+        // The list is the graph after all of that, and the status counts it.
+        let listed = dispatch(
+            &request_with("r-8", "tasks.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let tasks = answered(&listed).result.clone().unwrap();
+        assert_eq!(tasks["count"], json!(2));
+        let second = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == second_id)
+            .unwrap();
+        assert_eq!(second["ready"], json!(true));
+        assert_eq!(second["blocked"], json!([]));
+        assert_eq!(bridge.snapshot()["tasks"]["completed"], json!(1));
+        assert_eq!(bridge.snapshot()["tasks"]["pending"], json!(1));
+    }
+
+    #[test]
+    fn a_task_action_this_build_will_not_take_is_refused_with_a_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        let store = TaskStore::new(dir.path());
+
+        let mut done = store.create("already done", "").unwrap();
+        done.status = TaskStatus::Completed;
+        store.save(&done).unwrap();
+        let pending = store.create("not started", "").unwrap();
+        let mut owned = store.create("agent work", "").unwrap();
+        owned.status = TaskStatus::InProgress;
+        owned.owner = Some("agent".to_string());
+        store.save(&owned).unwrap();
+
+        for (case, method, params, code) in [
+            ("no subject", "tasks.create", json!({}), INVALID_PARAMS),
+            (
+                "blank subject",
+                "tasks.create",
+                json!({ "subject": "   " }),
+                TASK_INVALID,
+            ),
+            (
+                "description is not a string",
+                "tasks.create",
+                json!({ "subject": "x", "description": 7 }),
+                INVALID_PARAMS,
+            ),
+            (
+                "dependencies are not an array",
+                "tasks.create",
+                json!({ "subject": "x", "blocked_by": "task_0123abcd" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "a dependency is not a string",
+                "tasks.create",
+                json!({ "subject": "x", "blocked_by": [7] }),
+                INVALID_PARAMS,
+            ),
+            (
+                "a dependency is not a task id",
+                "tasks.create",
+                json!({ "subject": "x", "blocked_by": ["../escape"] }),
+                TASK_INVALID,
+            ),
+            (
+                "a dependency is missing",
+                "tasks.create",
+                json!({ "subject": "x", "blocked_by": ["task_00000000"] }),
+                TASK_UNKNOWN,
+            ),
+            ("no id", "tasks.claim", json!({}), INVALID_PARAMS),
+            (
+                "id is not a task id",
+                "tasks.claim",
+                json!({ "id": "../escape" }),
+                INVALID_PARAMS,
+            ),
+            (
+                "no such task",
+                "tasks.claim",
+                json!({ "id": "task_00000000" }),
+                TASK_UNKNOWN,
+            ),
+            (
+                "claiming a completed task",
+                "tasks.claim",
+                json!({ "id": done.id }),
+                TASK_NOT_READY,
+            ),
+            (
+                "releasing a pending task",
+                "tasks.release",
+                json!({ "id": done.id }),
+                TASK_NOT_READY,
+            ),
+            (
+                "releasing somebody else's task",
+                "tasks.release",
+                json!({ "id": owned.id }),
+                TASK_NOT_OWNED,
+            ),
+            (
+                "completing somebody else's task",
+                "tasks.complete",
+                json!({ "id": owned.id }),
+                TASK_NOT_OWNED,
+            ),
+            (
+                "completing a pending task",
+                "tasks.complete",
+                json!({ "id": pending.id }),
+                TASK_NOT_READY,
+            ),
+            (
+                "completing an already completed task",
+                "tasks.complete",
+                json!({ "id": done.id }),
+                TASK_NOT_READY,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", method, params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_task_methods_take_only_what_they_document() {
+        for method in [
+            "tasks.list",
+            "tasks.create",
+            "tasks.claim",
+            "tasks.release",
+            "tasks.complete",
+        ] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+        }
+        assert!(!takes_params("tasks.list"));
+        assert!(takes_params("tasks.create"));
+        assert!(takes_params("tasks.claim"));
+        assert!(takes_params("tasks.release"));
+        assert!(takes_params("tasks.complete"));
+
+        let line = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "r-1",
+            "method": "tasks.list",
+            "params": { "id": "task_0123abcd" },
+        })
+        .to_string();
+        match parse_request(&line) {
+            Parsed::Rejected { error, .. } => assert_eq!(error.code, INVALID_PARAMS),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn departments_can_be_created_populated_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        let created = dispatch(
+            &request_with(
+                "r-1",
+                "departments.create",
+                json!({
+                    "name": "研发部",
+                    "description": "build the thing",
+                    "instructions": "small changes",
+                }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let created = answered(&created);
+        assert!(created.ok, "{created:?}");
+        let department_id = created.result.as_ref().unwrap()["department"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let child = dispatch(
+            &request_with(
+                "r-2",
+                "departments.create",
+                json!({ "name": "前端组", "parent_id": department_id }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let child = answered(&child);
+        assert!(child.ok, "{child:?}");
+        assert_eq!(
+            child.result.as_ref().unwrap()["department"]["parentId"],
+            json!(department_id)
+        );
+
+        let added = dispatch(
+            &request_with(
+                "r-3",
+                "agents.add",
+                json!({
+                    "department_id": department_id,
+                    "name": "后端",
+                    "role": "owns the API",
+                    "instructions": "run the tests",
+                }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let added = answered(&added);
+        assert!(added.ok, "{added:?}");
+        assert_eq!(
+            added.result.as_ref().unwrap()["department"]["agents"][0]["name"],
+            json!("后端")
+        );
+
+        let listed = dispatch(
+            &request_with("r-4", "departments.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let listed = answered(&listed);
+        assert!(listed.ok, "{listed:?}");
+        assert_eq!(listed.result.as_ref().unwrap()["count"], json!(2));
+
+        let removed = dispatch(
+            &request_with("r-5", "departments.remove", json!({ "id": department_id })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let removed = answered(&removed);
+        assert!(removed.ok, "{removed:?}");
+        assert_eq!(
+            removed.result.as_ref().unwrap()["removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let listed = dispatch(
+            &request_with("r-6", "departments.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert_eq!(
+            answered(&listed).result.as_ref().unwrap()["count"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn the_department_methods_are_advertised_and_take_parameters() {
+        for method in [
+            "departments.list",
+            "departments.create",
+            "departments.remove",
+            "agents.add",
+            "agents.remove",
+            "departments.run",
+            "departments.stop",
+        ] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+        }
+        assert!(!takes_params("departments.list"));
+        assert!(takes_params("departments.create"));
+        assert!(takes_params("departments.remove"));
+        assert!(takes_params("agents.add"));
+        assert!(takes_params("agents.remove"));
+        assert!(takes_params("departments.run"));
+        assert!(takes_params("departments.stop"));
+    }
+
+    #[test]
+    fn a_skill_can_be_listed_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("skills").join("demo")).unwrap();
+        fs::write(
+            root.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: A demo skill.\n---\n\n# Demo\n\nSay hi.\n",
+        )
+        .unwrap();
+        let (bridge, chat, runtime) = fixture(root);
+
+        let listed = dispatch(
+            &request_with("r-1", "skills.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let result = answered(&listed).result.clone().unwrap();
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(
+            result["dir"],
+            json!(root.join("skills").display().to_string())
+        );
+        assert_eq!(result["skills"][0]["name"], json!("demo"));
+        assert_eq!(result["skills"][0]["description"], json!("A demo skill."));
+        assert!(result["skills"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("SKILL.md"));
+
+        // Reading hands back the manifest the model would get from `load_skill`.
+        let read = dispatch(
+            &request_with("r-2", "skills.read", json!({ "name": "demo" })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&read).ok);
+        let skill = answered(&read).result.clone().unwrap();
+        assert_eq!(skill["name"], json!("demo"));
+        assert!(skill["content"].as_str().unwrap().contains("Say hi."));
+    }
+
+    #[test]
+    fn a_skill_this_workspace_does_not_hold_is_refused_with_a_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        for (case, params, code) in [
+            ("no name", json!({}), INVALID_PARAMS),
+            ("name is not a string", json!({ "name": 7 }), INVALID_PARAMS),
+            ("name is blank", json!({ "name": "  " }), INVALID_PARAMS),
+            ("no such skill", json!({ "name": "nope" }), SKILL_UNKNOWN),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "skills.read", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plugin_can_be_connected_and_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+        // Nothing is connected, so this fixture's registry is the built-ins
+        // only: no `plugins.json` in the workspace.
+        assert_eq!(chat.mcp.available().len(), 2);
+
+        let before = dispatch(
+            &request_with("r-1", "plugins.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let listed = answered(&before).result.clone().unwrap();
+        assert_eq!(listed["available"], json!(2));
+        assert_eq!(listed["connected"], json!([]));
+        let servers = listed["servers"].as_array().unwrap();
+        assert!(servers.iter().any(|server| server["name"] == json!("docs")));
+        // Nothing is connected, so nothing has a catalogue to show yet.
+        assert!(servers.iter().all(|server| server["tools"] == json!([])));
+        assert_eq!(bridge.snapshot()["plugins"]["connected"], json!(0));
+
+        let connected = dispatch(
+            &request_with("r-2", "plugins.connect", json!({ "server": "docs" })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&connected).ok);
+        assert_eq!(
+            answered(&connected).result.clone().unwrap()["server"],
+            json!("docs")
+        );
+
+        // The same registry the snapshot reads, so the status counts the
+        // connection without being told twice.
+        assert_eq!(bridge.snapshot()["plugins"]["connected"], json!(1));
+        assert!(chat.mcp.is_connected("docs"));
+
+        let after = dispatch(
+            &request_with("r-3", "plugins.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let listed = answered(&after).result.clone().unwrap();
+        assert_eq!(listed["connected"], json!(["docs"]));
+        let docs = listed["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == json!("docs"))
+            .unwrap();
+        assert_eq!(docs["connected"], json!(true));
+        let tools = docs["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        assert!(tools
+            .iter()
+            .all(|tool| tool["name"].as_str().unwrap().starts_with("mcp__docs__")));
+        assert!(tools.iter().any(|tool| tool["policy"].as_str().is_some()));
+    }
+
+    #[test]
+    fn a_skill_folder_can_be_imported_into_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        // A clone of a skills repository: one skill per child folder.
+        let source = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let folder = source.path().join(name);
+            std::fs::create_dir_all(folder.join("references")).unwrap();
+            std::fs::write(
+                folder.join(SKILL_MANIFEST),
+                format!("---\nname: {name}\ndescription: The {name} skill.\n---\n\n# {name}\n"),
+            )
+            .unwrap();
+            std::fs::write(folder.join("references").join("notes.md"), "notes\n").unwrap();
+        }
+        // A repository's history is not part of the skill.
+        std::fs::create_dir_all(source.path().join(".git")).unwrap();
+        std::fs::write(source.path().join(".git").join("HEAD"), "ref\n").unwrap();
+
+        let imported = dispatch(
+            &request_with(
+                "r-1",
+                "skills.import",
+                json!({ "path": source.path().display().to_string() }),
+            ),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&imported).ok, "{:?}", answered(&imported).error);
+        let result = answered(&imported).result.clone().unwrap();
+        assert_eq!(result["count"], json!(2));
+        assert_eq!(
+            result["dir"],
+            json!(dir.path().join("skills").display().to_string())
+        );
+        // The whole folder came across, and the copy is a real skill.
+        assert!(dir
+            .path()
+            .join("skills/alpha/references/notes.md")
+            .is_file());
+        assert!(!dir.path().join("skills/alpha/.git").exists());
+
+        // It is the loader's skill now, so the catalogue and the model agree.
+        let listed = dispatch(
+            &request_with("r-2", "skills.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let listed = answered(&listed).result.clone().unwrap();
+        assert_eq!(listed["count"], json!(2));
+        assert!(listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill["name"] == json!("alpha")));
+        assert_eq!(bridge.snapshot()["skills"]["count"], json!(2));
+
+        let read = dispatch(
+            &request_with("r-3", "skills.read", json!({ "name": "beta" })),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&read).ok);
+        assert!(answered(&read).result.clone().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("# beta"));
+    }
+
+    #[test]
+    fn an_import_that_would_not_land_is_refused_with_a_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        // An empty folder, and one skill already on disk to collide with.
+        let empty = tempfile::tempdir().unwrap();
+        let single = tempfile::tempdir().unwrap();
+        std::fs::write(
+            single.path().join(SKILL_MANIFEST),
+            "---\nname: demo\n---\n\n# Demo\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.path().join("skills").join("demo").join(SKILL_MANIFEST),
+            "---\nname: demo\n---\n\n# Taken\n",
+        )
+        .unwrap();
+
+        let cases = [
+            ("no path", json!({}), INVALID_PARAMS),
+            ("path is not a string", json!({ "path": 7 }), INVALID_PARAMS),
+            ("path is blank", json!({ "path": "  " }), INVALID_PARAMS),
+            (
+                "no such folder",
+                json!({ "path": dir.path().join("nope").display().to_string() }),
+                SKILL_SOURCE,
+            ),
+            (
+                "no manifest anywhere",
+                json!({ "path": empty.path().display().to_string() }),
+                SKILL_INVALID,
+            ),
+            (
+                "the name is taken",
+                json!({ "path": single.path().display().to_string() }),
+                SKILL_EXISTS,
+            ),
+        ];
+        for (case, params, code) in cases {
+            let turn = dispatch(
+                &request_with("r-1", "skills.import", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+        // Nothing was half-imported by the refusals above.
+        assert_eq!(bridge.snapshot()["skills"]["count"], json!(1));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("skills/demo/SKILL.md")).unwrap(),
+            "---\nname: demo\n---\n\n# Taken\n"
+        );
+    }
+
+    #[test]
+    fn the_context_reads_back_the_size_the_compactor_measures() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        let fresh = dispatch(
+            &request_with("r-1", "chat.context", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        assert!(answered(&fresh).ok);
+        let context = answered(&fresh).result.clone().unwrap();
+        assert_eq!(context["messages"], json!(0));
+        assert_eq!(context["compacted"], json!(0));
+        assert!(context["session"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(!takes_params("chat.context"));
+
+        // Remember a conversation, then ask again: the size is the one the
+        // compactor would measure, and it is no longer zero.
+        chat.commit(Some(vec![Message::user_text("x".repeat(400).as_str())]));
+        let after = dispatch(
+            &request_with("r-2", "chat.context", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let context = answered(&after).result.clone().unwrap();
+        assert_eq!(context["messages"], json!(1));
+        assert!(context["chars"].as_u64().unwrap() >= 400);
+    }
+
+    #[test]
+    fn a_workspace_can_declare_its_own_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugins.json"),
+            r#"{
+  "servers": [
+    {
+      "name": "notes",
+      "command": "node",
+      "args": ["tools/notes.mjs"],
+      "policy": "allow"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        // Declared is not connected: the list carries it, the pool does not.
+        let listed = dispatch(
+            &request_with("r-1", "plugins.list", json!({})),
+            &bridge,
+            &chat,
+            runtime.handle(),
+        );
+        let listed = answered(&listed).result.clone().unwrap();
+        assert_eq!(listed["available"], json!(3));
+        let notes = listed["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == json!("notes"))
+            .expect("the declared plugin is listed");
+        assert_eq!(notes["source"], json!("workspace"));
+        assert_eq!(notes["command"], json!("node tools/notes.mjs"));
+        assert_eq!(notes["connected"], json!(false));
+        assert_eq!(notes["tools"], json!([]));
+        assert_eq!(bridge.snapshot()["plugins"]["available"], json!(3));
+        assert!(chat.mcp.connected_names().is_empty());
+
+        // The model is offered it too, through the tool that connects servers.
+        assert!(chat.mcp.available().contains(&"notes".to_string()));
+
+        // A plugins.json that cannot be read is a warning, not a dead runtime.
+        std::fs::write(dir.path().join("plugins.json"), "{ not json").unwrap();
+        let broken = bridge_at(dir.path());
+        assert!(broken
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("plugins.json")));
+        assert_eq!(broken.mcp.available().len(), 2);
+    }
+
+    #[test]
+    fn a_plugin_this_build_will_not_take_is_refused_with_a_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, chat, runtime) = fixture(dir.path());
+
+        for (case, params, code) in [
+            ("no server", json!({}), INVALID_PARAMS),
+            (
+                "server is not a string",
+                json!({ "server": 7 }),
+                INVALID_PARAMS,
+            ),
+            ("server is blank", json!({ "server": " " }), PLUGIN_UNKNOWN),
+            (
+                "no such server",
+                json!({ "server": "nope" }),
+                PLUGIN_UNKNOWN,
+            ),
+        ] {
+            let turn = dispatch(
+                &request_with("r-1", "plugins.connect", params),
+                &bridge,
+                &chat,
+                runtime.handle(),
+            );
+            assert!(!answered(&turn).ok, "`{case}` was accepted");
+            assert_eq!(
+                answered(&turn)
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(code),
+                "`{case}`"
+            );
+        }
+        // A refusal connects nothing.
+        assert!(chat.mcp.connected_names().is_empty());
+    }
+
+    #[test]
+    fn the_skill_and_plugin_methods_take_only_what_they_document() {
+        for method in [
+            "skills.list",
+            "skills.read",
+            "skills.import",
+            "plugins.list",
+            "plugins.connect",
+        ] {
+            assert!(METHODS.contains(&method), "{method} is not advertised");
+        }
+        assert!(!takes_params("skills.list"));
+        assert!(takes_params("skills.read"));
+        assert!(takes_params("skills.import"));
+        assert!(!takes_params("plugins.list"));
+        assert!(takes_params("plugins.connect"));
+
+        // Both list methods take nothing, so a key on one is refused rather than
+        // quietly ignored -- a host talking to a newer bridge finds out.
+        for method in ["skills.list", "plugins.list"] {
+            let line = json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": "r-1",
+                "method": method,
+                "params": { "name": "docs" },
+            })
+            .to_string();
+            match parse_request(&line) {
+                Parsed::Rejected { error, .. } => assert_eq!(error.code, INVALID_PARAMS),
+                other => panic!("expected a refusal from {method}, got {other:?}"),
+            }
+        }
     }
 }

@@ -39,6 +39,7 @@ pub mod team;
 pub mod tools;
 pub mod ui;
 pub mod workflow;
+pub mod workforce;
 
 pub use agent::{
     default_system_prompt, Agent, AgentBuilder, AgentEvent, AgentObserver, NoopObserver,
@@ -52,8 +53,8 @@ pub use compact::{
 };
 pub use config::Config;
 pub use cron::{
-    cron_matches, is_valid_cron_id, register_cron_tools, validate_cron, CancelCronTool, CronJob,
-    CronScheduler, ListCronsTool, ScheduleCronTool, CANCEL_CRON_TOOL_NAME, CRON_PROMPT,
+    cron_matches, is_valid_cron_id, next_match, register_cron_tools, validate_cron, CancelCronTool,
+    CronJob, CronScheduler, ListCronsTool, ScheduleCronTool, CANCEL_CRON_TOOL_NAME, CRON_PROMPT,
     LIST_CRONS_TOOL_NAME, SCHEDULED_TASKS_FILE, SCHEDULE_CRON_TOOL_NAME,
 };
 pub use error::{Error, Result};
@@ -70,9 +71,9 @@ pub use llm::{
     Usage,
 };
 pub use mcp::{
-    available_servers, host_policy, normalize_mcp_name, prefixed_tool_name, register_mcp_tools,
-    ConnectMcpTool, McpPermissionHook, McpPolicy, McpRegistry, McpServer, McpTool,
-    CONNECT_MCP_TOOL_NAME, MCP_PROMPT, MCP_TOOL_PREFIX,
+    available_servers, host_policy, load_plugin_specs, normalize_mcp_name, prefixed_tool_name,
+    register_mcp_tools, ConnectMcpTool, McpPermissionHook, McpPolicy, McpRegistry, McpServer,
+    McpTool, PluginSpec, CONNECT_MCP_TOOL_NAME, MCP_PROMPT, MCP_TOOL_PREFIX, PLUGIN_FILE,
 };
 pub use memory::{
     build_system, memory_slug, should_store_memory, validate_memory_record, CatalogRecall, Memory,
@@ -100,11 +101,11 @@ pub use team::{
     WORKTREES_DIR,
 };
 pub use tools::{
-    register_task_tools, ClaimTaskTool, CompleteTaskTool, CreateTaskTool, GetTaskTool,
-    ListTasksTool, LoadSkillTool, Task, TaskStatus, TaskStore, Tool, ToolContext, ToolRegistry,
-    UpdateTaskTool, CLAIM_TASK_TOOL_NAME, COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME,
-    DEFAULT_OWNER, GET_TASK_TOOL_NAME, LIST_TASKS_TOOL_NAME, LOAD_SKILL_TOOL_NAME, TASKS_DIR,
-    TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
+    is_valid_task_id, register_task_tools, AskUserTool, Asker, ClaimTaskTool, CompleteTaskTool,
+    CreateTaskTool, GetTaskTool, ListTasksTool, LoadSkillTool, Task, TaskStatus, TaskStore, Tool,
+    ToolContext, ToolRegistry, UpdateTaskTool, ASK_USER_TOOL_NAME, CLAIM_TASK_TOOL_NAME,
+    COMPLETE_TASK_TOOL_NAME, CREATE_TASK_TOOL_NAME, DEFAULT_OWNER, GET_TASK_TOOL_NAME,
+    LIST_TASKS_TOOL_NAME, LOAD_SKILL_TOOL_NAME, TASKS_DIR, TASKS_PROMPT, UPDATE_TASK_TOOL_NAME,
 };
 pub use workflow::{
     create_task_id, default_registry, fill_schema, findings_schema, last_run,
@@ -115,4 +116,9 @@ pub use workflow::{
     WorkflowRegistry, WorkflowScript, WorkflowTask, WorkflowTool, AGENT_CAP, CONCURRENCY,
     DEMO_CHANGES, LAST_RUN_FILE, REVIEW_DIMENSIONS, WORKFLOWS_DIR, WORKFLOW_AGENT_MAX_TOKENS,
     WORKFLOW_AGENT_SYSTEM, WORKFLOW_PROMPT, WORKFLOW_TOOL_NAME,
+};
+pub use workforce::{
+    is_valid_agent_id, is_valid_department_id, AgentProfile, Department, DepartmentMessage,
+    WorkforceStore, DEPARTMENTS_DIR, MAX_MESSAGES, MAX_MESSAGE_CHARS, MAX_NAME_CHARS,
+    MAX_ROLE_CHARS, MAX_TEXT_CHARS,
 };

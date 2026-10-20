@@ -2,8 +2,11 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 
 import {
+  answerChatQuestion,
+  approveChatCall,
   cancelChatTurn,
   deleteChatSession,
+  fetchChatContext,
   fetchChatHistory,
   fetchChatSessions,
   newChatSession,
@@ -15,6 +18,9 @@ import {
 import type {
   ChatEvent,
   ChatEventData,
+  ChatContext,
+  ChatPermissionBlock,
+  ChatQuestionBlock,
   ChatSessionOpened,
   ChatSessionSummary,
   ChatToolBlock,
@@ -54,6 +60,14 @@ export const useChatStore = defineStore('chat', () => {
   const current = ref('')
   /** Why the conversation list -- or the last change to it -- failed. */
   const sessionError = ref<RuntimeError | null>(null)
+  /**
+   * What the loop is holding, as the runtime reports it.
+   *
+   * Kept apart from `error`: this is a readout, and a readout that could not be
+   * read leaves the badge off rather than putting a banner over a conversation
+   * that is working.
+   */
+  const context = ref<ChatContext | null>(null)
   let unsubscribe: (() => void) | null = null
   let sequence = 0
   /** Events that arrived before the turn they name was known. */
@@ -71,6 +85,33 @@ export const useChatStore = defineStore('chat', () => {
   const sessionsSupported = computed(() =>
     (runtime.snapshot?.methods ?? []).includes('sessions.list'),
   )
+  /** Whether it can say how much of the conversation it is holding. */
+  const contextSupported = computed(() =>
+    (runtime.snapshot?.methods ?? []).includes('chat.context'),
+  )
+  /** Whether the runtime can take an answer, or a decision, from the page. */
+  const interactionSupported = computed(() =>
+    (runtime.snapshot?.methods ?? []).includes('chat.answer'),
+  )
+  /**
+   * What the runtime is waiting on a person for, if anything.
+   *
+   * Read back out of the transcript rather than remembered here: an interaction
+   * that has been answered, or dropped by a turn that ended, is not waiting any
+   * more, and only the runtime's own events say so.
+   */
+  const waiting = computed<ChatPermissionBlock | ChatQuestionBlock | null>(() => {
+    for (const turn of turns.value) {
+      for (const block of turn.blocks) {
+        if (block.kind === 'permission' && block.decision === 'pending') return block
+        if (block.kind === 'question' && !block.resolved) return block
+      }
+    }
+    return null
+  })
+
+  /** Whether the runtime has compacted the conversation at all. */
+  const compacted = computed(() => context.value?.compacted ?? 0)
   /** A turn is in flight; the runtime takes one prompt at a time. */
   const pending = computed(() => turns.value.some((turn) => turn.status === 'pending'))
   /** Whether the composer may send. */
@@ -104,6 +145,40 @@ export const useChatStore = defineStore('chat', () => {
     const last = turn.blocks.at(-1)
     if (last?.kind === 'text') last.text += text
     else turn.blocks.push({ kind: 'text', text })
+  }
+
+  /**
+   * Close whatever a turn was still waiting on.
+   *
+   * A turn that is over leaves no question open: the runtime either answered it
+   * or it is gone. A transcript that kept one pending would be waiting forever
+   * on a person nobody is asking any more.
+   */
+  function closeInteractions(turn: ChatTurn): void {
+    for (const block of turn.blocks) {
+      if (block.kind === 'permission' && block.decision === 'pending') block.decision = 'denied'
+      if (block.kind === 'question' && !block.resolved) block.resolved = true
+    }
+  }
+
+  /** The permission request an event names, if the transcript still holds it. */
+  function permissionBlock(turn: ChatTurn, id: string | undefined): ChatPermissionBlock | null {
+    return (
+      turn.blocks
+        .filter((block): block is ChatPermissionBlock => block.kind === 'permission')
+        .filter((block) => id === undefined || block.id === id)
+        .at(-1) ?? null
+    )
+  }
+
+  /** The question an event names, if the transcript still holds it. */
+  function questionBlock(turn: ChatTurn, id: string | undefined): ChatQuestionBlock | null {
+    return (
+      turn.blocks
+        .filter((block): block is ChatQuestionBlock => block.kind === 'question')
+        .filter((block) => id === undefined || block.id === id)
+        .at(-1) ?? null
+    )
   }
 
   /** Fold one runtime event into the transcript. */
@@ -168,8 +243,57 @@ export const useChatStore = defineStore('chat', () => {
         break
 
       case 'chat.notice':
-        if ((data.text ?? '') !== '') turn.blocks.push({ kind: 'notice', text: data.text ?? '' })
+        if ((data.text ?? '') !== '') {
+          turn.blocks.push({
+            kind: 'notice',
+            text: data.text ?? '',
+            // Kept so the transcript can tell a compaction apart from a
+            // memory recall without reading the runtime's prose.
+            notice: data.kind,
+          })
+        }
         break
+
+      case 'chat.permission':
+        turn.blocks.push({
+          kind: 'permission',
+          id: data.id ?? '',
+          name: data.name ?? 'tool',
+          input: data.input ?? '',
+          reason: data.reason ?? '',
+          source: data.source ?? 'main',
+          decision: 'pending',
+        })
+        break
+
+      case 'chat.permission_result': {
+        // The decision names the request it belongs to: only the runtime says
+        // whether a call may run, and it says so once.
+        const waiting = permissionBlock(turn, data.id)
+        if (waiting) waiting.decision = data.allowed ? 'allowed' : 'denied'
+        break
+      }
+
+      case 'chat.question':
+        turn.blocks.push({
+          kind: 'question',
+          id: data.id ?? '',
+          question: data.question ?? '',
+          options: data.options ?? [],
+          source: data.source ?? 'main',
+          answer: null,
+          resolved: false,
+        })
+        break
+
+      case 'chat.question_result': {
+        const waiting = questionBlock(turn, data.id)
+        if (waiting) {
+          waiting.answer = data.answer ?? null
+          waiting.resolved = true
+        }
+        break
+      }
 
       case 'chat.done':
         // The final text is authoritative, but the deltas already said it: it is
@@ -187,6 +311,7 @@ export const useChatStore = defineStore('chat', () => {
           code: 'chat_failed',
           message: 'Runtime 报告这一轮失败，但没有给出原因。',
         }
+        closeInteractions(turn)
         break
 
       case 'chat.cancelled':
@@ -194,6 +319,7 @@ export const useChatStore = defineStore('chat', () => {
         // nothing to explain and nothing to keep in the conversation.
         turn.status = 'cancelled'
         turn.error = null
+        closeInteractions(turn)
         break
 
       default:
@@ -222,6 +348,24 @@ export const useChatStore = defineStore('chat', () => {
     // This window may be a reload of one that was already in conversation.
     await restore()
     await refreshSessions()
+    await refreshContext()
+  }
+
+  /**
+   * Read back how much the runtime is holding for this conversation.
+   *
+   * The runtime compacts a long history before every model call; the page asks
+   * after each turn so the number a reader sees is the one the loop is
+   * actually working with, not one the page remembered.
+   */
+  async function refreshContext(): Promise<void> {
+    if (!runtime.ready || !contextSupported.value) return
+    try {
+      context.value = await fetchChatContext()
+    } catch {
+      // A readout nobody can read is simply not shown.
+      context.value = null
+    }
   }
 
   /** The re-read that is in flight, if any. */
@@ -311,6 +455,39 @@ export const useChatStore = defineStore('chat', () => {
     if (!canCancel.value) return false
     try {
       return (await cancelChatTurn()).cancelled
+    } catch (failure) {
+      error.value = toRuntimeError(failure)
+      return false
+    }
+  }
+
+  /**
+   * Answer the question the runtime is waiting on.
+   *
+   * The runtime is the one holding the question, so it is the one that decides
+   * whether the answer arrived. Nothing is written into the transcript here: a
+   * page cannot show an answer that never reached the model.
+   */
+  async function answer(id: string, text: string): Promise<boolean> {
+    if (!interactionSupported.value) return false
+    try {
+      return (await answerChatQuestion(id, text)).accepted
+    } catch (failure) {
+      error.value = toRuntimeError(failure)
+      return false
+    }
+  }
+
+  /**
+   * Allow or refuse the call the runtime is waiting on.
+   *
+   * The decision reaches the call the id names, and the runtime reports what it
+   * decided as `chat.permission_result` -- which is what the page shows.
+   */
+  async function decide(id: string, allow: boolean): Promise<boolean> {
+    if (!interactionSupported.value) return false
+    try {
+      return (await approveChatCall(id, allow)).accepted
     } catch (failure) {
       error.value = toRuntimeError(failure)
       return false
@@ -440,6 +617,7 @@ export const useChatStore = defineStore('chat', () => {
         // keeping a transcript of a runtime that is gone.
         void restore()
         void refreshSessions()
+        void refreshContext()
         return
       }
       for (const turn of turns.value) {
@@ -454,6 +632,7 @@ export const useChatStore = defineStore('chat', () => {
       // that was waiting for one: the next runtime numbers its turns from one
       // again, so a leftover would land in a stranger's turn.
       deferred = []
+      context.value = null
     },
   )
 
@@ -461,7 +640,11 @@ export const useChatStore = defineStore('chat', () => {
   // first prompt is what a conversation is called -- or changed how much it
   // holds, so the list is re-read once per turn rather than left stale.
   watch(pending, (running, wasRunning) => {
-    if (wasRunning && !running) void refreshSessions()
+    if (wasRunning && !running) {
+      void refreshSessions()
+      // A turn is what grows the history, and what makes the runtime compact.
+      void refreshContext()
+    }
   })
 
   return {
@@ -473,13 +656,19 @@ export const useChatStore = defineStore('chat', () => {
     canSend,
     sessions,
     sessionError,
+    context,
+    compacted,
     current,
     currentTitle,
     cancelSupported,
     sessionsSupported,
     canCancel,
     canSwitchSessions,
+    contextSupported,
+    interactionSupported,
+    waiting,
     refreshSessions,
+    refreshContext,
     startSession,
     openSession,
     renameSession,
@@ -489,6 +678,8 @@ export const useChatStore = defineStore('chat', () => {
     disconnect,
     send,
     clear,
+    answer,
+    decide,
   }
 })
 

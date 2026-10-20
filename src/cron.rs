@@ -126,22 +126,60 @@ pub fn cron_matches(expression: &str, moment: NaiveDateTime) -> bool {
     }
     let (minute, hour, day, month, weekday) =
         (fields[0], fields[1], fields[2], fields[3], fields[4]);
-    if !field_matches(minute, moment.minute())
-        || !field_matches(hour, moment.hour())
-        || !field_matches(month, moment.month())
-    {
-        return false;
-    }
+    field_matches(minute, moment.minute())
+        && field_matches(hour, moment.hour())
+        && field_matches(month, moment.month())
+        && day_matches(day, weekday, moment)
+}
 
-    let cron_weekday = moment.weekday().num_days_from_sunday();
-    let day_matches = field_matches(day, moment.day());
-    let weekday_matches = field_matches(weekday, cron_weekday);
+/// Cron's day rule, kept in one place because `cron_matches` and `next_match`
+/// must agree on it: day-of-month and day-of-week are ORed when both are set,
+/// and a `*` in either means the other one decides.
+fn day_matches(day: &str, weekday: &str, moment: NaiveDateTime) -> bool {
+    let by_day = field_matches(day, moment.day());
+    let by_weekday = field_matches(weekday, moment.weekday().num_days_from_sunday());
     match (day == "*", weekday == "*") {
         (true, true) => true,
-        (true, false) => weekday_matches,
-        (false, true) => day_matches,
-        (false, false) => day_matches || weekday_matches,
+        (true, false) => by_weekday,
+        (false, true) => by_day,
+        (false, false) => by_day || by_weekday,
     }
+}
+
+/// The first whole minute strictly after `after` that `expression` matches.
+///
+/// Walks day by day and only the minutes of a day whose date fields can match,
+/// so `0 0 29 2 *` -- a leap day, up to a few years out -- costs a day scan
+/// rather than a minute-by-minute one, and a date that can never match (Feb 30)
+/// gives up instead of looping forever. A malformed expression has no next
+/// match either.
+pub fn next_match(expression: &str, after: NaiveDateTime) -> Option<NaiveDateTime> {
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let (minute, hour, day, month, weekday) =
+        (fields[0], fields[1], fields[2], fields[3], fields[4]);
+
+    // Four years is the whole of the ordinary leap cycle. A schedule whose only
+    // match is further out than that (a century year that skips Feb 29) is
+    // reported as having no next run rather than scanned for indefinitely.
+    let last = after.checked_add_signed(chrono::Duration::days(366 * 4))?;
+    let mut moment = (after + chrono::Duration::minutes(1))
+        .with_second(0)?
+        .with_nanosecond(0)?;
+    while moment <= last {
+        if !field_matches(month, moment.month()) || !day_matches(day, weekday, moment) {
+            // Nothing in this day can match; step to the start of the next one.
+            moment = moment.date().succ_opt()?.and_hms_opt(0, 0, 0)?;
+            continue;
+        }
+        if field_matches(hour, moment.hour()) && field_matches(minute, moment.minute()) {
+            return Some(moment);
+        }
+        moment += chrono::Duration::minutes(1);
+    }
+    None
 }
 
 /// Validate one field against its range.
@@ -789,6 +827,45 @@ mod tests {
         assert!(cron_matches("0 9 13 * 1", monday()));
         assert!(cron_matches("0 9 12 * 6", monday()));
         assert!(!cron_matches("0 9 13 * 6", monday()));
+    }
+
+    #[test]
+    fn next_match_finds_the_first_matching_minute_after_the_moment() {
+        // 08:59 -> 09:00, and the answer is strictly after: 09:00 -> tomorrow.
+        assert_eq!(
+            next_match("0 9 * * *", moment(2026, 10, 12, 8, 59)),
+            Some(moment(2026, 10, 12, 9, 0))
+        );
+        assert_eq!(
+            next_match("0 9 * * *", moment(2026, 10, 12, 9, 0)),
+            Some(moment(2026, 10, 13, 9, 0))
+        );
+        // A step expression is read inside the hour, not only at the top of it.
+        assert_eq!(
+            next_match("*/15 * * * *", moment(2026, 10, 12, 10, 1)),
+            Some(moment(2026, 10, 12, 10, 15))
+        );
+        // Seconds are dropped: the answer is a whole minute.
+        assert_eq!(
+            next_match(
+                "0 9 * * *",
+                moment(2026, 10, 12, 8, 59).with_second(30).unwrap()
+            ),
+            Some(moment(2026, 10, 12, 9, 0))
+        );
+    }
+
+    #[test]
+    fn next_match_reads_the_weekday_and_gives_up_on_a_hopeless_one() {
+        // `monday()` is 2026-10-12; the next Friday 09:30 is the 16th.
+        assert_eq!(
+            next_match("30 9 * * 5", monday()),
+            Some(moment(2026, 10, 16, 9, 30))
+        );
+        // A malformed expression has no next match, and neither does a date
+        // that never exists -- it must not spin until the cap.
+        assert_eq!(next_match("not a cron", monday()), None);
+        assert_eq!(next_match("0 0 30 2 *", monday()), None);
     }
 
     #[test]

@@ -3,13 +3,18 @@ import {
   Ban,
   Check,
   ChevronDown,
+  Circle,
   CircleAlert,
+  CircleCheckBig,
   History,
   LoaderCircle,
+  MessageCircleQuestion,
   MessageSquare,
   Pencil,
   Plus,
   SendHorizontal,
+  ShieldAlert,
+  Shrink,
   Square,
   Trash2,
   Wrench,
@@ -21,7 +26,7 @@ import { RouterLink } from 'vue-router'
 import Alert from '@/components/ui/Alert.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
-import type { ChatBlock, ChatTurn } from '@/lib/chat'
+import type { ChatBlock, ChatToolBlock, ChatTurn } from '@/lib/chat'
 import { formatRelative, shortenPath } from '@/lib/format'
 import { RUNTIME_STATE_LABEL, runtimeStateTone } from '@/lib/runtime/types'
 import { useChatStore } from '@/stores/chat'
@@ -34,6 +39,9 @@ const chat = useChatStore()
 
 const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
+/** What has been typed into each question's own-words field, by interaction id. */
+const answers = ref<Record<string, string>>({})
+
 /** The session menu, so choosing from it closes it. */
 const menu = ref<HTMLDetailsElement | null>(null)
 /** The conversation the menu is renaming, and the name typed so far. */
@@ -85,11 +93,13 @@ const placeholder = computed(() => {
   if (runtime.state === 'starting') return 'Runtime 正在启动…'
   if (!runtime.ready) return 'Runtime 未运行：到设置里启动它'
   if (!chat.supported) return '这个 Runtime 没有对话接口（需要 chat.send）'
+  if (chat.waiting) return 'Runtime 正在等你回答上面的问题（也可以直接按停止）'
   if (chat.pending) return 'Runtime 正在回答上一个提示词…'
   return '给 Runtime 一个任务，例如「列出 src 下的 Rust 文件」'
 })
 
 const hint = computed(() => {
+  if (chat.waiting) return 'Runtime 正停在这一轮里等你：回答上面的问题，或者批准它，它才会继续。'
   if (chat.pending) {
     return chat.canCancel
       ? '这一轮正在运行：可以停止它，或者等它结束；停下来的一轮不会进入上下文。'
@@ -100,6 +110,43 @@ const hint = computed(() => {
 })
 
 const canSubmit = computed(() => chat.canSend && draft.value.trim() !== '')
+
+/**
+ * What the runtime is holding for this conversation, in one line.
+ *
+ * The runtime compacts a long history before every model call, and nothing
+ * about that reaches a reader unless it is said out loud. This says it: the
+ * size it is holding against the threshold it compacts above, and how many
+ * times it has already done so.
+ */
+const contextLine = computed(() => {
+  const context = chat.context
+  if (!context) return ''
+  const size = `${compact(context.chars)} 字符`
+  const limit = context.char_limit ? ` / ${compact(context.char_limit)}` : ''
+  return `上下文 ${size}${limit} · 消息 ${context.messages} 条`
+})
+
+const contextTitle = computed(() => {
+  const context = chat.context
+  if (!context) return ''
+  const limit = context.char_limit
+    ? `超过 ${context.char_limit} 字符时 Runtime 会自己压缩`
+    : '这个 Runtime 没有启用压缩'
+  return `${contextLine.value}；已自动压缩 ${context.compacted} 次；${limit}`
+})
+
+/** Big numbers, shortened: the badge is a readout, not a ledger. */
+function compact(value: number): string {
+  if (value < 1000) return String(value)
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}k`
+  return `${(value / 1_000_000).toFixed(1)}M`
+}
+
+/** The step name out of a compaction notice, e.g. `micro` from `(micro)`. */
+function compactionStep(text: string): string {
+  return text.match(/\(([^)]+)\)\s*$/)?.[1] ?? ''
+}
 
 /** A fingerprint of the transcript, so streaming text scrolls the view along. */
 const size = computed(() =>
@@ -115,6 +162,13 @@ function blockSize(block: ChatBlock): number {
       return block.text.length
     case 'tool':
       return (block.output ?? '').length + block.input.length + 1
+    case 'permission':
+      // A request is something the reader has to act on, not a line of prose.
+      return block.reason.length + block.input.length + 1
+    case 'question':
+      return (
+        block.question.length + block.options.join('').length + (block.answer?.length ?? 0) + 1
+      )
     default:
       return 1
   }
@@ -132,6 +186,96 @@ watch(size, async () => {
   const element = scroller.value
   if (element) element.scrollTop = element.scrollHeight
 })
+
+/**
+ * A question is not progress to read at leisure: the turn is stopped until
+ * somebody answers it. The view goes to it even if the reader had scrolled
+ * away, and puts the cursor where the answer goes.
+ */
+watch(
+  () => chat.waiting?.id ?? '',
+  async (id) => {
+    if (id === '') return
+    following = true
+    await nextTick()
+    const element = scroller.value
+    if (!element) return
+    element.scrollTop = element.scrollHeight
+    element.querySelector<HTMLInputElement>('input[data-answer]')?.focus()
+  },
+)
+
+/** Allow or refuse the call the runtime is waiting on. */
+async function decide(id: string, allow: boolean): Promise<void> {
+  await chat.decide(id, allow)
+}
+
+/** Answer a question, in the user's own words or with one of the suggestions. */
+async function answer(id: string, text: string): Promise<void> {
+  const said = text.trim()
+  if (said === '' || !(await chat.answer(id, said))) return
+  // The runtime reports the answer back as an event; the draft is only thrown
+  // away once it has been taken.
+  delete answers.value[id]
+}
+
+/** What a decision the runtime reported means, in a word. */
+function decisionLabel(decision: 'pending' | 'allowed' | 'denied'): string {
+  if (decision === 'allowed') return '已允许'
+  if (decision === 'denied') return '已拒绝'
+  return '等待中'
+}
+
+/** The badge tone for that decision. */
+function decisionTone(decision: 'pending' | 'allowed' | 'denied'): 'warn' | 'ok' | 'danger' {
+  if (decision === 'allowed') return 'ok'
+  if (decision === 'denied') return 'danger'
+  return 'warn'
+}
+
+/** One step of a plan, as `todo_write` carries it. */
+interface TodoItem {
+  content: string
+  status: string
+}
+
+/** How many steps of a plan are shown; the tool caps a list at twenty. */
+const MAX_TODOS = 20
+
+/** The icon that stands for a step's status. */
+const TODO_ICON: Record<string, typeof Circle> = {
+  pending: Circle,
+  in_progress: LoaderCircle,
+  completed: CircleCheckBig,
+}
+
+/**
+ * The plan a `todo_write` call carries.
+ *
+ * The tool's arguments are the list itself, so the transcript can show a plan
+ * as a plan instead of as JSON. A call the host cut short, or one that never
+ * parsed, simply answers nothing and falls back to the raw arguments.
+ */
+function todos(block: ChatToolBlock): TodoItem[] {
+  if (block.name !== 'todo_write') return []
+  try {
+    const parsed = JSON.parse(block.input) as { todos?: unknown }
+    if (!Array.isArray(parsed.todos)) return []
+    return parsed.todos
+      .filter((step): step is TodoItem => {
+        const candidate = step as TodoItem
+        return typeof candidate?.content === 'string' && candidate.content.trim() !== ''
+      })
+      .slice(0, MAX_TODOS)
+  } catch {
+    return []
+  }
+}
+
+/** The icon for a step's status. */
+function todoIcon(status: string): typeof Circle {
+  return TODO_ICON[status] ?? Circle
+}
 
 async function submit(): Promise<void> {
   const text = draft.value
@@ -351,6 +495,15 @@ function turnTone(turn: ChatTurn): string {
           <Trash2 class="size-3.5" />
           清屏
         </Button>
+        <Badge
+          v-if="chat.context"
+          :variant="chat.compacted ? 'accent' : 'neutral'"
+          :title="contextTitle"
+        >
+          <Shrink class="size-3.5" />
+          {{ contextLine }}
+          <template v-if="chat.compacted"> · 自动压缩 {{ chat.compacted }} 次</template>
+        </Badge>
         <Badge :variant="stateTone">{{ RUNTIME_STATE_LABEL[runtime.state] }}</Badge>
       </div>
     </header>
@@ -422,16 +575,145 @@ function turnTone(turn: ChatTurn): string {
                 </Badge>
               </div>
               <p
+                v-if="block.input && !todos(block).length"
+                class="truncate border-b border-line/60 px-3 py-1.5 font-mono text-[11px] text-ink-faint"
+                :title="block.input"
+              >
+                {{ block.input }}
+              </p>
+
+              <!-- `todo_write` 的整份清单就在它的参数里：摊成清单比一行 JSON 好读。 -->
+              <ol v-if="todos(block).length" class="divide-y divide-line/60">
+                <li
+                  v-for="(step, stepIndex) in todos(block)"
+                  :key="stepIndex"
+                  class="flex items-start gap-2 px-3 py-1.5 text-xs"
+                >
+                  <component
+                    :is="todoIcon(step.status)"
+                    class="mt-px size-3.5 shrink-0"
+                    :class="
+                      step.status === 'in_progress'
+                        ? 'animate-spin text-accent'
+                        : step.status === 'completed'
+                          ? 'text-ink-faint'
+                          : 'text-ink-muted'
+                    "
+                  />
+                  <span
+                    class="min-w-0 break-words"
+                    :class="
+                      step.status === 'completed' ? 'text-ink-faint line-through' : 'text-ink'
+                    "
+                  >
+                    {{ step.content }}
+                  </span>
+                </li>
+              </ol>
+
+              <pre
+                v-if="block.output !== null && !todos(block).length"
+                class="max-h-64 overflow-auto px-3 py-2 font-mono text-[11px] whitespace-pre-wrap text-ink-muted scroll-slim"
+              >{{ block.output }}</pre>
+            </div>
+
+            <div
+              v-else-if="block.kind === 'permission'"
+              class="overflow-hidden rounded-lg border border-warn/45 bg-warn/5"
+            >
+              <div class="flex items-center gap-2 border-b border-line/60 px-3 py-1.5">
+                <ShieldAlert class="size-3.5 shrink-0 text-warn" />
+                <span class="text-xs text-ink">
+                  申请使用 <span class="font-mono">{{ block.name }}</span>
+                </span>
+                <Badge v-if="block.source !== 'main'" class="px-1.5 py-0 text-[10px]">子智能体</Badge>
+                <Badge
+                  :variant="decisionTone(block.decision)"
+                  class="px-1.5 py-0 text-[10px]"
+                >
+                  {{ decisionLabel(block.decision) }}
+                </Badge>
+              </div>
+              <p class="px-3 py-1.5 text-xs text-ink-muted">{{ block.reason }}</p>
+              <p
                 v-if="block.input"
                 class="truncate border-b border-line/60 px-3 py-1.5 font-mono text-[11px] text-ink-faint"
                 :title="block.input"
               >
                 {{ block.input }}
               </p>
-              <pre
-                v-if="block.output !== null"
-                class="max-h-64 overflow-auto px-3 py-2 font-mono text-[11px] whitespace-pre-wrap text-ink-muted scroll-slim"
-              >{{ block.output }}</pre>
+              <div
+                v-if="block.decision === 'pending'"
+                class="flex flex-wrap items-center gap-2 px-3 py-2"
+              >
+                <Button
+                  size="sm"
+                  :disabled="!chat.interactionSupported"
+                  @click="decide(block.id, true)"
+                >
+                  允许
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  :disabled="!chat.interactionSupported"
+                  @click="decide(block.id, false)"
+                >
+                  拒绝
+                </Button>
+                <span class="text-[11px] text-ink-faint">
+                  Runtime 停在这里等这一句话；按停止等于没批准。
+                </span>
+              </div>
+            </div>
+
+            <div
+              v-else-if="block.kind === 'question'"
+              class="overflow-hidden rounded-lg border border-accent/40 bg-accent/5"
+            >
+              <div class="flex items-start gap-2 px-3 py-2">
+                <MessageCircleQuestion class="mt-px size-3.5 shrink-0 text-accent" />
+                <p class="min-w-0 text-sm break-words text-ink">{{ block.question }}</p>
+              </div>
+              <template v-if="!block.resolved">
+                <div v-if="block.options.length" class="flex flex-wrap gap-2 px-3 pb-2">
+                  <Button
+                    v-for="option in block.options"
+                    :key="option"
+                    variant="outline"
+                    size="sm"
+                    :disabled="!chat.interactionSupported"
+                    @click="answer(block.id, option)"
+                  >
+                    {{ option }}
+                  </Button>
+                </div>
+                <div class="flex items-center gap-2 border-t border-line/60 px-3 py-2">
+                  <input
+                    v-model="answers[block.id]"
+                    data-answer
+                    type="text"
+                    class="min-w-0 flex-1 rounded border border-line bg-canvas px-2 py-1 text-xs text-ink outline-none"
+                    placeholder="也可以用自己的话回答"
+                    :disabled="!chat.interactionSupported"
+                    @keydown.enter.prevent="answer(block.id, answers[block.id] ?? '')"
+                  />
+                  <Button
+                    size="sm"
+                    :disabled="!chat.interactionSupported || !(answers[block.id] ?? '').trim()"
+                    @click="answer(block.id, answers[block.id] ?? '')"
+                  >
+                    回答
+                  </Button>
+                </div>
+              </template>
+              <p v-else class="border-t border-line/60 px-3 py-1.5 text-xs text-ink-muted">
+                {{
+                  block.answer === null
+                    ? '没有回答：提问期间没人回答，Runtime 照实告诉了模型。'
+                    : `你回答：${block.answer}`
+                }}
+              </p>
             </div>
 
             <p
@@ -442,7 +724,23 @@ function turnTone(turn: ChatTurn): string {
               <span>{{ block.name }} 被权限策略拒绝：{{ block.reason }}</span>
             </p>
 
-            <p v-else class="flex items-start gap-2 text-xs text-ink-faint">
+            <p
+              v-else-if="block.kind === 'notice' && block.notice === 'compacted'"
+              class="flex items-center gap-2 text-xs text-ink-faint"
+              title="Runtime 自己压缩了这段对话的历史：旧的工具结果被收进文件，只留一个指路的引用。"
+            >
+              <Shrink class="size-3.5 shrink-0" />
+              <span>
+                Runtime 自动压缩了上下文<template v-if="compactionStep(block.text)">
+                  （{{ compactionStep(block.text) }}）</template
+                >
+              </span>
+            </p>
+
+            <p
+              v-else-if="block.kind === 'notice'"
+              class="flex items-start gap-2 text-xs text-ink-faint"
+            >
               <CircleAlert class="mt-px size-3.5 shrink-0" />
               <span>{{ block.text }}</span>
             </p>
