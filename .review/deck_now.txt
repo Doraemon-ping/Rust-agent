@@ -1,0 +1,97 @@
+exists True size 51873 mtime 2026-10-13 18:56:06
+slides 12 w 12191695 h 6858000
+runs 81
+fonts {'微软雅黑': 81}
+==================== slide 1
+Rust-agent 技术架构
+循环境 · 工具系统 · 技能与记忆 · 工作流引擎 · 多队友协作 · 边界
+crate rust-agent 0.1.0（edition 2021 / rust-version 1.75 / lib rust_agent + bin rust-agent + bin tui）
+事实来源：src/*.rs 源码常量与结构体、README.md、Cargo.toml、skills/*/SKILL.md
+==================== slide 2
+总体架构：一个循环 + 若干可替换接缝
+• 自下而上五层：模型层（llm/）→ 循环与运行时（agent.rs）→ 工具层（tools/）→ 上下文与状态层（message/compact/memory/background/cron）→ 协作与判定层（subagent/team/mcp/workflow/goal）。
+• s15 的设计主张：上述机制全部挂在同一个 for step in 0..max_steps 循环上，是接缝（seam）而不是各自独立的程序。
+• 循环骨架：compact 预处理 → 流式模型调用 → 收集 tool_use → 权限 hook → 执行工具 → PostToolUse → tool_result 回灌，直到模型不再要工具。
+• 两种交付形态共用同一套构建代码：REPL（src/main.rs）与 ratatui TUI（src/bin/tui.rs，default-run = tui）。
+• 依赖选型（Cargo.toml）：tokio（rt-multi-thread/process/fs/io-util/sync）、reqwest（json + rustls-tls）、serde/serde_json、async-trait、thiserror、anyhow、chrono、glob、rustyline、ratatui、dotenvy。
+• 扩展点：实现 Tool / LlmClient / Hook / Approver / MemoryRecall / GoalEvaluator / McpServer 即可换行为，循环本身不动。
+==================== slide 3
+src/ 模块划分总览
+• 核心：agent.rs（Agent、AgentBuilder、AgentEvent、AgentObserver、default_system_prompt）、lib.rs（pub mod + pub use 统一导出面）。
+• 模型层：llm/mod.rs（LlmClient trait、CompletionRequest/Response、ToolDefinition、Usage、StopReason）、llm/anthropic.rs（AnthropicClient）。
+• 工具层：tools/mod.rs（Tool、ToolRegistry、ToolContext）、tools/bash.rs、tools/fs.rs、tools/todo.rs、tools/task.rs、tools/skill.rs。
+• 上下文与状态：message.rs（Message/ContentBlock/ToolCall/Role）、compact.rs、memory.rs、background.rs、cron.rs。
+• 协作与判定：subagent.rs、team.rs、mcp.rs、workflow.rs、goal.rs。
+• 支撑层：permission.rs（三闸门）、hooks.rs（四个挂载点）、recovery.rs（失败恢复）、error.rs、config.rs、ui.rs。
+==================== slide 4
+模型层：LlmClient 与流式调用
+• LlmClient 唯一必需的方法是 complete；只有实现了 stream，才能把文本增量与已闭合的 tool_use 边到边转发给观察者。
+• trait 的默认 stream 实现 = 调 complete 再重放已完成的块，因此不能流式的提供方（本地模型、OpenAI 兼容网关、测试 mock）无需改动即可接入。
+• AnthropicClient：Messages API，stream: true，SSE 响应体逐行解析，text_delta 到达即转发，tool_use 块闭合即收集。
+• 已展示过内容的流式响应中途失败时直接报错而不重试（重放会重复用户已看到的文本）；被 max_tokens 截断才用更大预算重试一次。
+• recovery.rs：429 指数退避 + 最多 25% 抖动、连续 529 后切换 fallback 模型、截断升级 max_tokens、prompt too long 触发 reactive compact，其它错误原样上抛。
+• 可替换性已验证：MockAgentRunner 与 TUI 的 --demo 脚本化模型都能在无 API key 的情况下跑通循环。
+==================== slide 5
+工具系统：注册表、子代理与权限闸门
+• Tool trait + ToolRegistry（register / definitions）构成分发台；ToolContext 限定工具在工作区内安全操作。
+• ToolRegistry::base() 注册五个基础工具：bash、read_file、write_file、edit_file、glob；with_tasks() 再补上六个任务工具；todo_write 提供会话清单（默认 3 轮未更新时提醒，可用 todo_reminder_after 调整或关闭）。
+• task 工具（subagent.rs）：嵌套一个全新上下文的 Agent 循环，只挂 ToolRegistry::base()，因此不会递归委托，只有最终文本回到父级。
+• 权限三闸门（permission.rs）：deny list → rules → approval；Approver 有 Auto / Deny / 交互式实现，非交互轮次用 interactive(false) 把「询问」变成「带理由拒绝」。
+• hooks.rs 提供四个挂载点：UserPromptSubmit、PreToolUse、PostToolUse、Stop；PreToolUse 返回 Some 即阻断该次工具调用。
+• 默认权限闸门本身就是一个 PreToolUse hook —— 循环里没有硬编码的策略判断。
+==================== slide 6
+技能系统：目录先行，正文按需
+• 约定路径 skills/<name>/SKILL.md（SKILL_MANIFEST = "SKILL.md"），SkillLoader::new(dir) 启动时扫描并解析 YAML frontmatter。
+• 产出 Skill { name, description, content, path }；仓库现有两个技能：changelog 与 code-review。
+• 两段式加载：系统提示只注入 catalog（一行一个技能）/ prompt_section，正文不进上下文。
+• 模型调用 load_skill(name) 时才通过 SkillLoader::load 取回整份 SKILL.md 全文，作为工具结果回到对话。
+• 新增技能零代码改动：放一个 SKILL.md 即可；CLI 默认扫描 <workspace>/skills。
+• 与工具同构：技能是「知识」，工具是「动作」，两者都由循环按需拉取，避免常驻上下文。
+==================== slide 7
+记忆系统：.memory/ 三段流水
+• 存储：.memory/MEMORY.md 是目录（一行一条记录），.memory/<slug>.md 是一条记录（frontmatter 的 name/description/type + 正文）；MemoryType::ALL 定义四类记录。
+• recall（每轮）：目录先给模型选中索引（含确定性词法兜底），只加载被选中的正文，受 recall_char_limit 与 max_selected 限制。
+• extract（轮末）：对话 → 候选项 → validate_memory_record 校验（持久、非临时、非重复）→ 写盘并重建目录。
+• consolidate（阈值触发）：记录数达到 consolidate_threshold（默认 10）时合并去重；replace_all 失败会按字节恢复上一版存储。
+• 配置全在 MemoryConfig：recall_char_limit、max_selected、max_records、各类 max_tokens、recent_turns、dialogue_max_messages 等，留空即关闭持久记忆。
+• MemoryRecall trait 让 CatalogRecall 可被向量索引替换；事件 AgentEvent::MemoryRecalled { count } 与 MemoryStored { stored, consolidated } 供界面展示。
+==================== slide 8
+上下文压缩：五步管线与反应式兜底
+• 每次模型调用前先跑 Compactor::prepare()，按「最便宜的损失优先」依次执行五步（阈值均为 CompactConfig 字段）。
+• ① tool_result_budget：超大的工具结果溢出到 .task_outputs/tool-results/；② snip_compact：消息数超限时把中段归档到 .transcripts/。
+• ③ micro_compact：较旧的结果替换为「saved at」引用；④ fit_tool_results：仍内联的结果做预览裁剪。
+• ⑤ compact_history：其余内容交给一次额外的模型调用做摘要；模型也可主动调用 compact 工具，但只在本批工具调用闭合后才执行。
+• reactive_compact 是安全网：提供方返回 prompt_too_long 时，最旧消息被摘要后重试一次（次数由 max_reactive_retries 控制）。
+• 过程可观测：AgentEvent::Compacted { kind, transcript } 会把压缩类型与归档位置报给观察者。
+==================== slide 9
+工作流引擎（一）：注册表与四个原语
+• 动机：固定流程（四个审计员 → 逐条对抗验证 → 按严重度排序）不必让模型每步决策；宿主脚本知道步骤与顺序。
+• WorkflowRegistry：register(meta, script)、names()、has()、script()、catalog()、meta()；set_runner() 可换执行器（真实模型 / mock / 固定夹具）而不改脚本。
+• 对外只暴露一个 Workflow 工具（WORKFLOW_TOOL_NAME = "Workflow"）：模型只传工作流名字与参数，永远不传代码；valid_workflow_name / valid_run_id 校验命名。
+• agent(prompt, schema?, label?, phase?)：返回一个可 await 的 future（而不是就地 await），因此调用方能批量并发。
+• parallel(thunks) 是屏障：全部跑完再按输入顺序返回结果；pipeline(items, stages) 在阶段之间没有屏障，每个 stage 拿到上一值、原始项与索引。
+• phase(title) / log(message) 是进度标记；内置 review-changes（REVIEW_DIMENSIONS = correctness / security / performance / style）由 default_registry() 注册。
+==================== slide 10
+工作流引擎（二）：并发、上限与恢复
+• 并发实现：parallel() 用 tokio::task::JoinSet，对每个 thunk set.spawn(async move { (index, thunk.await) })，结果按索引回填，任一失败即整体失败。
+• 并发闸门：ExecutionLimits 持有 tokio::sync::Semaphore::new(CONCURRENCY)，CONCURRENCY = 8；每次真实 agent 调用前 acquire() 拿 SemaphorePermit，完成即释放。
+• 硬上限：AGENT_CAP = 1000（含嵌套工作流），claim_agent() 超限直接返回「agent() cap reached (1000)」。
+• 预算：Budget::new(total) 累计 tokens，remaining == 0 时返回「token budget exceeded」；单次工作流 agent 的预算为 WORKFLOW_AGENT_MAX_TOKENS = 2000。
+• 日志与恢复：WorkflowJournal::key 取 kind|label|prompt|schema 的语义哈希（stable_hash 用 FNV-1a，跨进程稳定），命中缓存直接返回且不占并发配额；resume_from_run_id 只重跑变化的步骤。
+• 运行产物都在 <workspace>/.workflow/：<runId>.json 快照、<runId>.output.json 结果、<runId>.journal.jsonl 日志、last_run.txt 指向最近一次；workflow() 嵌套只允许一层。
+==================== slide 11
+多队友与任务板：邮箱、计划门与 worktree
+• Team::new(workspace, client)：一个 Lead 加若干持久 teammate 线程；每个 teammate 有自己的会话，工作目录在 spawn 时固定（其任务的 worktree 或仓库）。
+• 通信靠文件邮箱，而不是共享 messages：MessageBus 读写 .mailboxes/<agent>.jsonl（send / read_inbox / peek / wait_for_messages），IDLE_SCAN_INTERVAL = 2s 空闲扫描。
+• 消息种类是常量集合：message、result、idle_notification、error、task_completed、shutdown_request/response、plan_request、plan_approval_request/response。
+• 共享任务板：TaskStore 落在 .tasks/，六个工具 create/update/list/get/claim/complete；blockedBy 建依赖边、owner 记归属，teammate 侧的 claim/complete 是「为自己认领」。
+• 计划门复用 hook 管线：PlanGate 处于 required/pending/rejected 时，PreToolUse 用 is_mutating_tool 拦住 bash、write_file、edit_file；审批请求带 req_NNNNNN id，且要求 id/发送方/接收方/状态/work_version 全部匹配，认领或完成会推动版本号、使陈旧审批失效。
+• 隔离与节流：create_worktree 执行 git worktree add .worktrees/<name> 并绑定任务（删除仍由宿主负责）；每轮最多一份 task_completed 报告、无任务时停在邮箱不空转、teammate 以 todo_reminder_after(0) 关闭 todo 提醒。
+==================== slide 12
+局限性与边界（源码与文档可验证）
+• 提供方单一：只有 llm/anthropic.rs 是真实实现，其它厂商需自己实现 LlmClient（complete 即可，stream 可选）。
+• MCP 的 docs 与 deploy 服务器是进程内 mock；接真实服务要自己实现 McpServer 并交给 McpRegistry::register_server。
+• 流式响应已展示过内容后失败不重试（宁可报错也不重复文本）；截断重试期间部分文本可能短暂出现两次。
+• 工作流脚本是可信宿主代码，注册时一次性校验；模型只能给名字与参数，无法表达任意控制流。
+• 规模与预算是硬编码常量：CONCURRENCY = 8、AGENT_CAP = 1000、单步 2000 tokens、循环 max_steps 默认 64（用尽返回 Error::MaxIterations）。
+• 目标评估器独立且无工具，只能读对话转录（超大的最新消息会被裁剪），证据必须由工作轮次显式产出；定时投递为至少一次语义；界面只有 REPL 与标注为 experimental 的 ratatui TUI，Cargo.toml 中 publish = false、版本 0.1.0。

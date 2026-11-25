@@ -1,6 +1,15 @@
 /target
 .env
 
+# build output and dependencies (never commit these)
+node_modules/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/dist/
+*.pdb
+*.lib
+*.rlib
+
 # compaction artifacts (s08)
 /.transcripts
 /.task_outputs
